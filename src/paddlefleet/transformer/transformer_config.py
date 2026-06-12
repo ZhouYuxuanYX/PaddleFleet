@@ -76,6 +76,9 @@ class TransformerConfig(ModelParallelConfig):
     negative values select from the end of the backbone stack, e.g. -1 is the
     last layer and -2 is the second-to-last layer."""
 
+    mtp_hidden_source: str = "last_layer_output"
+    """Which backbone hidden feature MTP uses as its initial feature: last_layer_output or last_layer_input."""
+
     separate_mtp_headloss: bool = False
     """Separate MTP LMHead & Loss calculate for pipeline balance."""
 
@@ -958,6 +961,13 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+        if self.mtp_hidden_source not in (
+            "last_layer_output",
+            "last_layer_input",
+        ):
+            raise ValueError(
+                f"mtp_hidden_source must be 'last_layer_output' or 'last_layer_input', got {self.mtp_hidden_source!r}."
+            )
         if self.mtp_reuse_layer is not None:
             if self.mtp_reuse_layer >= 0:
                 raise ValueError(
