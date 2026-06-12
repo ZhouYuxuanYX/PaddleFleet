@@ -942,6 +942,9 @@ class MultiTokenPredictionLayer(FleetLayer):
 
         # === Original concat+split logic ===
         hidden_states_concat = dict_args["hidden_states"]
+        mtp_hidden_source_states = dict_args.pop(
+            "mtp_hidden_source_states", None
+        )
         # mHC: pop multi-stream tensor if available
         mhc_multistream = dict_args.pop("mhc_multistream", None)
 
@@ -1043,6 +1046,8 @@ class MultiTokenPredictionLayer(FleetLayer):
                 if mhc_chunks is not None:
                     # mHC mode: use multi-stream as MTP input
                     dict_args["hidden_states"] = mhc_chunks[i]
+                elif i == 0 and mtp_hidden_source_states is not None:
+                    dict_args["hidden_states"] = mtp_hidden_source_states
                 else:
                     dict_args["hidden_states"] = tensor_list[i]
                 dict_args["decoder_input"] = tensor_list[i + 1]
@@ -1100,6 +1105,8 @@ class MultiTokenPredictionLayer(FleetLayer):
             if mhc_chunks is not None:
                 # mHC mode: use multi-stream as MTP input
                 dict_args["hidden_states"] = mhc_chunks[self.layer_number]
+            elif self.layer_number == 0 and mtp_hidden_source_states is not None:
+                dict_args["hidden_states"] = mtp_hidden_source_states
             else:
                 dict_args["hidden_states"] = tensor_list[self.layer_number]
             dict_args["decoder_input"] = tensor_list[self.layer_number + 1]
