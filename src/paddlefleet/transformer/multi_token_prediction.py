@@ -384,18 +384,22 @@ class MultiTokenPredictionLayer(FleetLayer):
                 self.hc_head_base.is_distributed = False
                 self.hc_head_scale.is_distributed = False
         else:
-            # Non-mHC mode: eh_proj [2h] -> [h]
-            # For the linear projection at the (k - 1)-th MTP layer, the input is the concatenation
-            # of the i-th token's hidden states and the (i + K)-th token's decoder input,
-            # so the input's shape is [s, b, 2*h].
-            # The output will be sent to the following transformer layer,
-            # so the output's shape should be [s, b, h].
+            # Non-mHC mode: eh_proj projects the combined embedding/hidden input
+            # before sending it to the MTP transformer layer. By default this is
+            # concat([e, h]) with [2h] -> [h]. With mtp_input_fusion="add",
+            # normalized e and h are added first, so the projection is [h] -> [h].
+            # With mtp_input_fusion="cond_norm", conditional scale/shift produces
+            # an h-sized feature, then eh_proj applies the post-fusion h -> h map.
             use_bias = False
             if self.config.gpt_model_use_experimental_version:
                 use_bias = self.config.use_bias
+            mtp_input_fusion = getattr(self.config, "mtp_input_fusion", "concat")
+            eh_proj_input_size = self.config.hidden_size
+            if mtp_input_fusion == "concat":
+                eh_proj_input_size *= 2
             self.eh_proj = build_spec_layer(
                 self.sublayers_spec.eh_proj,
-                self.config.hidden_size * 2,
+                eh_proj_input_size,
                 self.config.hidden_size,
                 config=self.config,
                 init_method=self.config.init_method,
@@ -403,6 +407,26 @@ class MultiTokenPredictionLayer(FleetLayer):
                 bias=use_bias,
                 skip_bias_add=False,
                 is_expert=False,
+            )
+            self.cond_norm_proj = None
+            if mtp_input_fusion == "cond_norm":
+                self.cond_norm_proj = build_spec_layer(
+                    self.sublayers_spec.eh_proj,
+                    self.config.hidden_size,
+                    self.config.hidden_size * 2,
+                    config=self.config,
+                    init_method=self.config.init_method,
+                    gather_output=False,
+                    bias=use_bias,
+                    skip_bias_add=False,
+                    is_expert=False,
+                )
+            eh_proj_desc = f"{eh_proj_input_size}->{self.config.hidden_size}"
+            warnings.warn(
+                f"[MTP-INPUT-FUSION-CONFIRM] "
+                f"mtp_input_fusion={mtp_input_fusion} "
+                f"eh_proj={eh_proj_desc} "
+                f"cond_norm_proj={'enabled' if self.cond_norm_proj is not None else 'disabled'}"
             )
             self.e_proj = None
             self.h_proj = None
@@ -421,6 +445,18 @@ class MultiTokenPredictionLayer(FleetLayer):
             )
 
         self.offload_context = nullcontext()
+
+    def _conditional_rms_norm(self, hidden_states: paddle.Tensor):
+        output_dtype = self.config.params_dtype or hidden_states.dtype
+        variance = paddle.mean(
+            paddle.square(hidden_states.astype("float32")),
+            axis=-1,
+            keepdim=True,
+        )
+        hidden_states = hidden_states * paddle.rsqrt(
+            variance + self.config.rms_norm_eps
+        )
+        return hidden_states.astype(output_dtype)
 
     def _concat_embeddings(
         self,
@@ -501,7 +537,11 @@ class MultiTokenPredictionLayer(FleetLayer):
                     hidden_states
                 )
         else:
-            hidden_states = self.hnorm(hidden_states)
+            mtp_input_fusion = getattr(self.config, "mtp_input_fusion", "concat")
+            if mtp_input_fusion == "cond_norm":
+                hidden_states = self._conditional_rms_norm(hidden_states)
+            else:
+                hidden_states = self.hnorm(hidden_states)
             # Apply mtp_hidden_inputs_mask to mask out hidden state contributions
             # at specific positions (e.g. EOS boundaries) in MTP.
             # mask shape: [B, 1, S] -> [B, S, 1] to broadcast with hidden_states [B, S, H]
@@ -537,19 +577,27 @@ class MultiTokenPredictionLayer(FleetLayer):
                         )
                     )
                 hidden_states = hidden_states * mtp_hidden_inputs_mask
-            # At the (k - 1)-th MTP layer, concatenates the i-th token's hidden_states
-            # and the (i + K)-th token's embedding, and combine them with linear projection.
-            hidden_states = paddle.cat((decoder_input, hidden_states), -1)
-            hidden_states, _ = self.eh_proj(hidden_states)
-            # For tensor parallel we need to gather the tensor across the model-parallel
-            # ranks after the linear projection. This used to call
-            # `all_gather_last_dim_from_tensor_parallel_region`, but that utility reduces
-            # the gradient in backward pass and was therefore incorrect in this context.
-            # It has been replaced with the correct `gather_from_tensor_model_parallel_region`.
-            if self.tensor_parallel > 1:
-                hidden_states = gather_from_tensor_model_parallel_region(
-                    hidden_states
-                )
+            # At the (k - 1)-th MTP layer, combine the i-th token's hidden_states
+            # and the (i + K)-th token's embedding before linear projection.
+            if mtp_input_fusion == "add":
+                hidden_states = decoder_input + hidden_states
+            elif mtp_input_fusion == "cond_norm":
+                cond_norm_params, _ = self.cond_norm_proj(decoder_input)
+                scale, shift = paddle.split(cond_norm_params, 2, axis=-1)
+                hidden_states = hidden_states * (1 + scale) + shift
+            else:
+                hidden_states = paddle.cat((decoder_input, hidden_states), -1)
+            if self.eh_proj is not None:
+                hidden_states, _ = self.eh_proj(hidden_states)
+                # For tensor parallel we need to gather the tensor across the model-parallel
+                # ranks after the linear projection. This used to call
+                # `all_gather_last_dim_from_tensor_parallel_region`, but that utility reduces
+                # the gradient in backward pass and was therefore incorrect in this context.
+                # It has been replaced with the correct `gather_from_tensor_model_parallel_region`.
+                if self.tensor_parallel > 1:
+                    hidden_states = gather_from_tensor_model_parallel_region(
+                        hidden_states
+                    )
             # For sequence parallel, scatter after linear_fc and before transformer layer.
             if self.sequence_parallel:
                 hidden_states = scatter_to_sequence_parallel_region(
