@@ -80,6 +80,16 @@ class TransformerConfig(ModelParallelConfig):
     mtp_hidden_source: str = "last_layer_output"
     """Which backbone hidden feature MTP uses as its initial feature: last_layer_output or last_layer_input."""
 
+    mtp_anchor_swap: bool = False
+    """When True, before fusion in MTP, project the previous-depth anchor embedding
+    direction out of the (hnorm-normalized) hidden_states, then run the existing
+    'add' or 'concat' fusion path with the current-depth anchor.
+    Geometrically: strip the residual-stream anchor (e_{t+k}) so the residue is
+    mostly context, then re-anchor on e_{t+k+1}; the reused last backbone layer L
+    then re-conditions all downstream computations on the new anchor.
+    Requires mtp_input_fusion in {'add','concat'}, mtp_reuse_last_layer=True,
+    mtp_hidden_source='last_layer_output', and enable_mtp_magic_send=False."""
+
     separate_mtp_headloss: bool = False
     """Separate MTP LMHead & Loss calculate for pipeline balance."""
 
@@ -973,6 +983,26 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 f"mtp_hidden_source must be 'last_layer_output' or 'last_layer_input', got {self.mtp_hidden_source!r}."
             )
+        if self.mtp_anchor_swap:
+            if self.mtp_input_fusion not in ("add", "concat"):
+                raise ValueError(
+                    "mtp_anchor_swap=True requires mtp_input_fusion in {'add','concat'}, "
+                    f"got {self.mtp_input_fusion!r}."
+                )
+            if not self.mtp_reuse_last_layer:
+                raise ValueError(
+                    "mtp_anchor_swap=True requires mtp_reuse_last_layer=True so that "
+                    "the reused last backbone layer L re-conditions on the new anchor."
+                )
+            if self.mtp_hidden_source != "last_layer_output":
+                raise ValueError(
+                    "mtp_anchor_swap=True requires mtp_hidden_source='last_layer_output' "
+                    f"for loop-consistent depth-k input distribution, got {self.mtp_hidden_source!r}."
+                )
+            if self.enable_mtp_magic_send:
+                raise ValueError(
+                    "mtp_anchor_swap=True is not supported with enable_mtp_magic_send=True yet."
+                )
         if self.mtp_reuse_last_layer and self.use_dense_mtp:
             # When MTP reuses the last backbone TransformerLayer's parameters,
             # the MTP transformer block must have an identical structure to the
