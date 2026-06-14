@@ -77,9 +77,6 @@ class TransformerConfig(ModelParallelConfig):
     mtp_input_fusion: str = "concat"
     """How MTP combines normalized hidden states and shifted input embeddings: concat, add, or cond_norm."""
 
-    mtp_hidden_source: str = "last_layer_output"
-    """Which backbone hidden feature MTP uses as its initial feature: last_layer_output or last_layer_input."""
-
     separate_mtp_headloss: bool = False
     """Separate MTP LMHead & Loss calculate for pipeline balance."""
 
@@ -965,13 +962,6 @@ class TransformerConfig(ModelParallelConfig):
         if self.mtp_input_fusion not in ("concat", "add", "cond_norm"):
             raise ValueError(
                 f"mtp_input_fusion must be 'concat', 'add', or 'cond_norm', got {self.mtp_input_fusion!r}."
-            )
-        if self.mtp_hidden_source not in (
-            "last_layer_output",
-            "last_layer_input",
-        ):
-            raise ValueError(
-                f"mtp_hidden_source must be 'last_layer_output' or 'last_layer_input', got {self.mtp_hidden_source!r}."
             )
         if self.mtp_reuse_last_layer and self.use_dense_mtp:
             # When MTP reuses the last backbone TransformerLayer's parameters,

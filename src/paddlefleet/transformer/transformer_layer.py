@@ -196,7 +196,6 @@ class TransformerLayer(nn.Layer):
 
         self.layer_number = layer_number
         self.is_mtp_layer = is_mtp_layer
-        self._mtp_hidden_source_logged = False
         self.hidden_dropout_prob = (
             config.hidden_dropout_prob
             if hidden_dropout_prob is None
@@ -451,7 +450,6 @@ class TransformerLayer(nn.Layer):
         )
         mtp_input = None
         mtp_ids = None
-        mtp_base_hidden_states = None
         if (
             self.config.num_nextn_predict_layers is not None
             and self.config.num_nextn_predict_layers > 0
@@ -466,7 +464,6 @@ class TransformerLayer(nn.Layer):
             )
             hidden_states = tensor_list[0]
             mtp_input = tuple(tensor_list[1:])
-            mtp_base_hidden_states = hidden_states
             dict_args["hidden_states"] = hidden_states
 
             # process position_ids
@@ -648,28 +645,6 @@ class TransformerLayer(nn.Layer):
             and not self.config.mtp_load_weight_only
             and not self.config.enable_mtp_magic_send
         ):
-            mtp_hidden_source = getattr(
-                self.config, "mtp_hidden_source", "last_layer_output"
-            )
-            last_backbone_layer_number = (
-                self.config.num_empty_layers_add_in_head
-                + self.config.num_hidden_layers
-                - 1
-            )
-            if (
-                mtp_hidden_source == "last_layer_input"
-                and self.layer_number == last_backbone_layer_number
-                and mtp_base_hidden_states is not None
-            ):
-                rst["mtp_hidden_source_states"] = mtp_base_hidden_states
-                if not self._mtp_hidden_source_logged:
-                    logger.warning(
-                        "[MTP-HIDDEN-SOURCE-CONFIRM] "
-                        "mtp_hidden_source=last_layer_input "
-                        "layer_number=%s",
-                        self.layer_number,
-                    )
-                    self._mtp_hidden_source_logged = True
             hidden_states_concat = paddle.concat([output, *mtp_input])
             rst["hidden_states"] = hidden_states_concat
             if not self.config.gpt_model_use_experimental_version:
