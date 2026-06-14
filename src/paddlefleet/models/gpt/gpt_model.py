@@ -225,27 +225,41 @@ class GPTModel(PipelineLayer):
           [MTP-REUSE-LAYER-WARN]      partial / shape-mismatched alias
         """
         reuse_layer = self.config.mtp_reuse_layer
-        target_backbone_layer_number = (
-            self.config.num_empty_layers_add_in_head
-            + self.config.num_hidden_layers
-            + reuse_layer
-        )
+        num_empty = self.config.num_empty_layers_add_in_head
+        num_hidden = self.config.num_hidden_layers
+        target_backbone_layer_number = num_empty + num_hidden + reuse_layer
+        # Global backbone layer_number range (across all PP ranks) for sanity:
+        # backbone layers occupy [num_empty .. num_empty + num_hidden - 1]
+        # (layer_number is 0-indexed within the backbone block).
+        backbone_global_range = (num_empty, num_empty + num_hidden - 1)
+
         target_backbone = None
         mtp_layers = []
+        backbone_layers_on_rank = []
         for layer in self.run_function:
-            if (
-                isinstance(layer, TransformerLayer)
-                and layer.layer_number == target_backbone_layer_number
-            ):
-                target_backbone = layer
+            if isinstance(layer, TransformerLayer):
+                backbone_layers_on_rank.append(layer)
+                if layer.layer_number == target_backbone_layer_number:
+                    target_backbone = layer
             elif isinstance(layer, MultiTokenPredictionLayer):
                 mtp_layers.append(layer)
+
+        backbone_numbers_on_rank = [l.layer_number for l in backbone_layers_on_rank]
+        rank_range = (
+            (min(backbone_numbers_on_rank), max(backbone_numbers_on_rank))
+            if backbone_numbers_on_rank
+            else None
+        )
 
         if target_backbone is None or not mtp_layers:
             warnings.warn(
                 "[MTP-REUSE-LAYER-SKIP] not applied on this PP rank: "
-                f"mtp_reuse_layer={reuse_layer}, "
-                f"target_layer_number={target_backbone_layer_number}, "
+                f"mtp_reuse_layer={reuse_layer} (negative-index from end of backbone), "
+                f"resolved target_layer_number={target_backbone_layer_number} "
+                f"(= num_empty_layers_add_in_head={num_empty} + num_hidden_layers={num_hidden} "
+                f"+ mtp_reuse_layer={reuse_layer}), "
+                f"backbone_global_range={backbone_global_range}, "
+                f"backbone_layer_numbers_on_this_rank={backbone_numbers_on_rank}, "
                 f"has_target_backbone={target_backbone is not None}, "
                 f"num_mtp_layers={len(mtp_layers)}. If pipeline_model_parallel_size>1 "
                 "and the selected backbone layer and MTP are on different stages, "
@@ -307,8 +321,14 @@ class GPTModel(PipelineLayer):
                 tag = "[MTP-REUSE-LAYER-WARN]"
             warnings.warn(
                 f"{tag} mtp_layer_number={mtp.layer_number} "
-                f"mtp_reuse_layer={reuse_layer} "
-                f"target_layer_number={target_backbone_layer_number} "
+                f"mtp_reuse_layer={reuse_layer} (negative-index from end of backbone) "
+                f"resolved_target_layer_number={target_backbone_layer_number} "
+                f"(= num_empty_layers_add_in_head={num_empty} + num_hidden_layers={num_hidden} "
+                f"+ mtp_reuse_layer={reuse_layer}), "
+                f"backbone_global_range={backbone_global_range}, "
+                f"target_layer_in_global_range={backbone_global_range[0] <= target_backbone_layer_number <= backbone_global_range[1]}, "
+                f"backbone_layer_numbers_on_this_rank={backbone_numbers_on_rank}, "
+                f"actual_aliased_src_layer_number={target_backbone.layer_number}, "
                 f"aliased={aliased}/{total} params to selected backbone TransformerLayer "
                 f"(missing_in_backbone={missing}, shape_mismatch={shape_mismatch}). "
                 "missing/shape_mismatch>0 typically means use_dense_mtp=True "
