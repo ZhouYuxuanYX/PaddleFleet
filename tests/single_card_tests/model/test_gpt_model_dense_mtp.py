@@ -221,8 +221,8 @@ class TestDenseMTP(unittest.TestCase):
             f"got {type(inner_mlp).__name__}"
         )
 
-    def test_mtp_reuse_last_layer_aliases_params(self):
-        """When mtp_reuse_last_layer=True, MTP transformer params should reuse last backbone params."""
+    def test_mtp_reuse_layer_minus_one_aliases_params(self):
+        """When mtp_reuse_layer=-1, MTP transformer params should reuse last backbone params."""
         config = GPTConfig(
             num_hidden_layers=2,
             hidden_size=512,
@@ -247,7 +247,7 @@ class TestDenseMTP(unittest.TestCase):
             use_qk_norm=True,
             num_nextn_predict_layers=1,
             use_dense_mtp=True,
-            mtp_reuse_last_layer=True,
+            mtp_reuse_layer=-1,
         )
         model = gpt_builder(config, num_stages=1)
 
@@ -271,9 +271,62 @@ class TestDenseMTP(unittest.TestCase):
             f"MTP params should reuse last backbone params, not_shared={not_shared[:5]}"
         )
 
-    def test_mtp_reuse_last_layer_overrides_use_dense_mtp(self):
-        """mtp_reuse_last_layer=True should force use_dense_mtp=False so the MTP
-        layer always mirrors the backbone-last layer (MoE in this config),
+    def test_mtp_reuse_layer_minus_two_aliases_second_last_layer(self):
+        """When mtp_reuse_layer=-2, MTP transformer params should reuse L-1, not L."""
+        config = GPTConfig(
+            num_hidden_layers=3,
+            hidden_size=512,
+            vocab_size=100,
+            max_sequence_length=64,
+            num_attention_heads=4,
+            intermediate_size=1024,
+            normalization="RMSNorm",
+            hidden_dropout_prob=0.0,
+            attention_dropout=0.0,
+            use_bias=False,
+            rotary_percent=1.0,
+            rotary_base=10000,
+            rope_scaling=1.0,
+            init_method=functools.partial(
+                paddle.nn.init.xavier_uniform_, gain=1.0
+            ),
+            output_layer_init_method=functools.partial(
+                paddle.nn.init.xavier_uniform_, gain=1.0
+            ),
+            tie_word_embeddings=True,
+            use_qk_norm=True,
+            num_nextn_predict_layers=1,
+            use_dense_mtp=True,
+            mtp_reuse_layer=-2,
+        )
+        model = gpt_builder(config, num_stages=1)
+
+        decoder_layers = self._find_decoder_layers(model)
+        mtp_layer = self._find_mtp_layer(model)
+        assert len(decoder_layers) >= 3
+        assert mtp_layer is not None
+
+        target_params = dict(decoder_layers[-2].named_parameters())
+        last_params = dict(decoder_layers[-1].named_parameters())
+        mtp_params = dict(mtp_layer.transformer_layer.named_parameters())
+
+        not_shared_with_target = [
+            n for n, p in mtp_params.items() if target_params.get(n) is not p
+        ]
+        shared_with_last = [
+            n for n, p in mtp_params.items() if last_params.get(n) is p
+        ]
+
+        assert not not_shared_with_target, (
+            f"MTP params should reuse second-last backbone params, not_shared={not_shared_with_target[:5]}"
+        )
+        assert not shared_with_last, (
+            f"MTP params should not reuse last layer when mtp_reuse_layer=-2, shared={shared_with_last[:5]}"
+        )
+
+    def test_mtp_reuse_layer_overrides_use_dense_mtp(self):
+        """mtp_reuse_layer=-1 should force use_dense_mtp=False so the MTP
+        layer always mirrors the selected backbone layer (MoE in this config),
         regardless of the user-supplied use_dense_mtp value."""
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
@@ -306,15 +359,15 @@ class TestDenseMTP(unittest.TestCase):
                 use_qk_norm=True,
                 num_nextn_predict_layers=1,
                 use_dense_mtp=True,
-                mtp_reuse_last_layer=True,
+                mtp_reuse_layer=-1,
             )
 
         assert config.use_dense_mtp is False, (
-            "mtp_reuse_last_layer=True should force use_dense_mtp=False, "
+            "mtp_reuse_layer=-1 should force use_dense_mtp=False, "
             f"got use_dense_mtp={config.use_dense_mtp}"
         )
-        assert any("MTP-REUSE-LAST-LAYER" in str(w.message) for w in caught), (
-            "Override should emit a [MTP-REUSE-LAST-LAYER] warning"
+        assert any("MTP-REUSE-LAYER" in str(w.message) for w in caught), (
+            "Override should emit a [MTP-REUSE-LAYER] warning"
         )
 
         model = gpt_builder(config, num_stages=1)

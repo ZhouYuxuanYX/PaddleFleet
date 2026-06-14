@@ -200,50 +200,64 @@ class GPTModel(PipelineLayer):
                     layer.weight = shared_embed_weight
 
         # MTP parameter reuse: alias each MultiTokenPredictionLayer's
-        # transformer_layer parameters to the last backbone TransformerLayer's
+        # transformer_layer parameters to the selected backbone TransformerLayer's
         # parameters on this PP rank (Option A — parameter-level aliasing,
         # NOT module reference replacement, so the LayerDesc tree is preserved
         # and checkpoint save via AOA still emits per-MTP keys).
-        if getattr(self.config, "mtp_reuse_last_layer", False):
-            self._alias_mtp_to_last_backbone_layer()
+        if getattr(self.config, "mtp_reuse_layer", None) is not None:
+            self._alias_mtp_to_reuse_layer()
 
-    def _alias_mtp_to_last_backbone_layer(self):
+    def _alias_mtp_to_reuse_layer(self):
         """Replace parameters of every MultiTokenPredictionLayer.transformer_layer
-        on this PP rank with the corresponding parameters of the last backbone
-        TransformerLayer on the same rank.
+        on this PP rank with the corresponding parameters of the selected
+        backbone TransformerLayer on the same rank.
+
+        config.mtp_reuse_layer follows Python negative indexing over the
+        backbone stack: -1 is the last layer, -2 is the second-to-last layer.
 
         Cross-stage aliasing is NOT supported (would need SharedLayerDesc); in
-        that case this is a no-op on the rank that lacks the backbone-last
+        that case this is a no-op on the rank that lacks the selected backbone
         layer, and a clear warning is emitted so operators can grep the log.
 
         Grep tags:
-          [MTP-REUSE-LAST-LAYER-CONFIRM]   alias succeeded for one MTP depth
-          [MTP-REUSE-LAST-LAYER-SKIP]      stage lacks one of the two endpoints
-          [MTP-REUSE-LAST-LAYER-WARN]      partial / shape-mismatched alias
+          [MTP-REUSE-LAYER-CONFIRM]   alias succeeded for one MTP depth
+          [MTP-REUSE-LAYER-SKIP]      stage lacks one of the two endpoints
+          [MTP-REUSE-LAYER-WARN]      partial / shape-mismatched alias
         """
-        last_backbone = None
+        reuse_layer = self.config.mtp_reuse_layer
+        target_backbone_layer_number = (
+            self.config.num_empty_layers_add_in_head
+            + self.config.num_hidden_layers
+            + reuse_layer
+        )
+        target_backbone = None
         mtp_layers = []
         for layer in self.run_function:
-            if isinstance(layer, TransformerLayer):
-                last_backbone = layer
+            if (
+                isinstance(layer, TransformerLayer)
+                and layer.layer_number == target_backbone_layer_number
+            ):
+                target_backbone = layer
             elif isinstance(layer, MultiTokenPredictionLayer):
                 mtp_layers.append(layer)
 
-        if last_backbone is None or not mtp_layers:
+        if target_backbone is None or not mtp_layers:
             warnings.warn(
-                "[MTP-REUSE-LAST-LAYER-SKIP] not applied on this PP rank: "
-                f"has_last_backbone={last_backbone is not None}, "
+                "[MTP-REUSE-LAYER-SKIP] not applied on this PP rank: "
+                f"mtp_reuse_layer={reuse_layer}, "
+                f"target_layer_number={target_backbone_layer_number}, "
+                f"has_target_backbone={target_backbone is not None}, "
                 f"num_mtp_layers={len(mtp_layers)}. If pipeline_model_parallel_size>1 "
-                "and backbone-last and MTP are on different stages, parameter-level "
-                "aliasing cannot bridge stages — use SharedLayerDesc instead."
+                "and the selected backbone layer and MTP are on different stages, "
+                "parameter-level aliasing cannot bridge stages — use SharedLayerDesc instead."
             )
             return
 
-        src_params = dict(last_backbone.named_parameters())
+        src_params = dict(target_backbone.named_parameters())
 
-        # Defensive check: with mtp_reuse_last_layer=True, TransformerConfig's
+        # Defensive check: with mtp_reuse_layer set, TransformerConfig's
         # __post_init__ force-sets use_dense_mtp=False so the MTP layer mirrors
-        # whatever the backbone-last layer is. This assert just guards against
+        # whatever the selected backbone layer is. This assert just guards against
         # someone bypassing __post_init__ (e.g. mutating the config after init).
         backbone_is_moe = any(
             (".experts." in n)
@@ -255,9 +269,9 @@ class GPTModel(PipelineLayer):
         assert not (
             backbone_is_moe and getattr(self.config, "use_dense_mtp", False)
         ), (
-            "[MTP-REUSE-LAST-LAYER] use_dense_mtp must be False when "
-            "mtp_reuse_last_layer=True (TransformerConfig.__post_init__ enforces "
-            "this). Backbone-last is MoE, MTP cannot be dense."
+            "[MTP-REUSE-LAYER] use_dense_mtp must be False when "
+            "mtp_reuse_layer is set (TransformerConfig.__post_init__ enforces "
+            "this). Selected backbone layer is MoE, MTP cannot be dense."
         )
 
         for mtp in mtp_layers:
@@ -288,15 +302,17 @@ class GPTModel(PipelineLayer):
                 aliased += 1
 
             total = len(dst_named)
-            tag = "[MTP-REUSE-LAST-LAYER-CONFIRM]"
+            tag = "[MTP-REUSE-LAYER-CONFIRM]"
             if missing or shape_mismatch:
-                tag = "[MTP-REUSE-LAST-LAYER-WARN]"
+                tag = "[MTP-REUSE-LAYER-WARN]"
             warnings.warn(
                 f"{tag} mtp_layer_number={mtp.layer_number} "
-                f"aliased={aliased}/{total} params to last backbone TransformerLayer "
+                f"mtp_reuse_layer={reuse_layer} "
+                f"target_layer_number={target_backbone_layer_number} "
+                f"aliased={aliased}/{total} params to selected backbone TransformerLayer "
                 f"(missing_in_backbone={missing}, shape_mismatch={shape_mismatch}). "
                 "missing/shape_mismatch>0 typically means use_dense_mtp=True "
-                "while backbone-last is MoE — set use_dense_mtp=False to fully reuse."
+                "while the selected backbone layer is MoE — set use_dense_mtp=False to fully reuse."
             )
 
     def _get_weight_only_params(self):

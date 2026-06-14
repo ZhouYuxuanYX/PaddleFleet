@@ -71,8 +71,10 @@ class TransformerConfig(ModelParallelConfig):
     use_dense_mtp: bool = False
     """When True, MTP layers use dense MLP instead of MoE in their internal transformer block."""
 
-    mtp_reuse_last_layer: bool = False
-    """When True, MTP layers reuse the last backbone TransformerLayer parameters."""
+    mtp_reuse_layer: int | None = None
+    """Which backbone TransformerLayer MTP should reuse. None disables reuse;
+    negative values select from the end of the backbone stack, e.g. -1 is the
+    last layer and -2 is the second-to-last layer."""
 
     separate_mtp_headloss: bool = False
     """Separate MTP LMHead & Loss calculate for pipeline balance."""
@@ -956,18 +958,29 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
-        if self.mtp_reuse_last_layer and self.use_dense_mtp:
-            # When MTP reuses the last backbone TransformerLayer's parameters,
-            # the MTP transformer block must have an identical structure to the
-            # backbone-last layer (same MoE / dense shape). Force-disable
-            # use_dense_mtp so the MTP layer matches whatever the backbone is.
-            warnings.warn(
-                "[MTP-REUSE-LAST-LAYER] mtp_reuse_last_layer=True overrides "
-                "use_dense_mtp=True -> use_dense_mtp=False. MTP layer structure "
-                "always matches the backbone-last TransformerLayer when reuse "
-                "is enabled."
-            )
-            self.use_dense_mtp = False
+        if self.mtp_reuse_layer is not None:
+            if self.mtp_reuse_layer >= 0:
+                raise ValueError(
+                    "mtp_reuse_layer must be None or a negative backbone-layer index, "
+                    f"got {self.mtp_reuse_layer}. Use -1 for last layer, -2 for second last."
+                )
+            if abs(self.mtp_reuse_layer) > self.num_hidden_layers:
+                raise ValueError(
+                    "mtp_reuse_layer is out of range for the backbone stack: "
+                    f"got {self.mtp_reuse_layer}, num_hidden_layers={self.num_hidden_layers}."
+                )
+            if self.use_dense_mtp:
+                # When MTP reuses a backbone TransformerLayer's parameters,
+                # the MTP transformer block must have an identical structure to the
+                # selected backbone layer (same MoE / dense shape). Force-disable
+                # use_dense_mtp so the MTP layer matches whatever the backbone is.
+                warnings.warn(
+                    "[MTP-REUSE-LAYER] mtp_reuse_layer is set; overriding "
+                    "use_dense_mtp=True -> use_dense_mtp=False. MTP layer structure "
+                    "always matches the selected backbone TransformerLayer when reuse "
+                    "is enabled."
+                )
+                self.use_dense_mtp = False
         if self.enable_mtp_magic_send:
             assert self.num_nextn_predict_layers == 1, (
                 "enable_mtp_magic_send only supports num_nextn_predict_layers=1"
