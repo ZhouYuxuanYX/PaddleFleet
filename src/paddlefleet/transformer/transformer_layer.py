@@ -420,34 +420,6 @@ class TransformerLayer(nn.Layer):
                 in_mlp_recompute=self.recompute_mlp,
             )
 
-        # MTP depth conditioning: a per-depth bias [K+1, hidden_size] added
-        # to this layer's input. Slot 0 = main backbone forward, slots 1..K
-        # = MTP depths 1..K. Created on the backbone-last TransformerLayer
-        # (the layer that gets reused for MTP) AND on every MTP-class
-        # TransformerLayer; the mtp_reuse_last_layer parameter-aliasing pass
-        # in gpt_model._alias_mtp_to_last_backbone_layer naturally collapses
-        # the MTP copies onto the backbone-last copy, so all K+1 'modes' of
-        # layer L share one depth-conditioning table. Zero-init guarantees
-        # the model starts strictly equivalent to the no-conditioning
-        # baseline.
-        self.depth_embed = None
-        if getattr(self.config, "mtp_depth_condition", False):
-            last_backbone_layer_number = (
-                self.config.num_empty_layers_add_in_head
-                + self.config.num_hidden_layers
-                - 1
-            )
-            if (
-                self.is_mtp_layer
-                or self.layer_number == last_backbone_layer_number
-            ):
-                num_depth_slots = self.config.num_nextn_predict_layers + 1
-                self.depth_embed = self.create_parameter(
-                    shape=[num_depth_slots, self.config.hidden_size],
-                    dtype=self.config.params_dtype,
-                    default_initializer=nn.initializer.Constant(0.0),
-                )
-
     def build_schedule_node(self):
         return TransformerLayerNode(
             self,
@@ -477,11 +449,6 @@ class TransformerLayer(nn.Layer):
         TransformerLayer._skip_mtp_probes = (
             is_mtp  # Suppress MD5 probes for MTP passes
         )
-        # MTP depth conditioning: pull the depth slot index out of dict_args.
-        # For the backbone-last layer's main forward, slot is 0.
-        # For MTP forwards, the MTP layer sets it to (mtp_layer_number + 1)
-        # before calling self.transformer_layer(...).
-        mtp_depth_index = dict_args.pop("mtp_depth_index", None)
         mtp_input = None
         mtp_ids = None
         mtp_base_hidden_states = None
@@ -608,16 +575,6 @@ class TransformerLayer(nn.Layer):
                 # New dataflow (experimental_dataflow=True): main mask is already main-seq only,
                 # mtp masks are in mtp_startend_row_indices_all and will be used by MTP layer directly
                 attn_mask_startend_row_indices_mtp = None
-
-        # MTP depth conditioning: add the per-depth bias to this layer's input.
-        # depth_embed is only created on the backbone-last layer and on MTP
-        # layers (see __init__). Slot 0 = main forward (mtp_depth_index=None
-        # or 0); slots 1..K = MTP depths 1..K (set by MTP layer).
-        if self.depth_embed is not None:
-            depth_slot = mtp_depth_index if mtp_depth_index is not None else 0
-            dict_args["hidden_states"] = (
-                dict_args["hidden_states"] + self.depth_embed[depth_slot]
-            )
 
         if self.config.block_attention_residuals and "blocks" not in dict_args:
             dict_args["blocks"] = []

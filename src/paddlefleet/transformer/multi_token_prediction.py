@@ -653,7 +653,6 @@ class MultiTokenPredictionLayer(FleetLayer):
         input_ids: paddle.Tensor | None = None,
         position_ids: paddle.Tensor | None = None,
         prev_decoder_input: paddle.Tensor | None = None,
-        mtp_depth_index: int | None = None,
         **kwargs,
     ) -> paddle.Tensor:
         """
@@ -686,7 +685,6 @@ class MultiTokenPredictionLayer(FleetLayer):
                 "is_mtp": True,
                 "input_ids": input_ids,
                 "position_ids": position_ids,
-                "mtp_depth_index": mtp_depth_index,
             }
             rst_dict = self.transformer_layer(input_dict)
 
@@ -746,7 +744,6 @@ class MultiTokenPredictionLayer(FleetLayer):
             packed_seq_params = kwargs.get("packed_seq_params", None)
             mtp_hidden_inputs_mask = kwargs.get("mtp_hidden_inputs_mask", None)
             input_ids = kwargs.get("input_ids", None)
-            mtp_depth_index = kwargs.get("mtp_depth_index", None)
             position_ids = None
             if self.config.gpt_model_use_experimental_version:
                 position_ids = kwargs.get("position_ids", None)
@@ -786,7 +783,6 @@ class MultiTokenPredictionLayer(FleetLayer):
                 else None,
                 input_ids=input_ids if input_ids is not None else None,
                 position_ids=position_ids if position_ids is not None else None,
-                mtp_depth_index=mtp_depth_index,
             )
 
         if self.config.recompute_method == "uniform":
@@ -1117,14 +1113,6 @@ class MultiTokenPredictionLayer(FleetLayer):
                 else:
                     dict_args.pop("prev_decoder_input", None)
 
-                # MTP depth conditioning: depth slot for the reused layer L
-                # at MTP depth i is (i + 1); slot 0 is reserved for the main
-                # backbone forward.
-                if getattr(self.config, "mtp_depth_condition", False):
-                    dict_args["mtp_depth_index"] = i + 1
-                else:
-                    dict_args.pop("mtp_depth_index", None)
-
                 # New dataflow: get the mask for depth i, shape [B, 1, S, 1]
                 mtp_mask_i = None
                 if mtp_startend_row_indices_all is not None:
@@ -1172,7 +1160,6 @@ class MultiTokenPredictionLayer(FleetLayer):
             dict_args["hidden_states"] = hidden_states_concat
             dict_args.pop("decoder_input")
             dict_args.pop("prev_decoder_input", None)
-            dict_args.pop("mtp_depth_index", None)
         else:
             tensor_list = paddle.split(
                 hidden_states_concat, self.config.num_nextn_predict_layers + 1
@@ -1196,14 +1183,6 @@ class MultiTokenPredictionLayer(FleetLayer):
                 ]
             else:
                 dict_args.pop("prev_decoder_input", None)
-
-            # MTP depth conditioning: depth slot for the reused layer L at
-            # MTP layer_number is (layer_number + 1); slot 0 is reserved for
-            # the main backbone forward.
-            if getattr(self.config, "mtp_depth_condition", False):
-                dict_args["mtp_depth_index"] = self.layer_number + 1
-            else:
-                dict_args.pop("mtp_depth_index", None)
 
             # New dataflow: get the mask for this layer's depth, shape [B, 1, S, 1]
             mtp_mask = None
@@ -1264,7 +1243,6 @@ class MultiTokenPredictionLayer(FleetLayer):
             dict_args["hidden_states"] = hidden_states_concat
             dict_args.pop("decoder_input")
             dict_args.pop("prev_decoder_input", None)
-            dict_args.pop("mtp_depth_index", None)
 
         # mHC: pass updated multi-stream to subsequent MTP layers
         if (
