@@ -90,6 +90,19 @@ class TransformerConfig(ModelParallelConfig):
     Requires mtp_input_fusion in {'add','concat'}, mtp_reuse_last_layer=True,
     mtp_hidden_source='last_layer_output', and enable_mtp_magic_send=False."""
 
+    mtp_depth_condition: bool = False
+    """When True, add a per-depth bias [K+1, hidden_size] (zero-init) to the input
+    of the reused backbone-last TransformerLayer L. Slot 0 is used by the main
+    backbone forward; slots 1..K are used by the K MTP depths. The same parameter
+    is aliased onto every MTP layer so all K+1 'modes' of layer L share a single
+    depth-conditioning table (timestep-embedding analogy: tells the shared layer
+    which depth it is currently running at). Zero-init guarantees the model
+    starts strictly equivalent to the baseline. Requires mtp_reuse_last_layer=True
+    (so the MTP and backbone-last layer are guaranteed to be on the same PP rank
+    and share params), num_nextn_predict_layers > 0, enable_hyper_connections=False
+    (mHC has a different hidden shape; not yet supported), and
+    enable_mtp_magic_send=False."""
+
     separate_mtp_headloss: bool = False
     """Separate MTP LMHead & Loss calculate for pipeline balance."""
 
@@ -1002,6 +1015,28 @@ class TransformerConfig(ModelParallelConfig):
             if self.enable_mtp_magic_send:
                 raise ValueError(
                     "mtp_anchor_swap=True is not supported with enable_mtp_magic_send=True yet."
+                )
+        if self.mtp_depth_condition:
+            if not self.mtp_reuse_last_layer:
+                raise ValueError(
+                    "mtp_depth_condition=True requires mtp_reuse_last_layer=True so the "
+                    "MTP layers and backbone-last layer share parameters and are co-located "
+                    "on the same PP rank."
+                )
+            if (
+                self.num_nextn_predict_layers is None
+                or self.num_nextn_predict_layers <= 0
+            ):
+                raise ValueError(
+                    "mtp_depth_condition=True requires num_nextn_predict_layers > 0."
+                )
+            if self.enable_hyper_connections:
+                raise ValueError(
+                    "mtp_depth_condition=True is not supported with enable_hyper_connections=True yet."
+                )
+            if self.enable_mtp_magic_send:
+                raise ValueError(
+                    "mtp_depth_condition=True is not supported with enable_mtp_magic_send=True yet."
                 )
         if self.mtp_reuse_last_layer and self.use_dense_mtp:
             # When MTP reuses the last backbone TransformerLayer's parameters,
