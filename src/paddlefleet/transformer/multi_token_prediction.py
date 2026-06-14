@@ -463,7 +463,6 @@ class MultiTokenPredictionLayer(FleetLayer):
         hidden_states: paddle.Tensor,
         decoder_input: paddle.Tensor,
         mtp_hidden_inputs_mask: paddle.Tensor | None = None,
-        prev_decoder_input: paddle.Tensor | None = None,
     ):
         """
         Concatenate the tokens before sending to transformer layer.
@@ -471,14 +470,6 @@ class MultiTokenPredictionLayer(FleetLayer):
         In mHC mode, hidden_states is [s, b, n*h] (multi-stream) and decoder_input
         is [s, b, h] (single-stream embedding). Uses separate e_proj and h_proj.
         In non-mHC mode, concatenates and projects with eh_proj as before.
-
-        When mtp_anchor_swap=True (and mtp_input_fusion in {'add','concat'}),
-        prev_decoder_input is the previous-depth pristine anchor embedding
-        (e_{t+k}). Its enorm-normalized direction is projected out of
-        hnorm(hidden_states) before the fusion path runs, so the fusion sees a
-        residue that no longer carries the previous anchor direction; the
-        current-depth anchor enorm(decoder_input)=enorm(e_{t+k+1}) is then
-        re-anchored by the existing 'add' or 'concat' path.
         """
         decoder_input = self.enorm(decoder_input)
 
@@ -586,28 +577,6 @@ class MultiTokenPredictionLayer(FleetLayer):
                         )
                     )
                 hidden_states = hidden_states * mtp_hidden_inputs_mask
-            # Anchor-swap pre-step (operates in normalized space):
-            #   hidden_states <- hnorm(h) - proj_{enorm(e_prev)}(hnorm(h))
-            # Applied uniformly before any fusion mode that uses normalized
-            # decoder_input (add / concat). 'cond_norm' is excluded by config.
-            # Geometric meaning: strip the previous depth's anchor direction
-            # so that the residue is mostly context; the fusion below then
-            # re-anchors on the current depth's e_curr (and the reused last
-            # backbone layer L re-conditions downstream computation on it).
-            if (
-                getattr(self.config, "mtp_anchor_swap", False)
-                and prev_decoder_input is not None
-                and mtp_input_fusion in ("add", "concat")
-            ):
-                e_prev = self.enorm(prev_decoder_input)
-                eps = self.config.rms_norm_eps
-                e_prev_sqnorm = paddle.sum(
-                    e_prev * e_prev, axis=-1, keepdim=True
-                )
-                coef = paddle.sum(
-                    hidden_states * e_prev, axis=-1, keepdim=True
-                ) / (e_prev_sqnorm + eps)
-                hidden_states = hidden_states - coef * e_prev
             # At the (k - 1)-th MTP layer, combine the i-th token's hidden_states
             # and the (i + K)-th token's embedding before linear projection.
             if mtp_input_fusion == "add":
@@ -652,7 +621,6 @@ class MultiTokenPredictionLayer(FleetLayer):
         mtp_hidden_inputs_mask: paddle.Tensor | None = None,
         input_ids: paddle.Tensor | None = None,
         position_ids: paddle.Tensor | None = None,
-        prev_decoder_input: paddle.Tensor | None = None,
         **kwargs,
     ) -> paddle.Tensor:
         """
@@ -665,10 +633,7 @@ class MultiTokenPredictionLayer(FleetLayer):
 
         with rng_context:
             hidden_states = self._concat_embeddings(
-                hidden_states,
-                decoder_input,
-                mtp_hidden_inputs_mask,
-                prev_decoder_input=prev_decoder_input,
+                hidden_states, decoder_input, mtp_hidden_inputs_mask
             )
 
             input_dict = {
@@ -999,12 +964,6 @@ class MultiTokenPredictionLayer(FleetLayer):
         mtp_input_ids_for_moe_mask = dict_args.pop(
             "mtp_input_ids_for_moe_mask", None
         )
-        # Anchor swap: pristine pre-backbone embeddings
-        # [e_t | e_{t+1} | ... | e_{t+K}] concatenated on the same axis as
-        # hidden_states_concat. Only used when mtp_anchor_swap=True.
-        # Stays in dict_args across MTP layers via the restore block at the
-        # end of forward (so depth>=2 MTP stages can still read it).
-        mtp_pristine_anchors = dict_args.pop("mtp_pristine_anchors", None)
         # Save and clear backbone input_ids so it doesn't leak into MTP transformer layers
         origin_input_ids = dict_args.pop("input_ids", None)
 
@@ -1078,18 +1037,6 @@ class MultiTokenPredictionLayer(FleetLayer):
                 mhc_multistream, self.config.num_nextn_predict_layers + 1
             )
 
-        # Anchor swap: split pristine pre-backbone embeddings into per-depth
-        # chunks. pristine_chunks[k] = e_{t+k}. Used as prev_decoder_input.
-        pristine_chunks = None
-        if (
-            getattr(self.config, "mtp_anchor_swap", False)
-            and mtp_pristine_anchors is not None
-        ):
-            pristine_chunks = paddle.split(
-                mtp_pristine_anchors,
-                self.config.num_nextn_predict_layers + 1,
-            )
-
         if self.config.train_mtp_only:
             for i in range(self.config.num_nextn_predict_layers):
                 tensor_list = paddle.split(
@@ -1104,14 +1051,6 @@ class MultiTokenPredictionLayer(FleetLayer):
                 else:
                     dict_args["hidden_states"] = tensor_list[i]
                 dict_args["decoder_input"] = tensor_list[i + 1]
-                # Anchor swap: prev anchor for depth i is the pristine
-                # pre-backbone embedding e_{t+i}. tensor_list[i] is unsafe here
-                # because for i>=1 it has been overwritten with the previous
-                # depth's MTP output by the loop body below.
-                if pristine_chunks is not None:
-                    dict_args["prev_decoder_input"] = pristine_chunks[i]
-                else:
-                    dict_args.pop("prev_decoder_input", None)
 
                 # New dataflow: get the mask for depth i, shape [B, 1, S, 1]
                 mtp_mask_i = None
@@ -1159,7 +1098,6 @@ class MultiTokenPredictionLayer(FleetLayer):
                 hidden_states_concat = paddle.concat(tensor_list)
             dict_args["hidden_states"] = hidden_states_concat
             dict_args.pop("decoder_input")
-            dict_args.pop("prev_decoder_input", None)
         else:
             tensor_list = paddle.split(
                 hidden_states_concat, self.config.num_nextn_predict_layers + 1
@@ -1172,17 +1110,6 @@ class MultiTokenPredictionLayer(FleetLayer):
             else:
                 dict_args["hidden_states"] = tensor_list[self.layer_number]
             dict_args["decoder_input"] = tensor_list[self.layer_number + 1]
-            # Anchor swap: prev anchor for depth=self.layer_number is the pristine
-            # pre-backbone embedding e_{t+layer_number} (from the side channel).
-            # tensor_list[layer_number] is unsafe for layer_number>=1: it has been
-            # overwritten with the previous MTP layer's output by the cross-stage
-            # concat done by the previous MTP layer instance.
-            if pristine_chunks is not None:
-                dict_args["prev_decoder_input"] = pristine_chunks[
-                    self.layer_number
-                ]
-            else:
-                dict_args.pop("prev_decoder_input", None)
 
             # New dataflow: get the mask for this layer's depth, shape [B, 1, S, 1]
             mtp_mask = None
@@ -1242,7 +1169,6 @@ class MultiTokenPredictionLayer(FleetLayer):
             hidden_states_concat = paddle.concat(tensor_list)
             dict_args["hidden_states"] = hidden_states_concat
             dict_args.pop("decoder_input")
-            dict_args.pop("prev_decoder_input", None)
 
         # mHC: pass updated multi-stream to subsequent MTP layers
         if (
@@ -1263,9 +1189,6 @@ class MultiTokenPredictionLayer(FleetLayer):
         # Restore mtp_input_ids_for_moe_mask for subsequent MTP layers (num_nextn > 1)
         if mtp_input_ids_for_moe_mask is not None:
             dict_args["mtp_input_ids_for_moe_mask"] = mtp_input_ids_for_moe_mask
-        # Restore mtp_pristine_anchors for subsequent MTP layers (num_nextn > 1)
-        if mtp_pristine_anchors is not None:
-            dict_args["mtp_pristine_anchors"] = mtp_pristine_anchors
         # Restore backbone input_ids
         if origin_input_ids is not None:
             dict_args["input_ids"] = origin_input_ids

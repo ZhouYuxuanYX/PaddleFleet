@@ -648,12 +648,6 @@ class GPTEmbedding(FleetLayer):
             assert len(mtp_emb_res) == self.config.num_nextn_predict_layers + 1
             hidden_states_concat = paddle.concat(mtp_emb_res)
             preproc_output["hidden_states"] = hidden_states_concat
-            # Anchor swap side channel: pristine pre-backbone embeddings
-            # [e_t, e_{t+1}, ..., e_{t+K}] (same per-chunk structure as
-            # hidden_states_concat, but never passes through the backbone).
-            # MTP layer at depth k uses the k-th chunk as prev_decoder_input.
-            if getattr(self.config, "mtp_anchor_swap", False):
-                preproc_output["mtp_pristine_anchors"] = hidden_states_concat
 
         # Pass through KV cache kwargs for inference
         for key in ("past_key_values", "use_cache"):
