@@ -662,20 +662,22 @@ class TransformerLayer(nn.Layer):
                 source_layer_number = backbone_total + mtp_reuse_layer
             else:
                 source_layer_number = backbone_total - 1
+            if not self._mtp_hidden_source_logged:
+                import warnings as _warnings
+                _warnings.warn(
+                    f"[MTP-HIDDEN-SOURCE-DECIDE] "
+                    f"mtp_hidden_source={mtp_hidden_source} "
+                    f"layer_number={self.layer_number} "
+                    f"source_layer_number={source_layer_number} "
+                    f"will_inject={mtp_hidden_source == 'input' and self.layer_number == source_layer_number and mtp_base_hidden_states is not None}"
+                )
+                self._mtp_hidden_source_logged = True
             if (
                 mtp_hidden_source == "input"
                 and self.layer_number == source_layer_number
                 and mtp_base_hidden_states is not None
             ):
                 rst["mtp_hidden_source_states"] = mtp_base_hidden_states
-                if not self._mtp_hidden_source_logged:
-                    logger.warning(
-                        "[MTP-HIDDEN-SOURCE-CONFIRM] "
-                        "mtp_hidden_source=input "
-                        "layer_number=%s",
-                        self.layer_number,
-                    )
-                    self._mtp_hidden_source_logged = True
             hidden_states_concat = paddle.concat([output, *mtp_input])
             rst["hidden_states"] = hidden_states_concat
             if not self.config.gpt_model_use_experimental_version:
