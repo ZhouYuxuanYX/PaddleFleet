@@ -390,6 +390,203 @@ class TestDenseMTP(unittest.TestCase):
             f"MTP params should reuse last backbone params, not_shared={not_shared[:5]}"
         )
 
+    def test_mtp_hidden_source_default_is_output(self):
+        """mtp_hidden_source defaults to 'output' (no behavior change)."""
+        config = GPTConfig(
+            num_hidden_layers=2,
+            hidden_size=512,
+            vocab_size=100,
+            max_sequence_length=64,
+            num_attention_heads=4,
+            intermediate_size=1024,
+            normalization="RMSNorm",
+            hidden_dropout_prob=0.0,
+            attention_dropout=0.0,
+            use_bias=False,
+            rotary_percent=1.0,
+            rotary_base=10000,
+            rope_scaling=1.0,
+            init_method=functools.partial(
+                paddle.nn.init.xavier_uniform_, gain=1.0
+            ),
+            output_layer_init_method=functools.partial(
+                paddle.nn.init.xavier_uniform_, gain=1.0
+            ),
+            tie_word_embeddings=True,
+            use_qk_norm=True,
+            num_nextn_predict_layers=1,
+            use_dense_mtp=True,
+        )
+        assert config.mtp_hidden_source == "output", (
+            f"default should be 'output', got {config.mtp_hidden_source!r}"
+        )
+
+    def test_mtp_hidden_source_invalid_raises(self):
+        """An unknown mtp_hidden_source value should raise ValueError."""
+        with self.assertRaises(ValueError):
+            GPTConfig(
+                num_hidden_layers=2,
+                hidden_size=512,
+                vocab_size=100,
+                max_sequence_length=64,
+                num_attention_heads=4,
+                intermediate_size=1024,
+                normalization="RMSNorm",
+                hidden_dropout_prob=0.0,
+                attention_dropout=0.0,
+                use_bias=False,
+                rotary_percent=1.0,
+                rotary_base=10000,
+                rope_scaling=1.0,
+                init_method=functools.partial(
+                    paddle.nn.init.xavier_uniform_, gain=1.0
+                ),
+                output_layer_init_method=functools.partial(
+                    paddle.nn.init.xavier_uniform_, gain=1.0
+                ),
+                tie_word_embeddings=True,
+                use_qk_norm=True,
+                num_nextn_predict_layers=1,
+                use_dense_mtp=True,
+                mtp_hidden_source="bogus",
+            )
+
+    def test_mtp_hidden_source_input_forward_runs(self):
+        """Forward pass with mtp_hidden_source='input' should produce a finite loss
+        and emit the [MTP-HIDDEN-SOURCE-CONFIRM] warning exactly once."""
+        seed = 46
+        random.seed(seed)
+        np.random.seed(seed)
+        paddle.seed(seed)
+
+        config = GPTConfig(
+            num_hidden_layers=2,
+            hidden_size=512,
+            vocab_size=100,
+            max_sequence_length=64,
+            num_attention_heads=4,
+            intermediate_size=1024,
+            normalization="RMSNorm",
+            hidden_dropout_prob=0.0,
+            attention_dropout=0.0,
+            use_bias=False,
+            rotary_percent=1.0,
+            rotary_base=10000,
+            rope_scaling=1.0,
+            init_method=functools.partial(
+                paddle.nn.init.xavier_uniform_, gain=1.0
+            ),
+            output_layer_init_method=functools.partial(
+                paddle.nn.init.xavier_uniform_, gain=1.0
+            ),
+            tie_word_embeddings=True,
+            use_qk_norm=True,
+            num_nextn_predict_layers=1,
+            use_dense_mtp=True,
+            mtp_reuse_layer=-1,
+            mtp_hidden_source="input",
+        )
+        model = gpt_builder(config, num_stages=1)
+
+        sequence_length = config.max_sequence_length
+        micro_batch_size = 1
+        data_seq = list(range(sequence_length))
+        input_ids = paddle.to_tensor(data_seq, dtype=paddle.int64).repeat(
+            (micro_batch_size, 1)
+        )
+        position_ids = paddle.to_tensor(data_seq, dtype=paddle.int64).repeat(
+            (micro_batch_size, 1)
+        )
+        labels = paddle.to_tensor(
+            list(range(1, sequence_length + 1)), dtype=paddle.int64
+        ).repeat((micro_batch_size, 1))
+
+        gpt_pipe_model = NoPipelineParallel(model, self.strategy)
+        data = (
+            {"input_ids": [input_ids], "position_ids": [position_ids]},
+            [labels],
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            loss = gpt_pipe_model.forward_backward_pipeline(data)
+
+        assert loss is not None
+        assert not paddle.isnan(loss).any()
+        assert not paddle.isinf(loss).any()
+        confirm_msgs = [
+            str(w.message)
+            for w in caught
+            if "MTP-HIDDEN-SOURCE-CONFIRM" in str(w.message)
+        ]
+        assert confirm_msgs, (
+            "Expected [MTP-HIDDEN-SOURCE-CONFIRM] warning when mtp_hidden_source='input'"
+        )
+        # The injection layer must be the last backbone layer
+        # (mtp_reuse_layer=-1, num_hidden_layers=2 -> source_layer_number=1).
+        assert any("layer_number=1" in m for m in confirm_msgs), (
+            f"Expected injection at layer_number=1, got: {confirm_msgs}"
+        )
+
+    def test_mtp_reuse_layer_non_negative_raises(self):
+        """mtp_reuse_layer must be a negative index; non-negative values must raise."""
+        with self.assertRaises(ValueError):
+            GPTConfig(
+                num_hidden_layers=2,
+                hidden_size=512,
+                vocab_size=100,
+                max_sequence_length=64,
+                num_attention_heads=4,
+                intermediate_size=1024,
+                normalization="RMSNorm",
+                hidden_dropout_prob=0.0,
+                attention_dropout=0.0,
+                use_bias=False,
+                rotary_percent=1.0,
+                rotary_base=10000,
+                rope_scaling=1.0,
+                init_method=functools.partial(
+                    paddle.nn.init.xavier_uniform_, gain=1.0
+                ),
+                output_layer_init_method=functools.partial(
+                    paddle.nn.init.xavier_uniform_, gain=1.0
+                ),
+                tie_word_embeddings=True,
+                use_qk_norm=True,
+                num_nextn_predict_layers=1,
+                use_dense_mtp=True,
+                mtp_reuse_layer=0,
+            )
+
+    def test_mtp_reuse_layer_out_of_range_raises(self):
+        """mtp_reuse_layer with magnitude exceeding num_hidden_layers must raise."""
+        with self.assertRaises(ValueError):
+            GPTConfig(
+                num_hidden_layers=2,
+                hidden_size=512,
+                vocab_size=100,
+                max_sequence_length=64,
+                num_attention_heads=4,
+                intermediate_size=1024,
+                normalization="RMSNorm",
+                hidden_dropout_prob=0.0,
+                attention_dropout=0.0,
+                use_bias=False,
+                rotary_percent=1.0,
+                rotary_base=10000,
+                rope_scaling=1.0,
+                init_method=functools.partial(
+                    paddle.nn.init.xavier_uniform_, gain=1.0
+                ),
+                output_layer_init_method=functools.partial(
+                    paddle.nn.init.xavier_uniform_, gain=1.0
+                ),
+                tie_word_embeddings=True,
+                use_qk_norm=True,
+                num_nextn_predict_layers=1,
+                use_dense_mtp=True,
+                mtp_reuse_layer=-99,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

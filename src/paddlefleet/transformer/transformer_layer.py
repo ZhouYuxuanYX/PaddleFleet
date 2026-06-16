@@ -670,6 +670,7 @@ class TransformerLayer(nn.Layer):
                 rst["mtp_hidden_source_states"] = mtp_base_hidden_states
                 if not self._mtp_hidden_source_logged:
                     import warnings as _warnings
+
                     _warnings.warn(
                         f"[MTP-HIDDEN-SOURCE-CONFIRM] "
                         f"mtp_hidden_source=input "
