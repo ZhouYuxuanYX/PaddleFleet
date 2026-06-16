@@ -649,23 +649,29 @@ class TransformerLayer(nn.Layer):
             and not self.config.enable_mtp_magic_send
         ):
             mtp_hidden_source = getattr(
-                self.config, "mtp_hidden_source", "last_layer_output"
+                self.config, "mtp_hidden_source", "output"
             )
-            last_backbone_layer_number = (
+            mtp_reuse_layer = getattr(self.config, "mtp_reuse_layer", None)
+            # Source layer index follows mtp_reuse_layer when set, otherwise the last backbone layer.
+            backbone_total = (
                 self.config.num_empty_layers_add_in_head
                 + self.config.num_hidden_layers
-                - 1
             )
+            if mtp_reuse_layer is not None:
+                # mtp_reuse_layer is a negative index into the backbone stack (-1 = last).
+                source_layer_number = backbone_total + mtp_reuse_layer
+            else:
+                source_layer_number = backbone_total - 1
             if (
-                mtp_hidden_source == "last_layer_input"
-                and self.layer_number == last_backbone_layer_number
+                mtp_hidden_source == "input"
+                and self.layer_number == source_layer_number
                 and mtp_base_hidden_states is not None
             ):
                 rst["mtp_hidden_source_states"] = mtp_base_hidden_states
                 if not self._mtp_hidden_source_logged:
                     logger.warning(
                         "[MTP-HIDDEN-SOURCE-CONFIRM] "
-                        "mtp_hidden_source=last_layer_input "
+                        "mtp_hidden_source=input "
                         "layer_number=%s",
                         self.layer_number,
                     )
