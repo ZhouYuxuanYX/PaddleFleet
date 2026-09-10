@@ -20,6 +20,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import numpy as np
 import paddle
 from paddle import Tensor, nn
 from paddle.distributed.fleet.meta_parallel import (
@@ -763,6 +764,28 @@ class MultiTokenPredictionLayer(FleetLayer):
 
         return outputs
 
+    def _sample_mtp_depth(self):
+        """Sample how many MTP depths K to actually run this step (prefix 1..K).
+
+        Driven by config.mtp_depth_sampling, a list P(K=k) of length
+        D=num_nextn_predict_layers. K is sampled locally and then overwritten with
+        global rank 0's value via broadcast so that every rank runs the exact same
+        set of depths — required for MoE expert-parallel all-to-all to stay
+        consistent. Returns D when sampling is disabled.
+        """
+        d = self.config.num_nextn_predict_layers
+        ratio = getattr(self.config, "mtp_depth_sampling", None)
+        if not ratio:
+            return d
+        probs = np.asarray(ratio, dtype="float64")
+        probs = probs / probs.sum()
+        k = int(np.random.choice(len(probs), p=probs)) + 1
+        if paddle.distributed.is_initialized():
+            t = paddle.to_tensor([k], dtype="int32")
+            paddle.distributed.broadcast(t, src=0)
+            k = int(t.item())
+        return max(1, min(k, d))
+
     def forward(self, dict_args: dict):
         if "context" in dict_args:
             assert dict_args["context"] is None, (
@@ -772,6 +795,30 @@ class MultiTokenPredictionLayer(FleetLayer):
             assert dict_args["packed_seq_params"] is None, (
                 "multi token prediction + sequence packing is not yet supported."
             )
+
+        # === MTP depth sampling (prefix-length sampling) ===
+        # Sample K once per micro-batch in the depth-0 layer and carry it in
+        # dict_args so it flows WITH the data. This is robust to
+        # gradient_accumulation_steps>1, pipeline_parallel and recompute: there is no
+        # shared/config state an interleaved micro-batch could overwrite, and the
+        # recompute of a layer replays the same saved dict_args. Depths >= K return
+        # early, skipping their transformer_layer forward; the LM head then emits None
+        # logits for them and the loss drops those entries.
+        if (
+            getattr(self.config, "mtp_depth_sampling", None)
+            and not self.config.enable_mtp_magic_send
+        ):
+            d = self.config.num_nextn_predict_layers
+            if self.layer_number == 0:
+                k = self._sample_mtp_depth()
+                dict_args["mtp_sampled_depth"] = k
+                # observability only, never read by the logic
+                self._last_sampled_depth = k
+            k = dict_args.get("mtp_sampled_depth", d)
+            if self.layer_number >= k:
+                # Skip this depth entirely: leave hidden_states_concat unchanged
+                # (K stays in dict_args for downstream MTP layers + the LM head).
+                return dict_args
 
         # === Magic Send branch ===
         # hidden_states is pure backbone output (not concatenated); mtp_input_embeds provided by MTPEmbeddingLayer
