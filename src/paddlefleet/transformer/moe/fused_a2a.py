@@ -15,7 +15,6 @@
 # limitations under the License.
 
 import inspect
-import os
 import queue
 
 import paddle
@@ -63,7 +62,7 @@ else:
 
 _buffer = None
 _hybrid_ep_buffer = None
-_EP_BARRIER_ASYNC = None
+_EP_BARRIER_ASYNC = True
 _ep_fence_tensors = {}
 
 # HybridEP dispatch/combine kernels use 128-token chunks to align with default
@@ -87,23 +86,23 @@ _SONIC_PACK_SCALE_WORDS_AVAILABLE = _supports_sonic_scale_word_packing(
 
 def barrier_ep(ep_group):
     """barrier_ep"""
-    if _ep_barrier_async_enabled():
+    if _EP_BARRIER_ASYNC:
         _stream_ordered_fence_ep(ep_group)
     else:
         paddle.distributed.barrier(ep_group)
 
 
-def _ep_barrier_async_enabled():
-    """Opt-in switch for the stream-ordered EP fence.
+def configure_ep_barrier(moe_ep_barrier_async: bool):
+    """Select the EP barrier implementation from ``moe_ep_barrier_async``.
 
-    Only valid while every DeepEP dispatch/combine is issued with
-    ``async_finish=False`` (the default), i.e. DeepEP work is joined back into
-    the calc stream before the next fence is enqueued.
+    Process-wide, like ``configure_buffer``: the fence protects the shared
+    module-level DeepEP ``_buffer``. Only valid while every DeepEP
+    dispatch/combine is issued with ``async_finish=False`` (the default), i.e.
+    DeepEP work is joined back into the calc stream before the next fence is
+    enqueued.
     """
     global _EP_BARRIER_ASYNC
-    if _EP_BARRIER_ASYNC is None:
-        _EP_BARRIER_ASYNC = os.getenv("FLEET_MOE_EP_BARRIER_ASYNC", "0") == "1"
-    return _EP_BARRIER_ASYNC
+    _EP_BARRIER_ASYNC = moe_ep_barrier_async
 
 
 def _ep_fence_tensor(ep_group):

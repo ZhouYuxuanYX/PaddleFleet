@@ -18,7 +18,7 @@ These exercise CPU-executable control/layout logic only:
   * get_hidden_bytes            -- per-token byte budget arithmetic
   * _normalize_fp8_scale_for_deepep -- transpose / truncate / validate
   * _ep_fence_tensor            -- per-group fence-tensor caching
-  * barrier_ep                  -- env-driven barrier vs. stream fence branch
+  * barrier_ep                  -- config-driven barrier vs. stream fence branch
   * DispatchNode / CombineNode  -- name + reset_statue state contract
 
 Real EP collectives (barrier / all_reduce) are genuine not-under-test
@@ -27,7 +27,6 @@ cross-rank rendezvous is NOT verified by this file. Expected values are derived
 by hand from the production source, independent of any coverage_test file.
 """
 
-import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -44,6 +43,7 @@ try:
         _ep_fence_tensor,
         _normalize_fp8_scale_for_deepep,
         barrier_ep,
+        configure_ep_barrier,
         get_hidden_bytes,
     )
 
@@ -173,8 +173,8 @@ class TestEpFenceTensor(unittest.TestCase):
 class TestBarrierEp(unittest.TestCase):
     """barrier_ep selects real barrier vs. stream-ordered all_reduce fence.
 
-    The env switch is cached in the module global _EP_BARRIER_ASYNC; each test
-    resets it, forces re-read, and restores it plus the fence-tensor cache.
+    The switch is the module global _EP_BARRIER_ASYNC set via
+    configure_ep_barrier; each test restores it plus the fence-tensor cache.
     The collectives themselves are mocked (real rendezvous NOT verified here).
     """
 
@@ -188,13 +188,13 @@ class TestBarrierEp(unittest.TestCase):
             fused_a2a._ep_fence_tensors.update(saved_fence)
 
         self.addCleanup(_restore_fence)
-        env = patch.dict(os.environ, {"FLEET_MOE_EP_BARRIER_ASYNC": value})
-        env.start()
-        self.addCleanup(env.stop)
-        fused_a2a._EP_BARRIER_ASYNC = None  # force env re-read
+        configure_ep_barrier(value)
+
+    def test_module_default_matches_config_default(self):
+        self.assertIs(fused_a2a._EP_BARRIER_ASYNC, True)
 
     def test_sync_branch_calls_barrier_only(self):
-        self._reset_switch("0")
+        self._reset_switch(False)
         group = SimpleNamespace(id=91001)
         with (
             patch.object(paddle.distributed, "barrier") as barrier,
@@ -205,7 +205,7 @@ class TestBarrierEp(unittest.TestCase):
         all_reduce.assert_not_called()
 
     def test_async_branch_all_reduces_fence_tensor_on_group(self):
-        self._reset_switch("1")
+        self._reset_switch(True)
         group = SimpleNamespace(id=91002)
         with (
             patch.object(paddle.distributed, "barrier") as barrier,

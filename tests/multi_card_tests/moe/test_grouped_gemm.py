@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import random
 import time
 import unittest
@@ -146,7 +145,7 @@ class TestStreamOrderedFenceEP(unittest.TestCase):
         self._reset_fence_state()
 
     def _reset_fence_state(self):
-        fused_a2a._EP_BARRIER_ASYNC = None
+        fused_a2a.configure_ep_barrier(True)
         fused_a2a._ep_fence_tensors.clear()
 
     def test_fence_tensor_is_cached_per_group(self):
@@ -192,53 +191,44 @@ class TestStreamOrderedFenceEP(unittest.TestCase):
         num_tokens, hidden_size, topk = 64, 128, 2
         outputs = []
 
-        with patch.dict(
-            os.environ,
-            {"FLEET_MOE_EP_BARRIER_ASYNC": "1" if async_barrier else "0"},
-        ):
-            fused_a2a._EP_BARRIER_ASYNC = None
-            for round_id in range(2):
-                values = np.arange(num_tokens * hidden_size, dtype="float32")
-                values = values.reshape(num_tokens, hidden_size)
-                values = values / (num_tokens * hidden_size)
-                values += ep_rank * 10 + round_id
-                x = paddle.to_tensor(values, dtype=paddle.bfloat16)
-                token_indices = paddle.to_tensor(
+        fused_a2a.configure_ep_barrier(async_barrier)
+        for round_id in range(2):
+            values = np.arange(num_tokens * hidden_size, dtype="float32")
+            values = values.reshape(num_tokens, hidden_size)
+            values = values / (num_tokens * hidden_size)
+            values += ep_rank * 10 + round_id
+            x = paddle.to_tensor(values, dtype=paddle.bfloat16)
+            token_indices = paddle.to_tensor(
+                [
                     [
-                        [
-                            (token_id + ep_rank + round_id) % num_experts,
-                            (
-                                token_id
-                                + ep_rank
-                                + round_id
-                                + self.ep_group.nranks
-                            )
-                            % num_experts,
-                        ]
-                        for token_id in range(num_tokens)
-                    ],
-                    dtype="int64",
-                )
-                token_probs = paddle.full(
-                    [num_tokens, topk], 1.0 / topk, dtype="float32"
-                )
+                        (token_id + ep_rank + round_id) % num_experts,
+                        (token_id + ep_rank + round_id + self.ep_group.nranks)
+                        % num_experts,
+                    ]
+                    for token_id in range(num_tokens)
+                ],
+                dtype="int64",
+            )
+            token_probs = paddle.full(
+                [num_tokens, topk], 1.0 / topk, dtype="float32"
+            )
 
-                dispatched_x, _, states, _ = fused_a2a.fused_dispatch(
-                    x,
-                    token_indices,
-                    token_probs,
-                    num_experts,
+            dispatched_x, _, states, _ = fused_a2a.fused_dispatch(
+                x,
+                token_indices,
+                token_probs,
+                num_experts,
+                self.ep_group,
+            )
+            if round_id == 0 and ep_rank == self.ep_group.nranks - 1:
+                time.sleep(0.5)
+            outputs.append(
+                fused_a2a.fused_combine(
+                    dispatched_x,
                     self.ep_group,
+                    states["handle"],
                 )
-                if round_id == 0 and ep_rank == self.ep_group.nranks - 1:
-                    time.sleep(0.5)
-                outputs.append(
-                    fused_a2a.fused_combine(
-                        dispatched_x,
-                        self.ep_group,
-                        states["handle"],
-                    )
-                )
+            )
 
         return outputs
 
@@ -264,8 +254,8 @@ class TestStreamOrderedFenceEP(unittest.TestCase):
             int(completed_rounds.numpy()[0]), 2 * self.ep_group.nranks
         )
 
-    def test_barrier_ep_uses_device_barrier_by_default(self):
-        fused_a2a._EP_BARRIER_ASYNC = False
+    def test_barrier_ep_uses_device_barrier_when_disabled(self):
+        fused_a2a.configure_ep_barrier(False)
         with (
             patch.object(paddle.distributed, "barrier") as device_barrier,
             patch.object(fused_a2a, "_stream_ordered_fence_ep") as fence,
@@ -275,7 +265,7 @@ class TestStreamOrderedFenceEP(unittest.TestCase):
         fence.assert_not_called()
 
     def test_barrier_ep_uses_fence_when_enabled(self):
-        fused_a2a._EP_BARRIER_ASYNC = True
+        fused_a2a.configure_ep_barrier(True)
         with (
             patch.object(paddle.distributed, "barrier") as device_barrier,
             patch.object(fused_a2a, "_stream_ordered_fence_ep") as fence,
@@ -283,17 +273,6 @@ class TestStreamOrderedFenceEP(unittest.TestCase):
             fused_a2a.barrier_ep(self.ep_group)
         fence.assert_called_once_with(self.ep_group)
         device_barrier.assert_not_called()
-
-    def test_async_flag_reads_env_once(self):
-        with patch.dict(os.environ, {"FLEET_MOE_EP_BARRIER_ASYNC": "1"}):
-            self.assertTrue(fused_a2a._ep_barrier_async_enabled())
-        # Cached: clearing the env afterwards must not flip the switch.
-        with patch.dict(os.environ, {}, clear=True):
-            self.assertTrue(fused_a2a._ep_barrier_async_enabled())
-
-        fused_a2a._EP_BARRIER_ASYNC = None
-        with patch.dict(os.environ, {}, clear=True):
-            self.assertFalse(fused_a2a._ep_barrier_async_enabled())
 
 
 if __name__ == "__main__":
