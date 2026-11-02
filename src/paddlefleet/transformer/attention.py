@@ -1312,9 +1312,11 @@ class SelfAttention(Attention):
 
         Independently splits the fused ``qkv_proj`` back into checkpoint q/k/v
         via ``fused_qkv``, then recurses every other direct child. The inverse
-        ``fused_qkv`` carries no ``^T``. ``SelfAttention`` owns no direct
-        parameter or buffer, so there is no own-parameter fallback. Not derived
-        from the checkpoint->model text.
+        first transposes the fused ``[hidden, fused_out]`` weight to
+        ``[fused_out, hidden]`` and splits it along ``axis=0``, so each piece
+        lands in the checkpoint's ``[out, hidden]`` layout. ``SelfAttention``
+        owns no direct parameter or buffer, so there is no own-parameter
+        fallback. Not derived from the checkpoint->model text.
         """
         statements = self._gen_inv_qkv_head_aoa_statements(
             ctx, structured_name_prefix, checkpoint_lookup_drop_segment
@@ -1456,11 +1458,13 @@ class SelfAttention(Attention):
         q_checkpoint_name = _anchor("q_proj.weight")
         k_checkpoint_name = _anchor("k_proj.weight")
         v_checkpoint_name = _anchor("v_proj.weight")
+        # Transposing the fused weight first puts the output features on
+        # axis 0, so the split pieces land directly in the checkpoint layout.
         statements = [
-            f"{qkv_model_name} -> {q_checkpoint_name}, "
+            f"{qkv_model_name}^T -> {q_checkpoint_name}, "
             f"{k_checkpoint_name}, {v_checkpoint_name}, "
             f"fused_qkv, num_heads={self.num_attention_heads}, "
-            f"num_key_value_groups={self.num_key_value_heads}"
+            f"num_key_value_groups={self.num_key_value_heads}, axis=0"
         ]
         if self.qkv_proj.bias is not None:
             statements += self._gen_inv_qkv_bias_aoa_statements(

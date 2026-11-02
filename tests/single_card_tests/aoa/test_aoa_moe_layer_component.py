@@ -13,8 +13,9 @@
 # limitations under the License.
 #
 # Scope: ``MoELayer`` owns no parameters of its own; it composes gate, optional
-# latent projection, optional shared experts (MLP), and the routed experts. The
-# routed-expert emission is dispatched on the *live* structure:
+# latent projection and ``latent_norm``, optional shared experts (MLP), and the
+# routed experts. The routed-expert emission is dispatched on the *live*
+# structure:
 #   * no ``grouped_gemm_experts`` -> per-expert recursion, enumerated by global
 #     expert id through a local template expert (see ``_global_expert_ctx``) so
 #     every EP rank emits the same statement set;
@@ -155,7 +156,11 @@ def _make_grouped_marker(
 
 
 def _make_moe_leaf(
-    num_experts=2, shared=False, grouped=False, grouped_marker_factory=None
+    num_experts=2,
+    shared=False,
+    grouped=False,
+    grouped_marker_factory=None,
+    latent_norm=False,
 ):
     """Binds the MoELayer AOA overrides onto a controllable stand-in.
 
@@ -206,6 +211,8 @@ def _make_moe_leaf(
             )
             if shared:
                 self.shared_experts = mlp_cls()
+            if latent_norm:
+                self.latent_norm = paddle.nn.LayerNorm(2)
             if grouped:
                 factory = (
                     _make_grouped_marker()
@@ -288,6 +295,39 @@ class TestMoELayerPerExpertInverse(unittest.TestCase):
                     f"-> {_HF}experts.{eid}.{leaf}.weight",
                     stmts,
                 )
+
+
+class TestMoELayerLatentNorm(unittest.TestCase):
+    """``latent_norm`` is a direct child the override composes by hand, so it
+    must be recursed explicitly in both directions; skipping it leaves its
+    parameters with no statement and they keep the model-side names."""
+
+    def _stmts(self, gen):
+        model = _make_moe_leaf(num_experts=1, latent_norm=True)()
+        return getattr(model, gen)(
+            _identity_ctx(model), structured_name_prefix=_PFX
+        )
+
+    def test_forward_maps_latent_norm(self):
+        stmts = self._stmts("gen_aoa_statements")
+        for p in ("weight", "bias"):
+            self.assertIn(
+                f"{_HF}latent_norm.{p} -> {_MD}latent_norm.{p}", stmts
+            )
+
+    def test_inverse_maps_latent_norm(self):
+        stmts = self._stmts("gen_inv_aoa_statements")
+        for p in ("weight", "bias"):
+            self.assertIn(
+                f"{_MD}latent_norm.{p} -> {_HF}latent_norm.{p}", stmts
+            )
+
+    def test_absent_latent_norm_emits_nothing(self):
+        model = _make_moe_leaf(num_experts=1)()
+        ctx = _identity_ctx(model)
+        for gen in ("gen_aoa_statements", "gen_inv_aoa_statements"):
+            stmts = getattr(model, gen)(ctx, structured_name_prefix=_PFX)
+            self.assertFalse(any("latent_norm" in s for s in stmts))
 
 
 class TestMoELayerGroupedPerExpertConcat(unittest.TestCase):

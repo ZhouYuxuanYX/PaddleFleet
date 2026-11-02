@@ -2633,11 +2633,12 @@ class MoELayer(nn.Layer):
         """Checkpoint->model generator for MoELayer.
 
         Composes gate (TopKRouter), optional MoE latent projection
-        (``fc1/fc2_latent_proj`` Linears), optional shared experts (MLP), then
-        the routed experts: the grouped-GEMM / sonic cross-expert fusion via a
-        direction-inner helper, or the per-expert live layout enumerated by
-        global expert id (see :meth:`_global_expert_ctx`) so every rank emits
-        the same statement set. Inverse is generated independently.
+        (``fc1/fc2_latent_proj`` Linears and ``latent_norm``), optional shared
+        experts (MLP), then the routed experts: the grouped-GEMM / sonic
+        cross-expert fusion via a direction-inner helper, or the per-expert
+        live layout enumerated by global expert id (see
+        :meth:`_global_expert_ctx`) so every rank emits the same statement set.
+        Inverse is generated independently.
         """
         statements = self.gate.gen_aoa_statements(
             ctx,
@@ -2659,6 +2660,12 @@ class MoELayer(nn.Layer):
                 structured_name_prefix=(
                     f"{structured_name_prefix}fc2_latent_proj."
                 ),
+                checkpoint_lookup_drop_segment=checkpoint_lookup_drop_segment,
+            )
+        if getattr(self, "latent_norm", None) is not None:
+            statements += self.latent_norm.gen_aoa_statements(
+                ctx,
+                structured_name_prefix=f"{structured_name_prefix}latent_norm.",
                 checkpoint_lookup_drop_segment=checkpoint_lookup_drop_segment,
             )
         if getattr(self, "shared_experts", None) is not None:
@@ -2702,9 +2709,10 @@ class MoELayer(nn.Layer):
         """Inverse (model -> checkpoint) generator for MoELayer.
 
         Independently mirrors :meth:`gen_aoa_statements` without deriving from
-        its output text: gate, latent projection, shared experts, then the
-        routed experts (grouped-fusion inverse helper, or the per-expert MLP
-        inverse enumerated by global expert id).
+        its output text: gate, latent projection (``fc1/fc2_latent_proj`` and
+        ``latent_norm``), shared experts, then the routed experts
+        (grouped-fusion inverse helper, or the per-expert MLP inverse
+        enumerated by global expert id).
         """
         statements = self.gate.gen_inv_aoa_statements(
             ctx,
@@ -2726,6 +2734,12 @@ class MoELayer(nn.Layer):
                 structured_name_prefix=(
                     f"{structured_name_prefix}fc2_latent_proj."
                 ),
+                checkpoint_lookup_drop_segment=checkpoint_lookup_drop_segment,
+            )
+        if getattr(self, "latent_norm", None) is not None:
+            statements += self.latent_norm.gen_inv_aoa_statements(
+                ctx,
+                structured_name_prefix=f"{structured_name_prefix}latent_norm.",
                 checkpoint_lookup_drop_segment=checkpoint_lookup_drop_segment,
             )
         if getattr(self, "shared_experts", None) is not None:
