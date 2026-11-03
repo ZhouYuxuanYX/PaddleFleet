@@ -707,6 +707,8 @@ jobs:
           export COVERAGE_FILE=/workspace/PaddleFleet/coveragedata-single/.coverage
           export COVERAGE_RCFILE=/workspace/PaddleFleet/ci/.coveragerc
           ls -a /workspace/PaddleFleet/coveragedata-single
+          # [paths] 只在映射后的 src/paddlefleet 文件存在时生效，必须在仓库根目录合并
+          cd /workspace/PaddleFleet
           coverage combine
           coverage xml -o /workspace/PaddleFleet/coveragedata-single/coverage.xml
           coverage report -m
@@ -1073,6 +1075,8 @@ jobs:
           export COVERAGE_FILE=/workspace/PaddleFleet/coveragedata-multi/.coverage
           export COVERAGE_RCFILE=/workspace/PaddleFleet/ci/.coveragerc
           ls -a /workspace/PaddleFleet/coveragedata-multi
+          # [paths] 只在映射后的 src/paddlefleet 文件存在时生效，必须在仓库根目录合并
+          cd /workspace/PaddleFleet
           coverage combine
           coverage xml -o /workspace/PaddleFleet/coveragedata-multi/coverage.xml
           coverage report -m
@@ -1436,6 +1440,8 @@ jobs:
           export COVERAGE_FILE=/workspace/PaddleFleet/coveragedata/.coverage
           export COVERAGE_RCFILE=/workspace/PaddleFleet/ci/.coveragerc
           ls -a /workspace/PaddleFleet/coveragedata
+          # [paths] 只在映射后的 src/paddlefleet 文件存在时生效，必须在仓库根目录合并
+          cd /workspace/PaddleFleet
           coverage combine
           coverage xml -o /workspace/PaddleFleet/coveragedata/coverage.xml
           coverage report -m
@@ -1511,7 +1517,7 @@ jobs:
 
   coverage_check:
     name: Coverage Upload And Check
-    needs: [multi-card_test, single_card_test, integration-test-H20-multi-card, integration-test-a100, integration-test-H20-single-card, check-bypass, coverage_approval]
+    needs: [multi-card_test, single_card_test, integration-test-H20-multi-card, integration-test-a100, integration-test-H20-single-card, unittest-gpu-ci, check-bypass, coverage_approval]
     if: ${{ always() && needs.check-bypass.outputs.can-skip != 'true' && needs.coverage_approval.outputs.can-skip != 'true' && needs.single_card_test.result != 'skipped' }}
     runs-on:
       group: APPROVAL
@@ -1542,6 +1548,7 @@ jobs:
           h20_multi_coverage.xml:h20-multi/coverage.xml
           h20_single_coverage.xml:h20-single/coverage.xml
           a100_coverage.xml:a100/coverage.xml
+          formers_coverage.xml:formers/coverage.xml
           "
           base_url="https://only-internal-network-support.bj.bcebos.com/${GITHUB_REPO_NAME}/pull/${PR_ID}/${COMMIT_ID}"
 
@@ -1586,6 +1593,7 @@ jobs:
             "h20_multi_coverage.xml"
             "h20_single_coverage.xml"
             "a100_coverage.xml"
+            "formers_coverage.xml"
           )
 
           # 检查哪些文件存在
@@ -1601,6 +1609,27 @@ jobs:
           # 使用脚本合并 XML 覆盖率文件并输出全量覆盖率报告
           python ci/merge_and_check_coverage.py "${EXISTING_FILES[@]}" --report-only
 
+          # 各流水线单独的全量覆盖率，口径与上面的合并报告相同
+          report_pipeline() {
+            local name=$1
+            shift
+            local files=()
+            for FILE in "$@"; do
+              [ -f "$FILE" ] && files+=("$FILE")
+            done
+            if [ ${#files[@]} -eq 0 ]; then
+              echo "  ${name}: 无覆盖率文件"
+              return
+            fi
+            python ci/merge_and_check_coverage.py "${files[@]}" --report-only \
+              | sed -n "s|^  全量覆盖率: |  ${name}: |p" \
+              || echo "  ${name}: 无有效覆盖率数据"
+          }
+          echo "【按流水线统计】"
+          report_pipeline "Fleet 单测 (single/multi-card)" single_coverage.xml multi_coverage.xml
+          report_pipeline "Fleet 集成测试 (H20/A100)" h20_single_coverage.xml h20_multi_coverage.xml a100_coverage.xml
+          report_pipeline "Formers 单测 (unittest-gpu-ci)" formers_coverage.xml
+
       - name: filter coverage files and remove backup files
         if: always()
         run: |
@@ -1610,6 +1639,7 @@ jobs:
             "h20_multi_coverage.xml"
             "h20_single_coverage.xml"
             "a100_coverage.xml"
+            "formers_coverage.xml"
           )
 
           for COVERAGE_FILE in "${COVERAGE_FILES[@]}"; do
@@ -1834,6 +1864,12 @@ jobs:
             python ${{ env.bos_file }} "$FILE" only-internal-network-support/PR/PaddleFleet/ci-unittest-gpu/${bos_prefix}/logs
             echo "$FILE: https://only-internal-network-support.bj.bcebos.com/PR/PaddleFleet/ci-unittest-gpu/${bos_prefix}/logs/$FILE"
           done
+          # Formers 单测的覆盖率，供 coverage_check 与其他流水线合并
+          if [ -f /workspace/PaddleFleet/coverage.xml ]; then
+            cd /workspace/PaddleFleet
+            python ${{ env.bos_file }} coverage.xml \
+              "only-internal-network-support/${{ github.repository }}/pull/${PR_ID}/${COMMIT_ID}/formers"
+          fi
           '
       - name: Set pytest execute flag output
         if: always()

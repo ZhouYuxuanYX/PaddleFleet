@@ -141,6 +141,7 @@ if [[ ${FLAGS_enable_CI} == "true" ]] || [[ ${FLAGS_enable_CE} == "true" ]];then
         --timeout 200 --durations 30 \
         --alluredir=result \
         --cov=paddlefleet \
+        --cov-config=ci/.coveragerc \
         --cov-report=xml:coverage.xml 2>&1 | tee ${log_path}/unittest.log
     # NOTE: use PIPESTATUS[0] to capture the exit code of the FIRST pipeline stage
     #       (`timeout` -> pytest). Plain $? would return tee's code (=0 even on failure).
