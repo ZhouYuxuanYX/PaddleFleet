@@ -1606,8 +1606,10 @@ jobs:
 
           echo "找到 ${#EXISTING_FILES[@]} 个覆盖率文件: ${EXISTING_FILES[*]}"
 
-          # 使用脚本合并 XML 覆盖率文件并输出全量覆盖率报告
-          python ci/merge_and_check_coverage.py "${EXISTING_FILES[@]}" --report-only
+          # 使用脚本合并 XML 覆盖率文件并输出全量覆盖率报告，合并结果写到 merged/coverage.xml 供上传
+          mkdir -p merged
+          python ci/merge_and_check_coverage.py "${EXISTING_FILES[@]}" --report-only \
+            --output-xml --output merged/coverage.xml
 
           # 各流水线单独的全量覆盖率，口径与上面的合并报告相同
           report_pipeline() {
@@ -1629,6 +1631,26 @@ jobs:
           report_pipeline "Fleet 单测 (single/multi-card)" single_coverage.xml multi_coverage.xml
           report_pipeline "Fleet 集成测试 (H20/A100)" h20_single_coverage.xml h20_multi_coverage.xml a100_coverage.xml
           report_pipeline "Formers 单测 (unittest-gpu-ci)" formers_coverage.xml
+
+      # Best effort: a failed upload shows as a warning and does not fail the coverage check.
+      - name: Upload merged coverage to BOS
+        if: always()
+        continue-on-error: true
+        env:
+          AK: paddle
+          SK: paddle
+        run: |
+          if [ ! -f merged/coverage.xml ]; then
+            echo "merged/coverage.xml not found, skip upload"
+            exit 0
+          fi
+          python -m pip install bce-python-sdk==0.8.74 -q
+          wget -q --no-proxy --no-check-certificate \
+            https://paddle-qa.bj.bcebos.com/CodeSync/develop/PaddlePaddle/PaddleTest/tools/bos_tools.py \
+            -O bos_tools.py
+          python bos_tools.py merged/coverage.xml \
+            "only-internal-network-support/${GITHUB_REPO_NAME}/pull/${PR_ID}/${COMMIT_ID}"
+          echo "merged coverage: https://only-internal-network-support.bj.bcebos.com/${GITHUB_REPO_NAME}/pull/${PR_ID}/${COMMIT_ID}/merged/coverage.xml"
 
       - name: filter coverage files and remove backup files
         if: always()

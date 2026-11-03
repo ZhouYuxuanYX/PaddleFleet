@@ -12,9 +12,20 @@ jobs:
     if: github.repository == 'PaddlePaddle/PaddleFleet'
     runs-on:
       group: APPROVAL
+    timeout-minutes: 90
     env:
       PR_ID: ${{ github.event.pull_request.number }}
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       BRANCH: develop
+      # SonarQube runs inside this job: a throwaway server (default "Sonar way"
+      # profile, embedded H2 database), so no external server or secrets.
+      SONARQUBE_VERSION: 26.9.0.129388
+      SONAR_SCANNER_VERSION: 8.1.0.6389
+      JDK_VERSION: 21.0.13+9
+      # Package dir shared by all runners on the host: the first job to need a
+      # package downloads it here, every later job just unpacks it. Runner users
+      # have no sudo; /var/tmp is writable by all and survives reboots.
+      SA_PKG_DIR: /var/tmp/code-health-check
 
     steps:
       - name: Cleanup
@@ -63,57 +74,22 @@ jobs:
         run: |
           pre-commit run --all-files
 
-      - name: Failure message
-        if: steps.pre-commit.outcome == 'failure'
+      # Code health runs even when pre-commit fails, so one run reports both.
+      # The scan reads head from the work tree, so undo pre-commit's auto-fixes
+      # first. No step between this one and the scan may modify tracked files.
+      # skip-ci: codestyle also skips the code health scan.
+      - name: Restore PR tree
+        if: steps.check-bypass.outputs.can-skip != 'true'
         run: |
-          echo "::error::Codestyle check failed."
-          echo "::error::Please install pre-commit and run the following commands locally to fix the issues:"
-          echo "::error::"
-          echo "::error::    pip install pre-commit==2.17.0"
-          echo "::error::    pre-commit run --all-files"
-          exit 1
-
-  code-health-check:
-    name: Code Health Check
-    if: github.repository == 'PaddlePaddle/PaddleFleet'
-    runs-on:
-      group: APPROVAL
-    timeout-minutes: 90
-    env:
-      PR_ID: ${{ github.event.pull_request.number }}
-      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-      # SonarQube runs inside this job: a throwaway server (default "Sonar way"
-      # profile, embedded H2 database), so no external server or secrets.
-      SONARQUBE_VERSION: 26.9.0.129388
-      SONAR_SCANNER_VERSION: 8.1.0.6389
-      JDK_VERSION: 21.0.13+9
-      # Package dir shared by all runners on the host: the first job to need a
-      # package downloads it here, every later job just unpacks it. Runner users
-      # have no sudo; /var/tmp is writable by all and survives reboots.
-      SA_PKG_DIR: /var/tmp/code-health-check
-
-    steps:
-      - name: Cleanup
-        run: |
-          rm -rf * .[^.]*
-
-      - name: Checkout base repo
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.pull_request.base.ref }}
-          fetch-depth: 1000
-
-      - name: Merge PR to test branch
-        run: |
-          git fetch origin pull/${PR_ID}/merge
-          git checkout -b test FETCH_HEAD
+          git checkout -q -- .
 
       - name: Set up tools
+        if: steps.check-bypass.outputs.can-skip != 'true'
         # Packages are downloaded once per host into $SA_PKG_DIR (checked by
         # sha256) and unpacked once per runner into its tool cache.
         run: |
           c=$RUNNER_TOOL_CACHE
-          # The runner's own python3 (3.12); a venv keeps pip off the system.
+          # python3 here is setup-python's 3.12; a venv keeps pip off it.
           v=$c/code-health-check-venv
           if [ ! -f "$v/.ok" ]; then
             echo "setup $v"
@@ -197,6 +173,7 @@ jobs:
           echo "SONAR_JAVA_PATH=$c/jdk-$JDK_VERSION/bin/java" >> "$GITHUB_ENV"
 
       - name: Start SonarQube
+        if: steps.check-bypass.outputs.can-skip != 'true'
         run: |
           free_port() {
             python -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'
@@ -238,6 +215,7 @@ jobs:
 
       - name: Scan base and head, report new issues
         # HEAD is the PR merge commit, HEAD^1 the base branch it merges into.
+        if: steps.check-bypass.outputs.can-skip != 'true'
         run: |
           python ci/code_health_check.py --selftest
           python ci/code_health_check.py HEAD^1
@@ -249,3 +227,13 @@ jobs:
           # sonar.sh waits forever if the launcher is left a zombie (no reaper).
           PIDDIR="$RUNNER_TEMP/sq" timeout 120 "$SONARQUBE_HOME/bin/linux-x86-64/sonar.sh" stop || true
           rm -rf "$RUNNER_TEMP/sq"
+
+      - name: Failure message
+        if: ${{ !cancelled() && steps.pre-commit.outcome == 'failure' }}
+        run: |
+          echo "::error::Codestyle check failed."
+          echo "::error::Please install pre-commit and run the following commands locally to fix the issues:"
+          echo "::error::"
+          echo "::error::    pip install pre-commit==2.17.0"
+          echo "::error::    pre-commit run --all-files"
+          exit 1
