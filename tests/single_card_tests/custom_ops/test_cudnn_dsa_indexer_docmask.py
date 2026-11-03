@@ -504,8 +504,10 @@ class TestCudnnIndexerTopkDocmask(unittest.TestCase):
         paddle.seed(5)
         ratio, sq, sk, topk = 4, 16, 8, 4
         scores = paddle.randn([1, sq, sk]).astype("float32")
-        idx_a, _ = cudnn_indexer_topk(scores, sq, ratio, topk, valid_range=None)
-        idx_b, _ = cudnn_indexer_topk(scores, sq, ratio, topk)
+        idx_a, _ = cudnn_indexer_topk(
+            scores.clone(), sq, ratio, topk, valid_range=None
+        )
+        idx_b, _ = cudnn_indexer_topk(scores.clone(), sq, ratio, topk)
         self.assertTrue(paddle.equal_all(idx_a, idx_b).item())
 
     def _run_spec_case(self, doc_lens, ratio, topk, seed, packed_sk=None):

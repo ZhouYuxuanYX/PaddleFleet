@@ -140,7 +140,10 @@ class _Spy:
         self.calls = []
 
     def __call__(self, input_values, seq_lens, top_k, return_val=True):
-        prod = _PRODUCTION_TOP_K(input_values, seq_lens, top_k, return_val)
+        # Production masks in place; clone so the replica sees raw scores.
+        prod = _PRODUCTION_TOP_K(
+            input_values.clone(), seq_lens, top_k, return_val
+        )
         unmasked = _unmasked_top_k(input_values, seq_lens, top_k, return_val)
         lens = seq_lens.reshape([-1, 1]).cast("int32")
         cols = paddle.arange(input_values.shape[-1], dtype="int32")

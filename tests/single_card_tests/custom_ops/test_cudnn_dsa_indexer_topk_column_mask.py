@@ -309,7 +309,7 @@ class TestIndexerTopKColumnMaskUnit(unittest.TestCase):
         sk = len(self.VALUES[0])
         for top_k in (1, 2, 4, sk, 7):
             out = indexer_mod._indexer_top_k_unfused(
-                values, seq_lens, top_k=top_k, return_val=True
+                values.clone(), seq_lens, top_k=top_k, return_val=True
             )
             ids = out["indices"]
             self.assertEqual(list(ids.shape), [len(self.SEQ_LENS), top_k])

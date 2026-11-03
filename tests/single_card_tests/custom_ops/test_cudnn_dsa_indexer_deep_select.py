@@ -430,7 +430,7 @@ class TestDeepSelectKernel(unittest.TestCase):
                             values, seq_lens, top_k, return_val
                         )
                         ref = indexer_mod._indexer_top_k_unfused(
-                            values, seq_lens, top_k, False
+                            values.clone(), seq_lens, top_k, False
                         )
                         ids = out["indices"]
                         self.assertEqual(ids.dtype, paddle.int32)

@@ -213,12 +213,14 @@ def _indexer_top_k_unfused(
     row, so those columns would win top slots and be returned; blanking only the
     output slots past ``seq_lens`` does not remove them. Mask the columns first.
     For the pure-causal callers this is a no-op (already ``-inf`` there).
+
+    ``input_values`` is masked in place to avoid a full-size copy; callers that
+    still need the raw scores must pass a clone.
     """
     seq_lens_col = seq_lens.reshape([-1, 1]).cast("int32")
-    input_values = paddle.where(
-        paddle.arange(input_values.shape[-1], dtype="int32") < seq_lens_col,
-        input_values,
-        paddle.full_like(input_values, float("-inf")),
+    input_values.masked_fill_(
+        paddle.arange(input_values.shape[-1], dtype="int32") >= seq_lens_col,
+        float("-inf"),
     )
     # Note: paddle.topk doesn't allow k greater than the axis size.
     k = min(top_k, input_values.shape[-1])
@@ -308,7 +310,9 @@ def cudnn_indexer_topk(
     """Select top-K indices using cuDNN TRT-LLM radix kernel (SM100).
 
     Args:
-        scores:  [B, S_q, S_k] fp32 Paddle tensor.
+        scores:  [B, S_q, S_k] fp32 Paddle tensor. With ``valid_range=None``
+            and the ``"paddle"`` backend, columns past each row's causal limit
+            may be set to ``-inf`` in place.
         sq:      query sequence length.
         ratio:   compression ratio.
         topk:    number of entries to select per query position.
