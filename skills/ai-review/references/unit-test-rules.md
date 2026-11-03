@@ -17,7 +17,7 @@
 | 分布式训练 | ParallelState、TP、PP、CP、EP、Dispatcher | 并行拓扑、参数/序列分片、通信、流水线与专家并行；配置对象中真实执行并行初始化的部分也适用本模块规则 | `tensor_parallel/`、`pipeline_parallel/`、`distributed/`、`parallel_state.py`、`context_parallel_utils.py`、MoE dispatcher |
 | 优化器 | Optimizer、GradClip、LRScheduler、Muon | 参数更新、梯度消费、优化器状态与 Muon 切分；scheduler 被 Trainer 推进的时机按训练引擎规则验证 | `utils/optimizer.py`、`utils/moe_hybrid_parallel_optimizer.py`、`transformer/muon_utils.py` 及参数 spec、`transformers/optimization.py` |
 | 计算优化 | FP8/Quantization、Fused Ops、Recompute、Offload | 低精度、融合算子、后端加速、重计算及显存管理，核对目标数值与资源生命周期 | `fp8/`、`quantization/`、`triton_ops/`、`triton_kernels/`、`tilelang_ops/`、`cudnn_ops/`、`fusions/`、`train_infer_consistent_ops/`、`refined_recompute/`、`trainer/utils/offload_optimizer.py`、仓库根 `packages/paddlefleet_ops/` |
-| Checkpoint 与权重管理层 | Checkpoint、Serialization、Reshard、MergeKit | 状态持久化、加载、重分片、恢复与模型权重合并；恢复后训练推进交由 Trainer 验证 | `trainer/unified_checkpoint/`、`trainer/utils/zero_cost_checkpoint.py`、`trainer/utils/reshard/`、`mergekit/`、配置保存接口 |
+| Checkpoint 与权重管理层 | Checkpoint、Serialization、Reshard、MergeKit | 状态持久化、加载、重分片、恢复与模型权重合并；恢复后训练推进交由 Trainer 验证 | `trainer/unified_checkpoint/`、`trainer/utils/zero_cost_checkpoint.py`、`trainer/utils/reshard/`、`mergekit/`、`models/gpt/aoa_*.py`、配置保存接口 |
 | 推理层 | Generation、LogitsProcessor、KV Cache | 解码策略、生成约束、缓存、结束状态及请求隔离 | `generation/`、模型的 cache/生成接口 |
 | 配置与运行基础设施 | **training_args**、**CLI**、Hparams、ConfigAdapter、Launcher、AutoConfigurator、CI | 参数定义、默认值、归一化、校验及配置传播；CLI 负责命令分派，launcher 负责环境和进程启动；搜索与 CI 负责运行结果处理。training_args 中 flags/Fleet 初始化同时按对应执行模块验证 | `trainer/training_args.py`、`trainer/argparser.py`、`cli/cli.py`、`cli/launcher.py`、`cli/hparams/`、`config_adapter/`、`training/`、`transformer/transformer_config.py`、`model_parallel_config.py`；仓库根 `auto_configurator/`、`ci/`、`scripts/`、`.github/workflows/` |
 
@@ -178,6 +178,7 @@
 - 完整续训同时验证恢复状态被 Trainer 正确消费，数据位置和 scheduler 总计划与参考相符；权重导出不机械要求完整训练。元数据替身可以验证映射逻辑，不能证明真实持久化或跨 rank 重分片数值。
 - 配置保存允许按当前策略省略默认值，检查加载后的语义及类型。`to_json_string` 默认快照与保存文件时的字段过滤不同，不能要求所有 JSON 都保留全部默认键或删去相同字段。
 - 模型合并按实际 linear、SLERP、TIES 等算法建立独立参考，检查参数键、dtype、分片顺序及元数据；随机 sparsify 单独管理随机性。adapter 保存还应核对适配器配置与基础模型身份。
+- 模块化 AOA 两个方向分别测试，涉及转置或融合时用非方阵真实张量走保存加载往返，覆盖性用结构断言而非语句条数。具体约定见 [模块化 AOA 扩展规则](modular-aoa.md)。
 
 **分环境要求：**
 
@@ -189,7 +190,7 @@
 
 **反模式：** [典型单测反例](unit-test-antipatterns.md)，Checkpoint 与权重管理常见于切片和拼接只检查形状、恢复路径被空实现替代、测试只操作自造文件而未调用生产入口。
 
-**常规测试位置：** `tests/formers/trainer/` 中 checkpoint 测试、`tests/formers/transformers/test_configuration_utils.py`、`tests/formers/mergekit/`。
+**常规测试位置：** `tests/formers/trainer/` 中 checkpoint 测试、`tests/formers/transformers/test_configuration_utils.py`、`tests/formers/mergekit/`、`tests/single_card_tests/aoa/`。
 
 ## 推理与生成
 
