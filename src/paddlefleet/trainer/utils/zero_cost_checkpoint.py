@@ -274,17 +274,35 @@ def _muon_classify_untracked_params(model, optimizer):
         tracked.update(p.name for p in color_params)
     untracked = [p for p in model.parameters() if p.name not in tracked]
 
-    color_to_group_info = type(shell)._build_color_to_group_info_from_params(
-        untracked, shell._hcg.get_sharding_parallel_group()
+    shell_cls = type(shell)
+    sharding_group = shell._hcg.get_sharding_parallel_group()
+    color_to_group_info = shell_cls._build_color_to_group_info_from_params(
+        untracked, sharding_group
     )
 
-    params_2d_by_color = defaultdict(list)
+    # Look params up with the key the shell builds the table with. Newer
+    # Paddle keys 2D buckets by (color name, group ranks), so one color can
+    # live on several groups (e.g. experts of sub-models with different EP
+    # sizes all use 'moe_expert'); older Paddle keys them by color name.
+    # TODO: drop the color-name fallback (the else branch) once the pinned
+    # Paddle includes PaddlePaddle/Paddle#79913.
+    if hasattr(shell_cls, "_param_bucket_key"):
+
+        def bucket_key(p):
+            return shell_cls._param_bucket_key(p, sharding_group)
+
+    else:
+
+        def bucket_key(p):
+            color = getattr(p, "color", -1)
+            color_val = (
+                color.get("color", -1) if isinstance(color, dict) else color
+            )
+            return None if color_val in (-1, None) else color_val
+
+    params_2d_by_bucket = defaultdict(list)
     all_1d_names = set()
     for p in untracked:
-        color = getattr(p, "color", -1)
-        color_val = color.get("color", -1) if isinstance(color, dict) else color
-        color_key = None if color_val in (-1, None) else color_val
-
         param_info = info_map.get(p.name)
         if param_info is None:
             raise ValueError(
@@ -294,14 +312,14 @@ def _muon_classify_untracked_params(model, optimizer):
         if getattr(param_info, "use_muon", False) or getattr(
             param_info, "use_hyperball", False
         ):
-            params_2d_by_color[color_key].append(p)
+            params_2d_by_bucket[bucket_key(p)].append(p)
         else:
             all_1d_names.add(p.name)
 
     local_2d_names = set()
     all_2d_names = set()
-    for color_key, params_2d in params_2d_by_color.items():
-        group_info = color_to_group_info[color_key]
+    for key, params_2d in params_2d_by_bucket.items():
+        group_info = color_to_group_info[key]
         world_size = group_info["world_size"]
         if world_size <= 1:
             rank2params = {0: params_2d}

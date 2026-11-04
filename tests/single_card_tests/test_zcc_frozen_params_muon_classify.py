@@ -114,7 +114,7 @@ def _info_map_of(shell):
 def _shell(model, rank, shell_cls=MuonShardingOptimizer):
     """The shell as the sharding optimizer leaves it with a frozen backbone."""
     shell = object.__new__(shell_cls)
-    if shell_cls is MixedShardingOptimizer:
+    if issubclass(shell_cls, MixedShardingOptimizer):
         # The full map built by the trainer, frozen params included; frozen
         # params have no sub-optimizer, so `keep_whole_of` cannot answer.
         inner = object.__new__(MixedInnerOptimizer)
@@ -134,6 +134,59 @@ def _shell(model, rank, shell_cls=MuonShardingOptimizer):
     shell._local_2d = [train_w] if rank == 0 else []
     shell._params_1d = []
     return shell
+
+
+def _bucket_keyed(shell_cls):
+    """``shell_cls`` with 2D buckets keyed by ``(color name, group ranks)``.
+
+    That is the layout of PaddlePaddle/Paddle#79913. A Paddle that has it is
+    used as is; otherwise the shell gets that PR's two class methods so the
+    bucket-key lookup runs on any Paddle. The class keeps the shell's name,
+    which `_muon_classify_untracked_params` dispatches on.
+    """
+    if hasattr(shell_cls, "_param_bucket_key"):
+        return shell_cls
+
+    def color_and_group(p, default_group):
+        color = getattr(p, "color", -1)
+        if isinstance(color, dict):
+            name = color.get("color", -1)
+            group = color.get("group", default_group)
+        else:
+            name, group = color, default_group
+        if name in (-1, None):
+            return None, default_group
+        return name, group
+
+    def ranks(group):
+        return tuple(group.ranks) if group else (0,)
+
+    def param_bucket_key(cls, p, default_group):
+        name, group = color_and_group(p, default_group)
+        return name, ranks(group)
+
+    def build_table(cls, parameter_list, default_group):
+        def info(group):
+            return {
+                "group": group,
+                "world_size": len(group.ranks) if group else 1,
+                "rank": group.rank if group else 0,
+            }
+
+        table = {(None, ranks(default_group)): info(default_group)}
+        for p in parameter_list:
+            name, group = color_and_group(p, default_group)
+            table.setdefault((name, ranks(group)), info(group))
+        return table
+
+    return type(
+        shell_cls.__name__,
+        (shell_cls,),
+        {
+            "_param_bucket_key": classmethod(param_bucket_key),
+            "_build_color_to_group_info_from_params": classmethod(build_table),
+        },
+    )
 
 
 def _as_trainable(shell, model, rank):
@@ -320,6 +373,42 @@ class _FrozenParamsCases:
         with self.assertRaisesRegex(ValueError, "no param info"):
             _muon_classify_untracked_params(self.models[0], _Wrapper(shell))
 
+    def test_same_color_on_two_groups(self):
+        """One color on two comm groups is partitioned per group.
+
+        E.g. experts of two sub-models with different expert-parallel sizes
+        both use 'moe_expert'. Only a shell keyed by (color, group ranks) can
+        tell the groups apart.
+        """
+        shell_cls = _bucket_keyed(self.SHELL)
+        replicated = ("frozen_a", "frozen_b")
+        local = []
+        for rank in range(WORLD):
+            model = self.models[rank]
+            group = SimpleNamespace(
+                ranks=list(range(WORLD)), rank=rank, nranks=WORLD
+            )
+            for attr in replicated:
+                model.param(attr).color = {
+                    "color": "moe_expert",
+                    "group": group,
+                }
+            names = {
+                model.param(a).name: a for a in ("frozen_expert", *replicated)
+            }
+            local_2d, all_2d, _ = _muon_classify_untracked_params(
+                model, _Wrapper(_shell(model, rank, shell_cls))
+            )
+            self.assertEqual(all_2d, set(names))
+            local.append({names[n] for n in local_2d if n in names})
+        # The single-rank group: every rank owns its own expert shard.
+        for rank in range(WORLD):
+            self.assertIn("frozen_expert", local[rank], f"rank {rank}")
+        # The two-rank group: each replicated param has exactly one owner.
+        for attr in replicated:
+            owners = [r for r in range(WORLD) if attr in local[r]]
+            self.assertEqual(len(owners), 1, f"{attr} owned by {owners}")
+
     def _fused_mappings(self):
         """Real get_fused_param_mappings() over a frozen-backbone shell."""
         paddle.set_device("gpu")
@@ -401,6 +490,43 @@ class TestFrozenParamsMixedShell(_FrozenParamsCases, unittest.TestCase):
             self.assertIn(name, all_1d)
             self.assertNotIn(name, all_2d | local_2d)
             self.assertIn("frozen_a", _fc_keys(model, _Wrapper(shell)))
+
+
+class TestFrozenParamsBucketKeyedMuonShell(
+    _FrozenParamsCases, unittest.TestCase
+):
+    """Every case again with 2D buckets keyed by (color, group ranks)."""
+
+    SHELL = _bucket_keyed(MuonShardingOptimizer)
+
+
+class TestFrozenParamsBucketKeyedMixedShell(
+    _FrozenParamsCases, unittest.TestCase
+):
+    SHELL = _bucket_keyed(MixedShardingOptimizer)
+
+
+class TestBucketKeyLookup(unittest.TestCase):
+    def test_lookup_uses_shell_bucket_key(self):
+        """Frozen 2D params are looked up with the shell's own bucket key."""
+        paddle.set_device("cpu")
+        model = _Model(1)
+        shell_cls = _bucket_keyed(MuonShardingOptimizer)
+        seen = []
+        orig = shell_cls._param_bucket_key
+
+        class Recording(shell_cls):
+            @classmethod
+            def _param_bucket_key(cls, p, default_group):
+                seen.append(p.name)
+                return orig.__func__(cls, p, default_group)
+
+        Recording.__name__ = "MuonShardingOptimizer"
+        _, all_2d, _ = _muon_classify_untracked_params(
+            model, _Wrapper(_shell(model, 1, Recording))
+        )
+        self.assertEqual(set(seen), all_2d)
+        self.assertEqual(len(all_2d), 3)
 
 
 class TestOtherShells(unittest.TestCase):
