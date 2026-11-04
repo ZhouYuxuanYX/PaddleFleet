@@ -679,6 +679,16 @@ def main(base_ref):
         f"（千行指标分母至少按 {cfg['score']['min_lines']} 行）。"
         f"规则见 `{CONFIG}`。",
         "",
+        *(
+            [
+                "如确需合入，请找 @From00 或 @sneaxiy 评估；任一人在本检查结束后"
+                " approve，本 job 自动重跑并跳过代码健康检查（pre-commit 仍需通过）。"
+                "检查运行中 approve 的，结束后由 PR 作者评论 `/re-run all-failed`。",
+                "",
+            ]
+            if verdict == "block"
+            else []
+        ),
         "| 维度 | diff 值 | 单项分 | 判定 | 说明 |",
         "|---|---|---|---|---|",
         *(

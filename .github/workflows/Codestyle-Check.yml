@@ -74,17 +74,42 @@ jobs:
         run: |
           pre-commit run --all-files
 
+      # Like bot-approval-required.yml: an APPROVED review by an approver on the
+      # PR head skips the code health scan only; pre-commit still has to pass.
+      # Approving re-runs this job (rerun.yml). Every code health step below
+      # runs only when steps.health.outputs.run == 'true'.
+      - name: Check approval
+        id: health
+        if: steps.check-bypass.outputs.can-skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPROVERS: "From00 sneaxiy"
+        run: |
+          set -euo pipefail
+          by=$(gh api --paginate "repos/${{ github.repository }}/pulls/${PR_ID}/reviews?per_page=100" \
+            | jq -rs --arg head "$PR_HEAD_SHA" --arg who "$APPROVERS" '
+              add | map(select(.commit_id == $head and (.user.login | IN($who | split(" ")[]))
+                               and (.state | IN("APPROVED", "CHANGES_REQUESTED", "DISMISSED"))))
+              | group_by(.user.login) | map(max_by(.submitted_at))
+              | map(select(.state == "APPROVED") | .user.login) | join(" ")')
+          if [ -n "$by" ]; then
+            echo "::notice::${by} 已 approve，跳过代码健康检查。"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
       # Code health runs even when pre-commit fails, so one run reports both.
       # The scan reads head from the work tree, so undo pre-commit's auto-fixes
       # first. No step between this one and the scan may modify tracked files.
       # skip-ci: codestyle also skips the code health scan.
       - name: Restore PR tree
-        if: steps.check-bypass.outputs.can-skip != 'true'
+        if: steps.health.outputs.run == 'true'
         run: |
           git checkout -q -- .
 
       - name: Set up tools
-        if: steps.check-bypass.outputs.can-skip != 'true'
+        if: steps.health.outputs.run == 'true'
         # Packages are downloaded once per host into $SA_PKG_DIR (checked by
         # sha256) and unpacked once per runner into its tool cache.
         run: |
@@ -173,7 +198,7 @@ jobs:
           echo "SONAR_JAVA_PATH=$c/jdk-$JDK_VERSION/bin/java" >> "$GITHUB_ENV"
 
       - name: Start SonarQube
-        if: steps.check-bypass.outputs.can-skip != 'true'
+        if: steps.health.outputs.run == 'true'
         run: |
           free_port() {
             python -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'
@@ -215,7 +240,7 @@ jobs:
 
       - name: Scan base and head, report new issues
         # HEAD is the PR merge commit, HEAD^1 the base branch it merges into.
-        if: steps.check-bypass.outputs.can-skip != 'true'
+        if: steps.health.outputs.run == 'true'
         run: |
           python ci/code_health_check.py --selftest
           python ci/code_health_check.py HEAD^1
