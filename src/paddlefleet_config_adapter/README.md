@@ -230,6 +230,14 @@ C/E/M 全部不通过时，报错会给出候选淘汰明细和最近的合法�
 新增开关只需在 `precision.py` 的 `PRECISION_SWITCHES` 里加一行，报告与日志会自动
 带上原因。
 
+个别场景需要保留某个开关的源值（例如测 FC 时保留 `multimax_modules`），用
+`--skip-precision-switch KEY` 跳过，可重复：
+
+```bash
+python -m paddlefleet_config_adapter --input config.yaml \
+    --target-nodes 1 --test-accuracy --skip-precision-switch multimax_modules
+```
+
 ---
 
 ## sharding 缩容的补偿开关

@@ -160,13 +160,17 @@ class ConfigAdapterTestBase(unittest.TestCase):
         test_performance=False,
         test_accuracy=False,
         shrink_structure=False,
+        skip_precision_switches=(),
         **kwargs,
     ):
         """Run one adaptation, returning ``(ok, message)``."""
         kwargs.setdefault("output_dir", self.output_dir)
         adapter = ConfigAdapter(
             options=AdaptOptions(
-                test_performance, test_accuracy, shrink_structure
+                test_performance,
+                test_accuracy,
+                shrink_structure,
+                skip_precision_switches,
             ),
             target_nodes=target_nodes,
             **kwargs,
@@ -231,6 +235,15 @@ class TestOptions(unittest.TestCase):
         plain = AdaptOptions(test_accuracy=True)
         self.assertEqual(plain.label, "accuracy")
         self.assertNotIn("--shrink-structure", plain.flags)
+
+    def test_skip_precision_switch_shows_in_flags(self):
+        options = AdaptOptions(
+            test_accuracy=True, skip_precision_switches=["multimax_modules"]
+        )
+        self.assertEqual(
+            options.flags,
+            "--test-accuracy --skip-precision-switch multimax_modules",
+        )
 
 
 class TestCandidates(unittest.TestCase):
@@ -310,6 +323,27 @@ class TestPrecisionSwitches(unittest.TestCase):
     def test_json_switch_skipped_without_model_config(self):
         _applied, skipped = plan_precision_switches({}, None)
         self.assertTrue(any("multimax_modules" in note for note in skipped))
+
+    def test_skip_keys_leaves_switch_untouched(self):
+        applied, skipped = plan_precision_switches(
+            {},
+            {"multimax_modules": ["lm_head"]},
+            skip_keys={"multimax_modules"},
+        )
+        self.assertNotIn("multimax_modules", {k for _t, k, _v, _r in applied})
+        self.assertTrue(any("multimax_modules" in note for note in skipped))
+
+    def test_unknown_skip_key_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "multimax_module"):
+            plan_precision_switches({}, {}, skip_keys={"multimax_module"})
+
+    def test_bare_string_skip_key_is_one_key(self):
+        self.assertEqual(
+            AdaptOptions(
+                skip_precision_switches="multimax_modules"
+            ).skip_precision_switches,
+            frozenset({"multimax_modules"}),
+        )
 
     def test_mqa_backward_backend_is_pinned_even_when_absent(self):
         # The absorbed-MQA dKV backward defaults to cuDNN, whose atomic
@@ -1893,6 +1927,22 @@ class TestAccuracySwitch(ConfigAdapterTestBase):
         self.assertEqual(config["csa_sparse_attn_backend"], "tilelang")
         self.assertIsNone(self.load_output_json(512)["multimax_modules"])
 
+    def test_skip_precision_switch_keeps_source_value(self):
+        ok, message = self.adapt(
+            target_nodes=1,
+            test_accuracy=True,
+            skip_precision_switches=["multimax_modules"],
+        )
+        self.assertTrue(ok, message)
+        self.assertEqual(
+            self.load_output_json(8)["multimax_modules"], ["lm_head"]
+        )
+        # Only the named switch is skipped; the others are still pinned.
+        self.assertEqual(
+            self.load_output_yaml(8)["csa_sparse_attn_backend"], "tilelang"
+        )
+        self.assertIn("--skip-precision-switch", message)
+
     def test_source_model_config_is_never_touched(self):
         ok, message = self.adapt(target_nodes=1, test_accuracy=True)
         self.assertTrue(ok, message)
@@ -2293,6 +2343,20 @@ class TestCliErrorPaths(ConfigAdapterTestBase):
         )
         self.assertEqual(code, 1)
         self.assertIn("--test-performance", out)
+
+    def test_skip_precision_switch_requires_test_accuracy(self):
+        code, out = self._run(
+            [
+                "--input",
+                str(self.yaml_path),
+                "--target-nodes",
+                "1",
+                "--skip-precision-switch",
+                "multimax_modules",
+            ]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("--test-accuracy", out)
 
     def test_python_m_entry_point(self):
         # `python -m paddlefleet_config_adapter` must reach the same main().
@@ -2867,6 +2931,26 @@ class TestCli(ConfigAdapterTestBase):
         text = patch.read_text(encoding="utf-8")
         self.assertIn("pipeline_model_parallel_size", text)
         self.assertIn("model_config.json", text)
+
+    def test_skip_precision_switch_reaches_the_adapter(self):
+        code, out = self._run(
+            [
+                "--input",
+                str(self.yaml_path),
+                "--target-nodes",
+                "1",
+                "--test-accuracy",
+                "--skip-precision-switch",
+                "multimax_modules",
+                "--output-dir",
+                str(self.output_dir),
+            ]
+        )
+        self.assertEqual(code, 0, out)
+        self.assertEqual(
+            self.load_output_json(8)["multimax_modules"], ["lm_head"]
+        )
+        self.assertIn("--skip-precision-switch", out)
 
     def test_shrink_structure_shows_up_in_the_report(self):
         self.write_yaml(

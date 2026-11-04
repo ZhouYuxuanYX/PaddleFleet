@@ -550,7 +550,11 @@ class ConfigAdapter:
 
     def _inject_precision(self, config, model_config, log):
         """Pin the determinism switches. Returns notes for skipped ones."""
-        applied, skipped = plan_precision_switches(config, model_config)
+        applied, skipped = plan_precision_switches(
+            config,
+            model_config,
+            skip_keys=self.options.skip_precision_switches,
+        )
         for target, key, value, reason in applied:
             if target == "yaml":
                 diffs = self.yaml_writer.apply_config_map(

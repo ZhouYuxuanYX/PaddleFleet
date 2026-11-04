@@ -29,6 +29,7 @@ from .model_config_resolver import (
     resolve_model_config,
 )
 from .options import AdaptOptions
+from .precision import PRECISION_SWITCHES
 from .utils import parse_value
 
 EPILOG = """\
@@ -113,6 +114,16 @@ def build_parser():
         help="精度维度：注入避免 aadiff 的开关；未同时指定 "
         "--test-performance 时还会保持等效 batch（GBS 不变、acc 放大），"
         "并且是唯一允许缩小 EP/PP（改模型结构）的模式",
+    )
+    parser.add_argument(
+        "--skip-precision-switch",
+        dest="skip_precision_switches",
+        action="append",
+        default=[],
+        choices=[switch.key for switch in PRECISION_SWITCHES],
+        metavar="KEY",
+        help="--test-accuracy 时不注入该精度开关、保留源配置的值，可重复。"
+        "可选：" + ", ".join(switch.key for switch in PRECISION_SWITCHES),
     )
     parser.add_argument(
         "--shrink-structure",
@@ -228,6 +239,26 @@ def _unified_diff(path, before):
     )
 
 
+def _check_mode_flags(args):
+    """Return an error message for flags that need another mode, else None."""
+    if args.shrink_structure and not args.test_accuracy:
+        return (
+            "--shrink-structure 必须与 --test-accuracy 一起使用"
+            "（缩结构属于模型结构变更，只在精度测试模式下允许）"
+        )
+    if args.shrink_structure and args.test_performance:
+        return (
+            "--shrink-structure 与 --test-performance 互斥"
+            "（测速要求模型结构与源作业一致，缩结构会改变计算量）"
+        )
+    if args.skip_precision_switches and not args.test_accuracy:
+        return (
+            "--skip-precision-switch 必须与 --test-accuracy 一起使用"
+            "（只有精度模式才会注入精度开关）"
+        )
+    return None
+
+
 def main(argv=None):
     """Parse arguments and run the adaptation."""
     args = build_parser().parse_args(argv)
@@ -258,25 +289,16 @@ def main(argv=None):
         print("错误：--target-nodes 必须 >= 1", file=sys.stderr)
         return 1
 
-    if args.shrink_structure and not args.test_accuracy:
-        print(
-            "错误：--shrink-structure 必须与 --test-accuracy 一起使用"
-            "（缩结构属于模型结构变更，只在精度测试模式下允许）",
-            file=sys.stderr,
-        )
-        return 1
-    if args.shrink_structure and args.test_performance:
-        print(
-            "错误：--shrink-structure 与 --test-performance 互斥"
-            "（测速要求模型结构与源作业一致，缩结构会改变计算量）",
-            file=sys.stderr,
-        )
+    mode_error = _check_mode_flags(args)
+    if mode_error:
+        print(f"错误：{mode_error}", file=sys.stderr)
         return 1
 
     options = AdaptOptions(
         test_performance=args.test_performance,
         test_accuracy=args.test_accuracy,
         shrink_structure=args.shrink_structure,
+        skip_precision_switches=args.skip_precision_switches,
     )
 
     before_yaml = before_json = None

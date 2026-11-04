@@ -75,7 +75,39 @@ PRECISION_SWITCHES = (
 )
 
 
-def plan_precision_switches(yaml_config, model_config=None):
+def normalize_skip_keys(skip_keys):
+    """Return ``skip_keys`` as a frozenset; unknown keys raise ``ValueError``.
+
+    A bare string is one key, not a sequence of characters.
+    """
+    if isinstance(skip_keys, str):
+        skip_keys = (skip_keys,)
+    keys = frozenset(skip_keys)
+    known = [switch.key for switch in PRECISION_SWITCHES]
+    unknown = keys.difference(known)
+    if unknown:
+        raise ValueError(
+            f"未知的精度开关：{', '.join(sorted(unknown))}"
+            f"（可选：{', '.join(known)}）"
+        )
+    return keys
+
+
+def _resolve_targets(switch, yaml_config, model_config):
+    """Documents ``switch`` must be written to; empty when none is writable."""
+    targets = []
+    if yaml_config is not None and switch.key in yaml_config:
+        targets.append("yaml")
+    if model_config is not None and switch.key in model_config:
+        targets.append("json")
+    if targets:
+        return targets
+    if switch.target == "json" and model_config is None:
+        return []
+    return [switch.target]
+
+
+def plan_precision_switches(yaml_config, model_config=None, skip_keys=()):
     """Decide where each determinism switch must be written.
 
     Returns ``(applied, skipped)``:
@@ -83,26 +115,30 @@ def plan_precision_switches(yaml_config, model_config=None):
     * ``applied`` -- list of ``(target, key, value, reason)`` where ``target``
       is ``"yaml"`` or ``"json"``;
     * ``skipped`` -- human-readable notes for switches that had nowhere to go
-      (e.g. a ``json`` switch while no ``model_config.json`` is being written).
+      (e.g. a ``json`` switch while no ``model_config.json`` is being written)
+      or that the caller excluded via ``skip_keys``.
+
+    ``skip_keys`` goes through :func:`normalize_skip_keys`, so an unknown key
+    raises ``ValueError`` instead of silently matching nothing.
     """
+    skip_keys = normalize_skip_keys(skip_keys)
     applied = []
     skipped = []
 
     for switch in PRECISION_SWITCHES:
-        targets = []
-        if yaml_config is not None and switch.key in yaml_config:
-            targets.append("yaml")
-        if model_config is not None and switch.key in model_config:
-            targets.append("json")
+        if switch.key in skip_keys:
+            skipped.append(
+                f"{switch.key}：通过 --skip-precision-switch 保留原值，未注入"
+            )
+            continue
 
+        targets = _resolve_targets(switch, yaml_config, model_config)
         if not targets:
-            if switch.target == "json" and model_config is None:
-                skipped.append(
-                    f"{switch.key}：yaml 与 model_config.json 均未声明该字段，"
-                    f"且本次没有可写的 model_config.json，已跳过"
-                )
-                continue
-            targets = [switch.target]
+            skipped.append(
+                f"{switch.key}：yaml 与 model_config.json 均未声明该字段，"
+                f"且本次没有可写的 model_config.json，已跳过"
+            )
+            continue
 
         for target in targets:
             applied.append((target, switch.key, switch.value, switch.reason))

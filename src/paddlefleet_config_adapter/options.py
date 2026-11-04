@@ -37,6 +37,8 @@ Each switch owns one concern:
 
 from __future__ import annotations
 
+from .precision import normalize_skip_keys
+
 
 class AdaptOptions:
     """Derived behaviour of the two test switches."""
@@ -46,6 +48,7 @@ class AdaptOptions:
         test_performance=False,
         test_accuracy=False,
         shrink_structure=False,
+        skip_precision_switches=(),
     ):
         self.test_performance = bool(test_performance)
         self.test_accuracy = bool(test_accuracy)
@@ -54,6 +57,11 @@ class AdaptOptions:
         # lists) down to its legal floor. Requires --test-accuracy and is
         # mutually exclusive with --test-performance (see cli.main).
         self.shrink_structure = bool(shrink_structure)
+        # --skip-precision-switch: determinism switches left at their source
+        # value. Requires --test-accuracy (see cli.main).
+        self.skip_precision_switches = normalize_skip_keys(
+            skip_precision_switches
+        )
 
     @property
     def freeze_parallel(self):
@@ -119,4 +127,6 @@ class AdaptOptions:
             given.append("--test-accuracy")
         if self.shrink_structure:
             given.append("--shrink-structure")
+        for key in sorted(self.skip_precision_switches):
+            given.append(f"--skip-precision-switch {key}")
         return " ".join(given) if given else "未指定测试维度"
