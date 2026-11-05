@@ -409,6 +409,14 @@ class MlpNode:
         Constructor
         """
         self.token_dispatcher = custom_map.token_dispatcher
+        # The node frees its input hidden states / indices and its output grad
+        # as soon as it is done with them. That is only safe when they are
+        # dispatcher-owned buffers (EP>1: DeepEP dispatch/combine). A caller
+        # handing in tensors shared with the rest of the graph (EP=1) sets
+        # ``owns_dispatch_buffers = False`` on its custom_map.
+        self.owns_dispatch_buffers = getattr(
+            custom_map, "owns_dispatch_buffers", True
+        )
         self.moe_expert_fusion = moe_expert_fusion
         self.experts = getattr(custom_map, "experts", None)
         if activation_type is None:
@@ -679,6 +687,12 @@ class MlpNode:
         self._pre_permute_cached_chunks = None
         self._pre_permute_chunk_bounds = None
         self.release_mem()
+
+    def _free_dispatch_buffer(self, tensor):
+        """Free a dispatcher-owned input / output-grad buffer early (see
+        ``owns_dispatch_buffers``); a no-op when the caller still uses it."""
+        if self.owns_dispatch_buffers:
+            tensor._clear_to_zero_allocation()
 
     def release_mem(self):
         """
@@ -1376,7 +1390,7 @@ class MlpNode:
         dispatched_indices._record_stream()
         dispatched_probs._record_stream()
         if self.dispatched_indices.dtype is not dispatched_indices.dtype:
-            dispatched_indices._clear_to_zero_allocation()
+            self._free_dispatch_buffer(dispatched_indices)
 
         # 3. FP8 量化（逐专家路径需要从 zipped 空间 gather，所以需要量化后的 zipped 数据）
         #    fusion 路径直接使用 unzipped_tokens，不需要量化 zipped 数据
@@ -1389,7 +1403,7 @@ class MlpNode:
                 hs_2d_dispatched_fp8, hs_2d_dispatched_scale = tilewise_quant(
                     hs_2d_dispatched
                 )
-            hs_2d_dispatched._clear_to_zero_allocation()
+            self._free_dispatch_buffer(hs_2d_dispatched)
 
             # 4. 保存输入供 recompute 使用（仅逐专家路径需要）
         if self.recompute_moe_premute and hs_2d_dispatched_fp8 is not None:
@@ -1746,7 +1760,7 @@ class MlpNode:
             self.hs_2d_dispatched_bf16 = None
         elif use_fp8_path:
             hs_fp8, hs_fp8_scale = tilewise_quant(hs_2d_dispatched)
-            hs_2d_dispatched._clear_to_zero_allocation()
+            self._free_dispatch_buffer(hs_2d_dispatched)
             self.hs_2d_dispatched_bf16 = None
         else:
             # BF16 path: no FP8 quantization
@@ -2301,7 +2315,7 @@ class MlpNode:
                 del expert_unzipped_grad
 
         # 4. unzip_grad
-        hidden_states_out_grad._clear_to_zero_allocation()  # dn1 复用 dn3
+        self._free_dispatch_buffer(hidden_states_out_grad)  # dn1 复用 dn3
         if self.recompute_moe_premute and zip_unzip_fusion:
             del unzipped_tokens, unzipped_scale
 
@@ -2973,7 +2987,7 @@ class MlpNode:
             # 路径 1：一次性 group GEMM → zip
             fwd_path = "group_gemm"
             if not use_fp8_dispatch_a2a:
-                hs_2d_dispatched._clear_to_zero_allocation()
+                self._free_dispatch_buffer(hs_2d_dispatched)
             expert_out = self.experts_group_gemm_node.forward(
                 unzipped_tokens,
                 unzipped_probs,
@@ -3116,7 +3130,7 @@ class MlpNode:
 
                 del expert_unzipped_grad
 
-            hidden_states_out_grad._clear_to_zero_allocation()
+            self._free_dispatch_buffer(hidden_states_out_grad)
             hs_fp8_dispatched_grad = merge_subbatch_cast(
                 output, hidden_states_out_grad.dtype
             )
@@ -3129,7 +3143,7 @@ class MlpNode:
             )
         else:
             bwd_path = "group_gemm"
-            hidden_states_out_grad._clear_to_zero_allocation()
+            self._free_dispatch_buffer(hidden_states_out_grad)
 
             # expert_grad
             expert_out, probs_grad = self.experts_group_gemm_node.backward(

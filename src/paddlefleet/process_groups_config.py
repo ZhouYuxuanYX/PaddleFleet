@@ -23,6 +23,9 @@ if TYPE_CHECKING:
 
 from paddlefleet import parallel_state
 
+# ProcessGroupCollection fields that hold no process group.
+_NON_PROCESS_GROUP_FIELDS = frozenset({"expert_rng_tracker_name"})
+
 
 @dataclass
 class ProcessGroupCollection:
@@ -78,6 +81,11 @@ class ProcessGroupCollection:
     # _EXPERT_DATA_PARALLEL_GROUP
     expt_dp: paddle.distributed.communication.group.Group = field(init=False)
 
+    # Not a process group: CUDA RNG tracker stream for expert init on these
+    # groups. None means the global expert stream. Set for expert groups that
+    # differ from the global EP layout (HyperBody encoder-only EP).
+    expert_rng_tracker_name: str | None = None
+
     def __init__(self, **kwargs):
         for key in kwargs:
             if key in [field.name for field in fields(self)]:
@@ -96,7 +104,11 @@ class ProcessGroupCollection:
                 one of the dataclass process group attributes.
         """
         # Get all available process groups
-        all_pgs = {field.name for field in fields(cls)}
+        all_pgs = {
+            field.name
+            for field in fields(cls)
+            if field.name not in _NON_PROCESS_GROUP_FIELDS
+        }
 
         # If no specific process groups requested, use all
         if required_pgs is None:

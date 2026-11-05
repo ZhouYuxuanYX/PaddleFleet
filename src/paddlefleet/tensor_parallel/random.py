@@ -46,6 +46,12 @@ HAVE_TE = False
 _MODEL_PARALLEL_RNG_TRACKER_NAME = "model-parallel-rng"
 _EXPERT_PARALLEL_RNG_TRACKER_NAME = "expert-parallel-rng"
 _DATA_PARALLEL_RNG_TRACKER_NAME = "data-parallel-rng"
+# Experts on an encoder-only EP group (HyperBody hyperencoder_expert_model_parallel_size).
+_ENCODER_EXPERT_PARALLEL_RNG_TRACKER_NAME = "encoder-expert-parallel-rng"
+# The seed of the last model_parallel_cuda_manual_seed call. Streams registered
+# later (the encoder expert stream) derive their seed from it, like the streams
+# that call registers itself.
+_BASE_SEED: int | None = None
 
 
 def _get_cuda_rng_state(
@@ -372,6 +378,31 @@ def model_parallel_cuda_manual_seed(
     _CUDA_RNG_STATE_TRACKER.add(
         _EXPERT_PARALLEL_RNG_TRACKER_NAME, expert_parallel_seed
     )
+    global _BASE_SEED
+    _BASE_SEED = seed
+
+
+def add_encoder_expert_parallel_rng(ep_rank: int, etp_rank: int = 0) -> str:
+    """Add (once) the RNG stream for experts on an encoder-only EP group.
+
+    The global expert stream is seeded by the rank in the *global* EP group.
+    Experts on a smaller encoder EP group are replicated across ranks with
+    different global EP ranks, so they need a stream seeded by the rank in the
+    encoder EP group: replicas of an expert then get identical initial values,
+    and the global expert stream (decoder experts) no longer depends on how
+    many encoder experts were created before it. Returns the tracker name.
+    """
+    tracker = get_cuda_rng_tracker()
+    name = _ENCODER_EXPERT_PARALLEL_RNG_TRACKER_NAME
+    if name not in tracker.get_states():
+        if _BASE_SEED is None:
+            raise RuntimeError(
+                "model_parallel_cuda_manual_seed must be called before building "
+                "encoder-only expert groups"
+            )
+        # +50 keeps it apart from the global expert seeds (seed + 1024 + 100 * r + etp).
+        tracker.add(name, _BASE_SEED + 1024 + 50 + 100 * ep_rank + etp_rank)
+    return name
 
 
 def _get_all_rng_states():

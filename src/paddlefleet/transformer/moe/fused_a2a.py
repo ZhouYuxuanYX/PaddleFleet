@@ -61,6 +61,10 @@ else:
     HAVE_SONIC_MOE = False
 
 _buffer = None
+# One DeepEP buffer per EP group (keyed by group.id), so MoE regions on
+# different EP groups (e.g. HyperBody encoder vs decoder) do not rebuild a
+# shared buffer on every switch. ``_buffer`` keeps pointing at the last one used.
+_buffers = {}
 _hybrid_ep_buffer = None
 _EP_BARRIER_ASYNC = True
 _ep_fence_tensors = {}
@@ -304,18 +308,20 @@ def get_buffer(group: Group, hidden_bytes: int):
 
     # Allocate buffer if not existed or not enough buffer
     # NOTES: the adaptive routing configuration of the network **must be off**
+    buffer = _buffers.get(group.id)
     if (
-        _buffer is None
-        or _buffer.group != group
-        or _buffer.num_nvl_bytes < num_nvl_bytes
-        or _buffer.num_rdma_bytes < num_rdma_bytes
+        buffer is None
+        or buffer.num_nvl_bytes < num_nvl_bytes
+        or buffer.num_rdma_bytes < num_rdma_bytes
     ):
-        _buffer = deep_ep.Buffer(
+        buffer = deep_ep.Buffer(
             group,
             num_nvl_bytes,
             num_rdma_bytes,
             num_qps_per_rank=max(24, deep_ep.Buffer.num_sms),
         )
+        _buffers[group.id] = buffer
+    _buffer = buffer
     return _buffer
 
 

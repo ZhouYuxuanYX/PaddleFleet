@@ -20,6 +20,7 @@ import logging
 import os
 from copy import deepcopy
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import paddle
@@ -103,6 +104,33 @@ logger = logging.getLogger(__name__)
 
 # MD5 logging for MoE precision debugging
 _LOG_LAYER_MD5 = os.environ.get("LOG_LAYER_MD5", "0") == "1"
+
+
+class _SingleCardFusionMap:
+    """The ``custom_map`` FusionMoePyLayer gets at EP=1.
+
+    The fusion node reads everything from the MoE layer except the dispatch
+    result, which at EP>1 comes from the DeepEP dispatcher. MlpNode only reads
+    ``token_dispatcher._comm_manager.tokens_per_expert`` from it, so that is
+    provided here. The layer itself gets no ``token_dispatcher``: other code
+    treats one as a real dispatcher with comm groups.
+
+    ``owns_dispatch_buffers = False``: at EP>1 the node's input hidden states,
+    indices and output grad are DeepEP buffers nobody else holds, so it frees
+    them early. At EP=1 they are shared with the router, the shared experts and
+    the residual branch, so the node must leave them alone.
+    """
+
+    owns_dispatch_buffers = False
+
+    def __init__(self, layer, tokens_per_expert):
+        self._layer = layer
+        self.token_dispatcher = SimpleNamespace(
+            _comm_manager=SimpleNamespace(tokens_per_expert=tokens_per_expert)
+        )
+
+    def __getattr__(self, name):
+        return getattr(self._layer, name)
 
 
 def _log_moe_md5(tensor, name, layer_idx=None):
@@ -2182,14 +2210,27 @@ class MoELayer(nn.Layer):
                     )
                     _hs_shared_gate_path = _hs_shared_gate
                     _pre_permuted = (_permuted, _sorted_indices)
-                output = self._forward_single_card_grouped_gemm_moe(
-                    reshaped_input,
-                    mask,
-                    probs,
-                    topk_indices,
-                    topk_weights,
-                    pre_permuted=_pre_permuted,
+                use_ep1_fusion = self._ep1_fusion_enabled()
+                fusion_skip = (
+                    self._ep1_fusion_skip_reason(topk_indices, _pre_permuted)
+                    if use_ep1_fusion
+                    else "disabled"
                 )
+                if fusion_skip is None:
+                    output = self._forward_single_card_fusion(
+                        reshaped_input, mask, topk_indices, topk_weights
+                    )
+                else:
+                    output = self._forward_single_card_grouped_gemm_moe(
+                        reshaped_input,
+                        mask,
+                        probs,
+                        topk_indices,
+                        topk_weights,
+                        pre_permuted=_pre_permuted,
+                    )
+                if use_ep1_fusion:
+                    self._log_ep1_fusion_once(fusion_skip)
             else:
                 output = self._forward_single_card_moe(
                     reshaped_input, topk_indices, topk_weights
@@ -2247,6 +2288,103 @@ class MoELayer(nn.Layer):
         if self.expert_model_parallel_size <= 1 and self.sequence_parallel:
             output = ScatterOp.apply(output)
         return output, None  # None is bias
+
+    def _ep1_fusion_enabled(self):
+        """Use the fusion node at EP=1 only for the HyperBody encoder with
+        ``hyperencoder_expert_model_parallel_size == 1``. The key is put on the
+        encoder view by ``hyperbody.modeling._build_encoder_view`` and kept off
+        the decoder view, so no other MoE layer is affected."""
+        config = getattr(self, "config", None)
+        return (
+            getattr(config, "hyperencoder_expert_model_parallel_size", None)
+            == 1
+        )
+
+    def _ep1_fusion_skip_reason(self, topk_indices, pre_permuted):
+        """Why the EP=1 fusion node cannot be used here (None: it can).
+
+        Only the bf16 path the EP fusion node already runs at EP>1 is
+        enabled; the rest keeps _forward_single_card_grouped_gemm_moe.
+        """
+        if pre_permuted is not None:
+            return "HF bit-exact path"
+        if self.using_sonic_moe:
+            return "using_sonic_moe"
+        if getattr(self, "use_accuracy_compatible", False):
+            return "use_accuracy_compatible"
+        if self.fp8 or self.use_w4a8:
+            return "fp8 / w4a8 not verified at EP=1"
+        if topk_indices is None:
+            return "router returned no topk_indices"
+        return None
+
+    def _log_ep1_fusion_once(self, skip_reason):
+        if getattr(self, "_ep1_fusion_logged", False):
+            return
+        self._ep1_fusion_logged = True
+        logger.info(
+            "[EP1-FUSION] layer=%s num_experts=%s: %s",
+            getattr(self, "layer_number", None),
+            self.num_experts,
+            "fusion node (moe_permute/moe_unpermute)"
+            if skip_reason is None
+            else f"single-card permute ({skip_reason})",
+        )
+
+    def _forward_single_card_fusion(
+        self, hidden_states, routing_map, topk_indices, topk_weights
+    ):
+        """EP=1 routed experts through FusionMoePyLayer.
+
+        Same contract as _forward_single_card_grouped_gemm_moe: takes the
+        [S, H] expert input, returns the [S, H] prob-weighted sum over top-k.
+        The router's topk weights / indices stand in for DeepEP's dispatched
+        probs / indices (at EP=1 global expert id == local expert id); the
+        probs gradient flows back through topk_weights instead of the dense
+        probs, which the router builds from the same topk weights.
+        """
+        num_tokens = hidden_states.shape[0]
+        # The fusion node does not free these at EP=1 (owns_dispatch_buffers on
+        # _SingleCardFusionMap), so they are passed as they are. The indices
+        # are detached: the router's come out with stop_gradient=False, but
+        # FusionMoePyLayer returns None for them and Paddle would then hand a
+        # null grad to the producer (the DeepEP dispatcher marks them the same
+        # way, _try_setup_router_topk_metadata).
+        topk_indices = topk_indices.reshape([num_tokens, -1]).detach()
+        topk_weights = topk_weights.reshape(topk_indices.shape).astype(
+            "float32"
+        )
+        # Same counts (and the same D2H sync) as GroupedMLPExpert.forward.
+        tokens_per_expert = [
+            int(x) for x in routing_map.astype("int64").sum(axis=0).tolist()
+        ]
+        output = FusionMoePyLayer.apply(
+            hidden_states,
+            topk_weights,
+            topk_indices,
+            _SingleCardFusionMap(self, tokens_per_expert),
+            self.num_experts_per_tok,
+            use_fp8_mlp=self.fp8,
+            moe_deep_gemm=self.moe_deep_gemm,
+            recompute_moe_gate_up=self.recompute_moe_gate_up,
+            recompute_moe_premute=self.recompute_moe_premute,
+            fp8_dispatched_handle=None,
+            use_bf16_gemm_weight_grad=not self.fp8_wgrad,
+            use_auto_subbatch=self.use_auto_subbatch,
+            auto_subbatch_mode=self.auto_subbatch_mode,
+            moe_expert_fusion=self.moe_expert_fusion,
+            moe_subbatch_token_num_after_dispatch=self.moe_subbatch_token_num_after_dispatch,
+            moe_subbatch_diag=self.moe_subbatch_diag,
+            use_ue8m0=self.use_ue8m0,
+            defer_expert_up_gate_dw=self.defer_expert_up_gate_dw,
+            defer_expert_down_dw=self.defer_expert_down_dw,
+            clamp_value=self.config.activation_func_clamp_value,
+            is_first_fwd=not framework._dygraph_tracer()._has_grad,
+            use_accuracy_compatible=False,
+            use_w4a8=False,
+            w4a8_route_factor_post_w2=self.w4a8_route_factor_post_w2,
+        )
+        return output
 
     def _forward_single_card_moe(
         self,

@@ -731,6 +731,17 @@ class Trainer:
             )
             self.args.enable_zero_cost_checkpoint = False
 
+        # HyperBody encoder-only expert groups are built with the model; reject
+        # checkpoint paths that only know the global expert layout.
+        _encoder_ep = sys.modules.get(
+            "paddlefleet.transformers.hyperbody.encoder_ep"
+        )
+        if (
+            _encoder_ep is not None
+            and _encoder_ep.get_encoder_ep_degree() is not None
+        ):
+            _encoder_ep.check_encoder_ep_checkpoint_compat(self.args)
+
         if self.args.enable_zero_cost_checkpoint:
             # Currently, zero cost checkpoint only support pretraining mode with hybrid parallel enabled
             assert not self.args.ignore_save_lr_and_optim, (

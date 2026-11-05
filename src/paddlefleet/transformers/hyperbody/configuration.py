@@ -307,6 +307,13 @@ class HyperBodyEncoderConfig(PretrainedConfig):
         # Shard the packed encoder trunk over CP (flashmask only). Off: every CP
         # rank runs the whole encoder sequence (cp_replicated_sequence).
         hyperencoder_cp_shard: bool = False,
+        # Encoder-only EP degree. None: same as the decoder (global EP). Must
+        # divide the decoder EP; the encoder EP groups nest inside it.
+        hyperencoder_expert_model_parallel_size: int | None = None,
+        # Encoder EP > 1 needs Muon/Mixed sharding that keys 2D buckets by
+        # (color, group ranks) (PaddlePaddle/Paddle#79913) and checks for it.
+        # Only set this when the optimizer is neither of them.
+        hyperencoder_allow_color_buckets: bool = False,
         # Encoder-only MoE aux loss, independent of the global coef (the decoder
         # runs noaux_tc at 0.0). MUST ride through ``super().__init__``: it is an
         # llm_meta key, so ``set_expected_keys`` overwrites anything assigned on
@@ -375,6 +382,22 @@ class HyperBodyEncoderConfig(PretrainedConfig):
         self.hyperencoder_attn_backend = hyperencoder_attn_backend
         self.hyperencoder_packed_decoder = hyperencoder_packed_decoder
         self.hyperencoder_cp_shard = bool(hyperencoder_cp_shard)
+        self.hyperencoder_expert_model_parallel_size = (
+            None
+            if hyperencoder_expert_model_parallel_size is None
+            else int(hyperencoder_expert_model_parallel_size)
+        )
+        if (
+            self.hyperencoder_expert_model_parallel_size is not None
+            and self.hyperencoder_expert_model_parallel_size <= 0
+        ):
+            raise ValueError(
+                "encoder_config.hyperencoder_expert_model_parallel_size must be "
+                f"positive, got {hyperencoder_expert_model_parallel_size!r}."
+            )
+        self.hyperencoder_allow_color_buckets = bool(
+            hyperencoder_allow_color_buckets
+        )
         if self.hyperencoder_cp_shard and not bool(hyperencoder_packed_decoder):
             raise ValueError(
                 "encoder_config.hyperencoder_cp_shard=True requires the packed "

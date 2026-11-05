@@ -284,8 +284,15 @@ class GroupedMLPExpert(FleetLayer):
             self.config.hidden_size,
         ]
 
+        # Experts on an encoder-only EP group use their own stream (see
+        # tensor_parallel.random.add_encoder_expert_parallel_rng).
+        # getattr: callers may pass a stand-in collection without the field.
+        rng_name = (
+            getattr(pg_collection, "expert_rng_tracker_name", None)
+            or get_expert_parallel_rng_tracker_name()
+        )
         rng_ctx = (
-            get_cuda_rng_tracker().fork(get_expert_parallel_rng_tracker_name())
+            get_cuda_rng_tracker().fork(rng_name)
             if paddle.distributed.get_world_size() > 1 and self.expert_parallel
             else nullcontext()
         )

@@ -1324,10 +1324,19 @@ class HyperBodyUnifiedModel(PretrainedModel, PipelineLayer):
 def _build_decoder_view(config: HyperBodyConfig):
     import types
 
+    # ``hyperencoder_expert_model_parallel_size`` also sits flat on the config
+    # (ERNIEBot copies it down into encoder_config from there). Keep it off the
+    # decoder view: MoELayer reads it to pick the EP=1 fusion path, which is
+    # meant for the encoder only.
     merged = {
         k: v
         for k, v in config.__dict__.items()
-        if k not in ("decoder_config", "encoder_config")
+        if k
+        not in (
+            "decoder_config",
+            "encoder_config",
+            "hyperencoder_expert_model_parallel_size",
+        )
     }
     dec = config.decoder_config
     for key in DECODER_VIEW_KEYS:
@@ -1363,6 +1372,39 @@ def _build_decoder_view(config: HyperBodyConfig):
         config.encoder_config.hyperencoder_packed_decoder
     )
     return view
+
+
+def _encoder_ep_size(config: HyperBodyConfig) -> int:
+    """Encoder EP degree: ``encoder_config.hyperencoder_expert_model_parallel_size``
+    when set, else the global (decoder) EP."""
+    enc_ep = getattr(
+        config.encoder_config, "hyperencoder_expert_model_parallel_size", None
+    )
+    return config.expert_model_parallel_size if enc_ep is None else int(enc_ep)
+
+
+def _inject_encoder_pg_collection(config, encoder_view, enc_layer_specs):
+    """Encoder-only EP: hand the encoder trunk its own ep / expt_dp groups.
+
+    The MoE layer derives EP size, local experts, dispatcher group and the
+    expert params' grad group from pg_collection at construction time. Nothing
+    changes when the encoder EP equals the decoder EP. The Trainer checks the
+    checkpoint paths against these groups
+    (``encoder_ep.check_encoder_ep_checkpoint_compat``).
+    """
+    enc_ep = encoder_view.expert_model_parallel_size
+    if enc_ep == config.expert_model_parallel_size:
+        return
+    from .encoder_ep import get_encoder_pg_collection
+
+    enc_pgs = get_encoder_pg_collection(
+        int(enc_ep),
+        allow_color_buckets=getattr(
+            config.encoder_config, "hyperencoder_allow_color_buckets", False
+        ),
+    )
+    for spec in enc_layer_specs:
+        spec.extra_kwargs["pg_collection"] = enc_pgs
 
 
 def _build_encoder_view(config: HyperBodyConfig, decoder_hidden: int):
@@ -1452,7 +1494,7 @@ def _build_encoder_view(config: HyperBodyConfig, decoder_hidden: int):
         moe_expert_fusion=config.moe_expert_fusion,
         moe_deep_gemm=getattr(config, "moe_deep_gemm", True),
         router_aux_loss_coef=float(enc.router_aux_loss_coef),
-        expert_model_parallel_size=config.expert_model_parallel_size,
+        expert_model_parallel_size=_encoder_ep_size(config),
         context_parallel_size=config.context_parallel_size,
         moe_shared_expert_overlap=config.moe_shared_expert_overlap,
         moe_router_load_balancing_type=config.moe_router_load_balancing_type,
@@ -1482,6 +1524,12 @@ def _build_encoder_view(config: HyperBodyConfig, decoder_hidden: int):
     # key (and the same cross-layer aggregate). The tag routes the encoder's
     # metrics to ``<monitor>_enc/...``; see internal_medicine LayerId.
     view.metric_layer_region = "enc"
+    # Read by MoELayer._ep1_fusion_enabled: an explicit encoder EP of 1 runs the
+    # routed experts through the EP fusion node. Only this view carries it
+    # (_build_decoder_view drops the flat copy).
+    view.hyperencoder_expert_model_parallel_size = getattr(
+        config.encoder_config, "hyperencoder_expert_model_parallel_size", None
+    )
     view.hyperbody_context_token_id = config.hyperbody_context_token_id
     # AOA declarations for the encoder region: the field list above is explicit,
     # so nothing reaches the view unless it is forwarded here. The two name
@@ -2095,6 +2143,7 @@ def build_hyperbody_unified_model(
 
     encoder_view = _build_encoder_view(config, decoder_view.hidden_size)
     enc_layer_specs = get_hyperbody_encoder_layer_specs(encoder_view)
+    _inject_encoder_pg_collection(config, encoder_view, enc_layer_specs)
 
     frontend_spec = LayerSpec(
         HyperBodyEncoderFrontEnd, extra_kwargs={"config": encoder_view}

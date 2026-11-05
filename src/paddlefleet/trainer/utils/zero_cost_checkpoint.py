@@ -22,6 +22,7 @@ import multiprocessing
 import os
 import random
 import re
+import sys
 import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict
@@ -2675,6 +2676,11 @@ class DistInfoCollectorValidator:
             "ep_degree": ep_degree,
             "moe_sharding_degree": moe_sharding_degree,
         }
+        # Only written when encoder experts use their own EP groups, so
+        # checkpoints of other models keep the old parallel_config.
+        encoder_ep_degree = _encoder_ep_degree()
+        if encoder_ep_degree is not None and encoder_ep_degree != ep_degree:
+            parallel_config["encoder_ep_degree"] = encoder_ep_degree
         self._check_distributed_strategy(parallel_config)
         return parallel_config
 
@@ -2705,6 +2711,8 @@ class DistInfoCollectorValidator:
             ]
             keys = list(old_config.keys())
             for key in keys:
+                if key == "encoder_ep_degree":
+                    continue
                 if key not in cur_config:
                     return False, f"missing {key}"
                 else:
@@ -2715,7 +2723,29 @@ class DistInfoCollectorValidator:
                             False,
                             f"{key} not match: {old_value} vs {cur_value}",
                         )
+            # A missing encoder_ep_degree means encoder experts used the
+            # global EP layout, so compare the effective encoder EP size.
+            old_enc = old_config.get(
+                "encoder_ep_degree", old_config["ep_degree"]
+            )
+            cur_enc = cur_config.get(
+                "encoder_ep_degree", cur_config["ep_degree"]
+            )
+            if old_enc != cur_enc:
+                return (
+                    False,
+                    f"encoder_ep_degree not match: {old_enc} vs {cur_enc}",
+                )
         return True, None
+
+
+def _encoder_ep_degree():
+    """EP size of HyperBody encoder-only expert groups, or None if not built.
+
+    Looked up in sys.modules so models without them never import HyperBody.
+    """
+    mod = sys.modules.get("paddlefleet.transformers.hyperbody.encoder_ep")
+    return None if mod is None else mod.get_encoder_ep_degree()
 
 
 def _zcc_metadata_shards(ckpt_meta, key):

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
 import time
 from collections import OrderedDict
 
@@ -1418,6 +1419,17 @@ def get_moe_sharding_group(hcg=None):
         return None
 
 
+def _encoder_expert_data_groups():
+    """Expert-data groups of HyperBody encoder-only EP, if any were built.
+
+    Looked up in sys.modules so models without them never import HyperBody.
+    """
+    mod = sys.modules.get("paddlefleet.transformers.hyperbody.encoder_ep")
+    if mod is None:
+        return []
+    return [pgs.expt_dp for pgs in mod._ENCODER_PGS.values()]
+
+
 def get_param_sharding_group(param, hcg=None):
     if hcg is None:
         hcg = fleet.get_hybrid_communicate_group()
@@ -1429,9 +1441,12 @@ def get_param_sharding_group(param, hcg=None):
     color = getattr(param, "color")
     if isinstance(color, dict):
         group = color.get("group", default_group)
-        assert group is default_group or group is ep_sharding_group, (
-            f"unsupported group: {group}"
-        )
+        # The group in param.color is the one the sharding optimizer actually
+        # slices this param on, so master-weight restore must use it as is.
+        allowed = [default_group, ep_sharding_group]
+        allowed += _encoder_expert_data_groups()
+        if not any(group is g for g in allowed):
+            raise ValueError(f"unsupported group: {group}")
         return group
     else:
         return default_group
