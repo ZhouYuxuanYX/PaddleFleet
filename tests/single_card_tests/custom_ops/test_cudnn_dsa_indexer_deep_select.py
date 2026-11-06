@@ -41,7 +41,7 @@ def _deep_select_kernel_available():
     if (
         not paddle.is_compiled_with_cuda()
         or paddle.device.cuda.device_count() == 0
-        or paddle.device.cuda.get_device_capability()[0] < 10
+        or paddle.device.cuda.get_device_capability()[0] < 9
     ):
         return False
     try:

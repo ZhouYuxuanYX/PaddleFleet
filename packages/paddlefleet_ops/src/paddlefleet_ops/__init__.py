@@ -266,7 +266,7 @@ if paddle.is_compiled_with_cuda():
     if sys.version_info >= (3, 12):
         _CUDNN_FRONTEND_AVAILABLE = True
     _FAST_HADAMARD_TRANSFORM_AVAILABLE = True
-    if paddle.cuda.get_device_capability()[0] >= 10 and _cuda_version >= (
+    if paddle.cuda.get_device_capability()[0] >= 9 and _cuda_version >= (
         12,
         9,
     ):
@@ -487,7 +487,7 @@ if paddle.is_compiled_with_cuda():
     else:
         warning, error = _build_notice(
             "paddlefleet_ops.deep_select",
-            "requires CUDA >= 12.9 and GPU compute capability >= 10.0.",
+            "requires CUDA >= 12.9 and GPU compute capability >= 9.0.",
         )
         logger.warning(warning)
         blocked_import_messages["paddlefleet_ops.deep_select"] = error
