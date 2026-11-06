@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import logging
 import os
-import platform
 import re
 import shutil
 import subprocess
@@ -351,9 +350,6 @@ def get_special_build_deps():
         minor = sys.version_info.minor
         deps = []
         # for deep_ep build
-        if platform.machine() == "aarch64":
-            deps.append("nvidia-nvshmem-cu13>=3.3.9,<3.5")
-            return deps
         if cuda_major == 12:
             if cuda_minor > 6:
                 deps.append("paddle-nvidia-nvshmem-cu12>=3.3.9,<3.5")

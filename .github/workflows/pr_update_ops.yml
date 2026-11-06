@@ -292,7 +292,7 @@ jobs:
       matrix:
         python_version: ["3.12"]
         cuda:
-          - {CUDA_VERSION: CUDA13.2, bos_CUDA: cu132, IMAGE_TAG: cuda132-dev-arm-py312-fleet}
+          - {CUDA_VERSION: CUDA13.2, bos_CUDA: cu132, IMAGE_TAG: cuda132-dev-arm-py312-fleet, CUDA_ARCH_LIST: "9.0;10.0;10.3"}
     env:
       TASK: PaddleFleet-nightly-arm-${{ matrix.cuda.CUDA_VERSION }}
       PIP_CACHE_DIR: /home/.cache/pip
@@ -325,6 +325,7 @@ jobs:
             -e CCACHE_MAXSIZE \
             -e CCACHE_LIMIT_MULTIPLE \
             -e UV_HTTP_TIMEOUT \
+            -e PADDLE_CUDA_ARCH_LIST="${{ matrix.cuda.CUDA_ARCH_LIST }}" \
             -e PR_ID \
             -e COMMIT_ID \
             -e BRANCH \
@@ -386,7 +387,9 @@ jobs:
           fi
           export IS_NVIDIA=True
           python -m pip install --break-system-packages packaging "setuptools>=66.1.0" wheel "ninja==1.11.1.1" "pybind11[global]>=2.13,<3"
-          python -m pip install --break-system-packages "nvidia-nvshmem-cu13>=3.3.9,<3.5"
+          # Official nvidia-nvshmem-cu13 lacks SM103 and installs into the same nvidia/nvshmem dir.
+          python -m pip uninstall --break-system-packages -y nvidia-nvshmem-cu13 || true
+          python -m pip install --break-system-packages "paddle-nvidia-nvshmem-cu13>=3.3.9,<3.5" --extra-index-url=https://www.paddlepaddle.org.cn/packages/nightly/${{ matrix.cuda.bos_CUDA }}/
           source ci/setup_ops_toolchain.sh || exit 1
           uv build --wheel --package paddlefleet-ops --out-dir dist --no-build-isolation -v
           '
