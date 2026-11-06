@@ -33,6 +33,7 @@ from paddlefleet.models.hyperencoder.modality_encoders import (
     _aligned_bilinear_2d,
     get_abs_pos_1d,
     get_abs_pos_2d,
+    image_to_patch_rows,
 )
 
 
@@ -207,6 +208,112 @@ class TestImageEncoderConv(unittest.TestCase):
         x = paddle.randn([1, 3, 12, 12])
         out = enc(x)
         self.assertEqual(out.shape, [1, 6, 6, 8])
+
+
+class TestImageEncoderConvForwardPatches(unittest.TestCase):
+    def test_image_to_patch_rows_layout(self):
+        img = paddle.arange(3 * 5 * 7, dtype="float32").reshape([3, 5, 7])
+        rows = image_to_patch_rows(img, 2)
+        self.assertEqual(rows.shape, [2, 3, 12])
+        # Block (1, 2) covers pixels [:, 2:4, 4:6], flattened in (c, u, v).
+        ref = img[:, 2:4, 4:6].reshape([-1])
+        self.assertTrue(bool((rows[1, 2] == ref).all()))
+        # numpy input gives the same layout.
+        rows_np = image_to_patch_rows(img.numpy(), 2)
+        self.assertTrue(bool((paddle.to_tensor(rows_np) == rows).all()))
+
+    def test_matches_per_image_forward(self):
+        paddle.seed(0)
+        enc = ImageEncoderConv(
+            img_size=8, patch_size=2, in_chans=3, embed_dim=8, out_chans=16
+        )
+        with paddle.no_grad():
+            enc.pos_embed.set_value(paddle.randn(enc.pos_embed.shape))
+        enc.to(dtype="float64")
+        imgs = [
+            paddle.randn([3, h, w], dtype="float64")
+            for h, w in [(8, 6), (9, 7), (4, 10), (8, 6)]
+        ]
+        rows = [image_to_patch_rows(im, 2) for im in imgs]
+        grids = [tuple(r.shape[:2]) for r in rows]
+        out = enc.forward_patches(
+            paddle.concat([r.reshape([-1, 12]) for r in rows], axis=0), grids
+        )
+        ref = paddle.concat(
+            [enc(im.unsqueeze(0)).reshape([-1, 8]) for im in imgs], axis=0
+        )
+        self.assertEqual(out.shape, ref.shape)
+        self.assertLess(float((out - ref).abs().max()), 1e-6)
+
+
+class TestPatchEmbedForwardPatches(unittest.TestCase):
+    def test_rejects_overlapping_or_padded_conv(self):
+        x = paddle.zeros([4, 3 * 2 * 2])
+        for kw in (
+            {"kernel_size": (2, 2), "stride": (1, 1)},
+            {"kernel_size": (2, 2), "stride": (2, 2), "padding": (1, 1)},
+        ):
+            with self.assertRaises(ValueError):
+                PatchEmbed(in_chans=3, embed_dim=8, **kw).forward_patches(x)
+
+    def test_empty_input(self):
+        enc = ImageEncoderConv(img_size=8, patch_size=2, embed_dim=8)
+        out = enc.forward_patches(paddle.zeros([0, 12]), [])
+        self.assertEqual(out.shape, [0, 8])
+
+
+class TestAudioEncoderConvForwardBatch(unittest.TestCase):
+    def _enc(self):
+        paddle.seed(0)
+        enc = AudioEncoderConv(
+            num_mel_bins=4, embed_dim=8, max_position_embeddings=64
+        )
+        with paddle.no_grad():
+            for p in enc.parameters():
+                p.set_value(paddle.randn(p.shape))
+        enc.to(dtype="float64")
+        return enc
+
+    def test_matches_per_item_forward(self):
+        enc = self._enc()
+        # Even / odd lengths, length 1 and 2, and an odd item followed by an
+        # even one (the gap then needs two zero frames).
+        for lengths in ([6, 7, 1, 40, 13, 6, 2, 33], [1], [7, 2], [2, 1, 3]):
+            mels = [paddle.randn([4, t], dtype="float64") for t in lengths]
+            ref = paddle.concat(
+                [enc(m.unsqueeze(0))[0, 0] for m in mels], axis=0
+            )
+            out, out_lens = enc.forward_batch(mels)
+            self.assertEqual(out_lens, [(t + 1) // 2 for t in lengths])
+            self.assertEqual(out.shape, ref.shape)
+            self.assertLess(float((out - ref).abs().max()), 1e-10, lengths)
+
+    def test_grads_match_per_item_forward(self):
+        lengths = [5, 12, 9]
+        mels = [paddle.randn([4, t], dtype="float64") for t in lengths]
+        grads = []
+        for batched in (False, True):
+            enc = self._enc()
+            if batched:
+                out, _ = enc.forward_batch(mels)
+            else:
+                out = paddle.concat([enc(m.unsqueeze(0))[0, 0] for m in mels])
+            (
+                out
+                * paddle.arange(out.numel(), dtype="float64").reshape(out.shape)
+            ).sum().backward()
+            grads.append({n: p.grad.numpy() for n, p in enc.named_parameters()})
+        for n in grads[0]:
+            scale = float(abs(grads[0][n]).max()) + 1e-30
+            self.assertLess(
+                float(abs(grads[0][n] - grads[1][n]).max()) / scale, 1e-6, n
+            )
+
+    def test_empty_input(self):
+        out, out_lens = self._enc().forward_batch([])
+        self.assertEqual(out.shape, [0, 8])
+        self.assertEqual(out.dtype, paddle.float64)  # the tower's dtype
+        self.assertEqual(out_lens, [])
 
 
 class TestAudioEncoderConv(unittest.TestCase):

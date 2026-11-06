@@ -43,10 +43,15 @@ Numerical details:
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING
 
+import numpy as np
 import paddle
 import paddle.nn.functional as F
 from paddle import nn
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 __all__ = [
     "MlpProjector",
@@ -55,6 +60,7 @@ __all__ = [
     "AudioEncoderConv",
     "get_abs_pos_2d",
     "get_abs_pos_1d",
+    "image_to_patch_rows",
 ]
 
 
@@ -107,6 +113,9 @@ class PatchEmbed(nn.Layer):
         embed_dim: int = 768,
     ) -> None:
         super().__init__()
+        self.kernel_size = tuple(kernel_size)
+        self.stride = tuple(stride)
+        self.padding = tuple(padding)
         self.proj = nn.Conv2D(
             in_chans,
             embed_dim,
@@ -119,6 +128,23 @@ class PatchEmbed(nn.Layer):
         x = self.proj(x)
         # B C H W -> B H W C
         return x.transpose([0, 2, 3, 1])
+
+    def forward_patches(self, patches: paddle.Tensor) -> paddle.Tensor:
+        """Patch rows ``[N, C*kh*kw]`` -> ``[N, embed_dim]``, one GEMM.
+
+        Each row is one non-overlapping ``kh x kw`` block flattened in
+        ``(c, u, v)`` order (``image_to_patch_rows``). With
+        ``kernel == stride`` and no padding the conv is exactly this matmul
+        with ``weight.reshape([embed_dim, -1])``; other geometries raise.
+        """
+        if self.kernel_size != self.stride or any(self.padding):
+            raise ValueError(
+                "PatchEmbed.forward_patches needs kernel_size == stride and "
+                f"zero padding, got kernel_size={self.kernel_size}, "
+                f"stride={self.stride}, padding={self.padding}"
+            )
+        weight = self.proj.weight.reshape([self.proj.weight.shape[0], -1])
+        return F.linear(patches, weight.t(), self.proj.bias)
 
 
 def _aligned_interp_1d_axis(
@@ -222,6 +248,22 @@ def get_abs_pos_1d(abs_pos: paddle.Tensor, tgt_size: int) -> paddle.Tensor:
     return abs_pos
 
 
+def image_to_patch_rows(image, patch_size: int = 14):
+    """``[C, H, W]`` -> ``[H//p, W//p, C*p*p]``, the layout of ``forward_patches``.
+
+    Each non-overlapping ``p x p`` block is flattened in ``(c, u, v)`` order,
+    blocks row-major over the patch grid; trailing pixels are dropped like a
+    ``Conv2D(stride=p)`` without padding. Pure data movement, so it can run on
+    the data side. Works on numpy arrays and paddle Tensors alike (returns the
+    same kind as ``image``).
+    """
+    c, h, w = (int(d) for d in image.shape)
+    p = int(patch_size)
+    gh, gw = h // p, w // p
+    x = image[:, : gh * p, : gw * p].reshape([c, gh, p, gw, p])
+    return x.transpose([1, 3, 0, 2, 4]).reshape([gh, gw, c * p * p])
+
+
 class ImageEncoderConv(nn.Layer):
     """Patch embedding plus a learnable 2-D positional embedding.
 
@@ -256,10 +298,33 @@ class ImageEncoderConv(nn.Layer):
         )
 
     def forward(self, x: paddle.Tensor) -> paddle.Tensor:
-        """``[B, 3, H, W]`` -> ``[B, H//14, W//14, 768]``."""
+        """``[B, 3, H, W]`` -> ``[B, H//p, W//p, embed_dim]``."""
         x = self.patch_embed(x)
         if self.pos_embed is not None:
             x = x + get_abs_pos_2d(self.pos_embed, (x.shape[1], x.shape[2]))
+        return x
+
+    def forward_patches(
+        self, patches: paddle.Tensor, grids: Sequence[tuple[int, int]]
+    ) -> paddle.Tensor:
+        """Patch rows of many images -> ``[sum(h*w), embed_dim]``, one GEMM.
+
+        ``patches`` is ``[sum(h*w), C*p*p]`` (``p = patch_size``): the data
+        side cut every image into its non-overlapping ``p x p`` blocks with
+        ``image_to_patch_rows`` and stacked them image after image. ``grids``
+        lists each image's patch grid ``(h, w)`` in the same order. The patch
+        embed is ``PatchEmbed.forward_patches``; the pos embed is resampled
+        once per distinct grid.
+        """
+        x = self.patch_embed.forward_patches(patches)
+        if self.pos_embed is not None and grids:
+            pos = {}
+            for g in grids:
+                if g not in pos:
+                    pos[g] = get_abs_pos_2d(self.pos_embed, g).reshape(
+                        [g[0] * g[1], -1]
+                    )
+            x = x + paddle.concat([pos[g] for g in grids], axis=0)
         return x
 
 
@@ -305,3 +370,65 @@ class AudioEncoderConv(nn.Layer):
         x = x.transpose([0, 2, 1])  # [B, T', embed_dim]
         x = x + get_abs_pos_1d(self.pos_embed, x.shape[1])
         return x.unsqueeze(1)  # [B, 1, T', embed_dim]
+
+    def forward_batch(
+        self, audios: Sequence[paddle.Tensor]
+    ) -> tuple[paddle.Tensor, list[int]]:
+        """Many ``[M, T_i]`` mels -> ``([sum(T'_i), D], [T'_i])``.
+
+        Returns the stacked features and each item's row count
+        ``T'_i = (T_i+1)//2``; row block ``i`` equals
+        ``forward(audios[i][None])[0, 0]``. All items
+        are laid end to end on one time axis, each starting at an even frame
+        and followed by at least one zero frame, and the convs run once over
+        that ``[1, M, L]`` sequence (``L`` exceeds ``sum(T_i)`` by at most two
+        frames per item):
+
+        * ``conv1`` (kernel 3, stride 1) reads one frame past each end of an
+          item: the zero gap, i.e. what the per-item path sees as padding.
+        * The gap frames of the ``conv1`` output are zeroed again (the conv
+          adds its bias there) before ``conv2``.
+        * ``conv2`` (kernel 3, stride 2) output ``j`` reads ``conv1`` frames
+          ``2j-1 .. 2j+1``. With an even start ``s`` the item's outputs are
+          ``s/2 .. s/2+T'-1``; they read the gap before ``s`` and, for odd
+          ``T``, the gap at ``s+T``, again matching the per-item padding.
+
+        The pos embed is resampled once per distinct ``T'_i``.
+        """
+        lengths = [int(a.shape[1]) for a in audios]
+        if not lengths:
+            empty = paddle.zeros([0, self.pos_embed.shape[-1]])
+            return empty.astype(self.pos_embed.dtype), []
+        starts, total = [], 0
+        for t in lengths:
+            starts.append(total)
+            total += t + 1  # at least one zero frame after each item
+            total += total % 2  # next item starts at an even frame
+        # Gather source per packed frame; gaps point at one appended zero column.
+        zero_col = sum(lengths)
+        flat = paddle.concat(
+            [*audios, paddle.zeros([audios[0].shape[0], 1], audios[0].dtype)],
+            axis=1,
+        )
+        src = np.full(total, zero_col, dtype=np.int64)
+        keep = np.zeros(total, dtype=bool)
+        offset = 0
+        for s, t in zip(starts, lengths):
+            src[s : s + t] = np.arange(offset, offset + t)
+            keep[s : s + t] = True
+            offset += t
+        x = paddle.index_select(flat, paddle.to_tensor(src), axis=1)
+        x = F.gelu(self.conv1(x.unsqueeze(0)), approximate=False)
+        x = x * paddle.to_tensor(keep[None, None, :]).astype(x.dtype)
+        x = F.gelu(self.conv2(x), approximate=False)
+        x = x[0].transpose([1, 0])  # [(total+1)//2, D]
+        out_lens = [(t + 1) // 2 for t in lengths]
+        rows = np.concatenate(
+            [s // 2 + np.arange(t) for s, t in zip(starts, out_lens)]
+        )
+        x = paddle.index_select(x, paddle.to_tensor(rows), axis=0)
+        pos = {}
+        for t in out_lens:
+            if t not in pos:
+                pos[t] = get_abs_pos_1d(self.pos_embed, t)[0]
+        return x + paddle.concat([pos[t] for t in out_lens], axis=0), out_lens

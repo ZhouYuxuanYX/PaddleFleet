@@ -314,6 +314,10 @@ class HyperBodyEncoderConfig(PretrainedConfig):
         # (color, group ranks) (PaddlePaddle/Paddle#79913) and checks for it.
         # Only set this when the optimizer is neither of them.
         hyperencoder_allow_color_buckets: bool = False,
+        # Run each modality tower once per packed micro-batch (one patch-embed
+        # GEMM for all images, one packed conv pass for all audio chunks)
+        # instead of once per segment. Not bit-identical, hence off.
+        hyperencoder_batched_patch_embed: bool = False,
         # Encoder-only MoE aux loss, independent of the global coef (the decoder
         # runs noaux_tc at 0.0). MUST ride through ``super().__init__``: it is an
         # llm_meta key, so ``set_expected_keys`` overwrites anything assigned on
@@ -397,6 +401,9 @@ class HyperBodyEncoderConfig(PretrainedConfig):
             )
         self.hyperencoder_allow_color_buckets = bool(
             hyperencoder_allow_color_buckets
+        )
+        self.hyperencoder_batched_patch_embed = bool(
+            hyperencoder_batched_patch_embed
         )
         if self.hyperencoder_cp_shard and not bool(hyperencoder_packed_decoder):
             raise ValueError(

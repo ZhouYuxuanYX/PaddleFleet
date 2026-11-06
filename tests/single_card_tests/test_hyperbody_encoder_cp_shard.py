@@ -70,6 +70,7 @@ def _enc_cfg(cp=4, shard=True, mode="contiguous_allgather"):
         hyperencoder_cp_shard=shard,
         context_parallel_size=cp,
         cp_balance_mode=mode,
+        hyperencoder_batched_patch_embed=False,
     )
 
 

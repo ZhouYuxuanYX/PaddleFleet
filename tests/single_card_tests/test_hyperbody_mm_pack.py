@@ -102,6 +102,25 @@ def test_pack_hyperbody_mm_roundtrip_and_key_cleanup():
             assert pfx + suf not in batch
 
 
+def test_unpack_hyperbody_mm_image_as_patches():
+    """image_as_patches keeps the image payload whole and still cleans keys."""
+    rows = [
+        None,
+        paddle.to_tensor(np.arange(24, dtype="float32").reshape([2, 3, 4])),
+    ]
+    audio = [paddle.to_tensor(np.arange(5, dtype="float32")), None]
+    batch = pack_hyperbody_mm(rows, audio)
+    unpack_hyperbody_mm(batch, image_as_patches=True)
+    assert "image" not in batch
+    values, shapes, seg_index = batch["image_patches"]
+    assert shapes == [[2, 3, 4]] and seg_index == [-1, 0]
+    assert _same(values.reshape([-1, 4]), rows[1].reshape([-1, 4]))
+    assert _same(batch["audio"][0], audio[0]) and batch["audio"][1] is None
+    for pfx in (HB_IMAGE_PREFIX, HB_AUDIO_PREFIX):
+        for suf in ("_values", "_shapes", "_seg_index"):
+            assert pfx + suf not in batch
+
+
 def test_unpack_hyperbody_mm_noop_without_keys():
     """unpack is a no-op (returns as-is) when packing keys are absent."""
     batch = {"input_ids": paddle.to_tensor(np.zeros((1, 3), dtype="int64"))}
@@ -114,6 +133,7 @@ if __name__ == "__main__":
         test_pack_unpack_roundtrip_with_none()
         test_pack_unpack_empty_and_all_none()
         test_pack_hyperbody_mm_roundtrip_and_key_cleanup()
+        test_unpack_hyperbody_mm_image_as_patches()
         test_unpack_hyperbody_mm_noop_without_keys()
     except AssertionError:
         import traceback

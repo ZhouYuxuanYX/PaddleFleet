@@ -50,6 +50,7 @@ import copy
 import math
 from dataclasses import dataclass, field
 
+import numpy as np
 import paddle
 from paddle.distributed import fleet
 from paddle.distributed.fleet.meta_parallel import (
@@ -242,6 +243,33 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
                 p.average_gradients_across_tp_domain = True
 
     # -- per-segment multimodal context builder (dummy keepalive) --
+    def _image_keepalive(self, dtype):
+        """``0`` that keeps the image tower in the graph: a dummy pass ``* 0``."""
+        dummy = paddle.zeros([1, 3, 128, 128], dtype=dtype)
+        return self.projector(self.image_encoder(dummy)).sum() * 0.0
+
+    def _audio_keepalive(self, dtype):
+        """``0`` that keeps the audio tower in the graph: a dummy pass ``* 0``."""
+        dummy = paddle.zeros([1, 128, 10], dtype=dtype)
+        return self.projector(self.audio_encoder(dummy)).sum() * 0.0
+
+    @staticmethod
+    def _splice(emb, pos, feat):
+        """Truncate ``emb`` at the first placeholder ``pos`` and append ``feat``."""
+        return paddle.concat([emb[:pos], feat], axis=0)
+
+    @classmethod
+    def _assemble_segment(cls, emb, img, aud, img_keep, aud_keep):
+        """Splice one segment's tower features into its token embeddings.
+
+        ``img`` / ``aud`` are ``(pos, feat)`` -- the first placeholder and the
+        feature rows -- or ``None`` when the segment lacks that modality, in
+        which case that tower's keepalive ``0`` is added instead. Image first,
+        then audio; the single place both context-embed paths share.
+        """
+        emb = cls._splice(emb, *img) if img is not None else emb + img_keep
+        return cls._splice(emb, *aud) if aud is not None else emb + aud_keep
+
     def _embed_one_context(self, ids_i, img_i, aud_i):
         """One context segment ``[C_i]`` -> ``[C_i', H]`` with image/audio splice.
 
@@ -255,6 +283,7 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
 
         emb_i = self.embed_tokens(ids_i)  # [C_i, H]
 
+        img = aud = img_keep = aud_keep = None
         pos = paddle.nonzero(ids_i == IM_PATCH_TOKEN)
         if pos.numel() > 0 and isinstance(img_i, paddle.Tensor):
             feat = self.projector(self.image_encoder(img_i.unsqueeze(0)))
@@ -264,11 +293,9 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
                 .transpose([0, 2, 1])
                 .squeeze(0)
             )
-            emb_i = paddle.concat([emb_i[: int(pos[0])], feat], axis=0)
+            img = (int(pos[0]), feat)
         else:
-            dummy = paddle.zeros([1, 3, 128, 128], dtype=emb_i.dtype)
-            feat = self.projector(self.image_encoder(dummy))
-            emb_i = emb_i + feat.sum() * 0.0
+            img_keep = self._image_keepalive(emb_i.dtype)
 
         pos = paddle.nonzero(ids_i == AUDIO_PATCH_TOKEN)
         if pos.numel() > 0 and isinstance(aud_i, paddle.Tensor):
@@ -279,12 +306,11 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
                 .transpose([0, 2, 1])
                 .squeeze(0)
             )
-            emb_i = paddle.concat([emb_i[: int(pos[0])], feat], axis=0)
+            aud = (int(pos[0]), feat)
         else:
-            dummy = paddle.zeros([1, 128, 10], dtype=emb_i.dtype)
-            feat = self.projector(self.audio_encoder(dummy))
-            emb_i = emb_i + feat.sum() * 0.0
+            aud_keep = self._audio_keepalive(emb_i.dtype)
 
+        emb_i = self._assemble_segment(emb_i, img, aud, img_keep, aud_keep)
         return emb_i
 
     def _build_context_embeds(
@@ -325,6 +351,152 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
             )
             for s in range(n_seg)
         ]
+
+    def _embed_patch_rows(self, values, shapes):
+        """All images of a micro-batch, as patch rows -> per-image features.
+
+        ``values`` / ``shapes`` are the packed ``hb_image_*`` payload in the
+        ``hyperencoder_batched_patch_embed`` layout: image ``k`` is
+        ``[h_k, w_k, C*p*p]``. Patch embed and projector run once over the
+        stacked ``[sum(h*w), C*p*p]`` rows; returns ``[h_k*w_k, H]`` per image.
+        """
+        weight = self.image_encoder.patch_embed.proj.weight
+        dim = int(np.prod(weight.shape[1:]))
+        if any(len(s) != 3 or int(s[2]) != dim for s in shapes):
+            raise ValueError(
+                "hyperencoder_batched_patch_embed expects every image as "
+                f"[h, w, {dim}] patch rows, got shapes {shapes[:4]}...; is "
+                "the data side writing the patch layout?"
+            )
+        grids = [(int(h), int(w)) for h, w, _ in shapes]
+        x = self.image_encoder.forward_patches(values.reshape([-1, dim]), grids)
+        x = self.projector(x)
+        return paddle.split(x, [h * w for h, w in grids], axis=0)
+
+    @staticmethod
+    def _first_placeholder(seg, s, kind):
+        """First ``kind`` placeholder of host-side segment ids ``seg``.
+
+        The segment must carry that placeholder and none of the other
+        modality's: the batched path splices exactly one tower per segment.
+        """
+        from .configuration import AUDIO_PATCH_TOKEN, IM_PATCH_TOKEN
+
+        own, other = (
+            (IM_PATCH_TOKEN, AUDIO_PATCH_TOKEN)
+            if kind == "image"
+            else (AUDIO_PATCH_TOKEN, IM_PATCH_TOKEN)
+        )
+        pos = np.flatnonzero(seg == own)
+        if not pos.size or (seg == other).any():
+            raise ValueError(
+                f"context segment {s} carries {kind} but is not an "
+                f"{kind}-only segment"
+            )
+        return int(pos[0])
+
+    @staticmethod
+    def _packed_media_layout(image_patches, audio, cu_seqlens_context):
+        """Check the switch-on inputs; return ``bounds, image, seg_index, audio``.
+
+        ``image`` is the ``(values, shapes)`` payload, ``seg_index[s]`` the
+        image of segment ``s`` (``-1``: none) and ``audio`` a per-segment list.
+        """
+        if cu_seqlens_context is None:
+            raise ValueError(
+                "hyperencoder_batched_patch_embed needs the packed layout "
+                "(cu_seqlens_context)."
+            )
+        if isinstance(cu_seqlens_context, paddle.Tensor):
+            cu_seqlens_context = cu_seqlens_context.tolist()
+        bounds = [int(x) for x in cu_seqlens_context]
+        n_seg = len(bounds) - 1
+        values, shapes, seg_index = image_patches or (None, [], [-1] * n_seg)
+        seg_index = [int(k) for k in seg_index]
+        if len(seg_index) != n_seg or max(seg_index, default=-1) >= len(shapes):
+            raise ValueError(
+                f"image seg_index {seg_index} does not match {n_seg} context "
+                f"segments / {len(shapes)} images"
+            )
+        audio = audio if audio else [None] * n_seg
+        if len(audio) != n_seg:
+            raise ValueError(
+                f"{len(audio)} audio entries for {n_seg} context segments"
+            )
+        return bounds, (values, shapes), seg_index, audio
+
+    def _embed_packed_audio(self, audio):
+        """Every audio segment through the tower + projector at once.
+
+        Returns ``{segment: [T'_s, H]}`` for the segments that carry audio.
+        """
+        segs = [s for s, a in enumerate(audio) if isinstance(a, paddle.Tensor)]
+        if not segs:
+            return {}
+        x, lens = self.audio_encoder.forward_batch([audio[s] for s in segs])
+        x = self.projector(x)
+        return dict(zip(segs, paddle.split(x, lens, axis=0)))
+
+    def _segment_media(self, seg, s, img_feat, aud_feat):
+        """``(img, aud)`` arguments of ``_assemble_segment`` for segment ``s``."""
+        if img_feat is not None and aud_feat is not None:
+            raise ValueError(
+                f"context segment {s} carries both an image and audio"
+            )
+        img = aud = None
+        if img_feat is not None:
+            img = (self._first_placeholder(seg, s, "image"), img_feat)
+        if aud_feat is not None:
+            aud = (self._first_placeholder(seg, s, "audio"), aud_feat)
+        return img, aud
+
+    def _build_context_embeds_from_patches(
+        self, context_ids, image_patches, audio, cu_seqlens_context
+    ):
+        """Packed context embeds with every tower run once per micro-batch.
+
+        Used with ``hyperencoder_batched_patch_embed``: ``image_patches`` is
+        the ``(values, shapes, seg_index)`` triple from
+        ``unpack_hyperbody_mm(..., image_as_patches=True)`` (``None`` if the
+        batch has no image keys) and ``audio`` the per-segment mel list. All
+        images go through ``_embed_patch_rows`` and all audio chunks through
+        ``_embed_packed_audio`` at once; each tower's keepalive runs once and
+        is shared by the segments that lack it. Each segment is then put
+        together by ``_assemble_segment``, as in ``_embed_one_context``; equal
+        to ``_build_context_embeds`` up to accumulation order.
+        """
+        bounds, (values, shapes), seg_index, audio = self._packed_media_layout(
+            image_patches, audio, cu_seqlens_context
+        )
+        row = context_ids[0]
+        # One host copy of the ids per micro-batch to find the placeholders;
+        # the per-segment path syncs once per segment (``int(pos[0])``).
+        row_np = row.numpy()
+        emb_row = self.embed_tokens(row)
+        img_feats = self._embed_patch_rows(values, shapes) if shapes else []
+        aud_feats = self._embed_packed_audio(audio)
+        # Each keepalive runs once, shared by every segment without that tower.
+        img_keep = aud_keep = None
+        if any(k < 0 for k in seg_index):
+            img_keep = self._image_keepalive(emb_row.dtype)
+        if len(aud_feats) < len(seg_index):
+            aud_keep = self._audio_keepalive(emb_row.dtype)
+
+        out = []
+        for s, k in enumerate(seg_index):
+            lo, hi = bounds[s], bounds[s + 1]
+            img, aud = self._segment_media(
+                row_np[lo:hi],
+                s,
+                img_feats[k] if k >= 0 else None,
+                aud_feats.get(s),
+            )
+            out.append(
+                self._assemble_segment(
+                    emb_row[lo:hi], img, aud, img_keep, aud_keep
+                )
+            )
+        return out
 
     def _packed_rope(self, max_seqlen: int, seg_lens):
         """Assemble RoPE freqs for the packed sequence: ``[1, ΣL_i, 1, D]``.
@@ -403,7 +575,10 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
 
         # The fleet pipeline micro-batch loader only passes Tensors; image/audio
         # are packed as ragged Tensors upstream and restored in place to lists here.
-        unpack_hyperbody_mm(dict_args)
+        # With hyperencoder_batched_patch_embed the image keys hold patch rows
+        # and are kept whole as dict_args["image_patches"] instead.
+        batched = self.config.hyperencoder_batched_patch_embed
+        unpack_hyperbody_mm(dict_args, image_as_patches=batched)
 
         context_ids = dict_args["context_ids"]
         image = dict_args.get("image", None)
@@ -413,9 +588,17 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
             self._check_context_token_counts(dict_args["input_ids"], cu_seqlens)
         cu_seqlens_context = dict_args.get("cu_seqlens_context", None)
 
-        context_embeds = self._build_context_embeds(
-            context_ids, image, audio, cu_seqlens_context
-        )
+        if batched:
+            context_embeds = self._build_context_embeds_from_patches(
+                context_ids,
+                dict_args.get("image_patches", None),
+                audio,
+                cu_seqlens_context,
+            )
+        else:
+            context_embeds = self._build_context_embeds(
+                context_ids, image, audio, cu_seqlens_context
+            )
 
         if self.packed:
             out = self._forward_packed(context_embeds)
@@ -1459,6 +1642,7 @@ def _build_encoder_view(config: HyperBodyConfig, decoder_hidden: int):
         hyperencoder_seq_align=enc.hyperencoder_seq_align,
         hyperencoder_attn_backend=enc.hyperencoder_attn_backend,
         hyperencoder_packed_decoder=enc.hyperencoder_packed_decoder,
+        hyperencoder_batched_patch_embed=enc.hyperencoder_batched_patch_embed,
         tensor_model_parallel_size=config.tensor_model_parallel_size,
         # ``pad_token_id``: prefer the encoder-scoped value from
         # ``encoder_config`` (NOT an llm_meta key, so it survives a plain

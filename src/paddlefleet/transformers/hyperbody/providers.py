@@ -386,6 +386,13 @@ class HyperEncoderProvider(GPTConfig, ModelProviderMixin["HyperEncoderModel"]):
     hyperencoder_packed_decoder: bool = False
     #: Shard the packed trunk over CP (set by HyperBody's ``_configure_encoder_cp``).
     hyperencoder_cp_shard: bool = False
+    #: The data side ships images as 14x14 patch rows (``image_to_patch_rows``)
+    #: and the frontend embeds all of them with one GEMM
+    #: (``ImageEncoderConv.forward_patches``) and all audio chunks as one
+    #: packed sequence (``AudioEncoderConv.forward_batch``) instead of one
+    #: tower pass per segment.
+    #: Mathematically equivalent, not bit-identical, hence off by default.
+    hyperencoder_batched_patch_embed: bool = False
 
     # No `transform_rules`: `HyperEncoderConfig` field names are exactly the same
     # as on the Fleet side, so none needs renaming.

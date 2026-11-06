@@ -39,14 +39,26 @@ K = number of present tensors, S = number of segments; per-segment byte offset i
 the running sum of prod(shapes), not stored separately (minimal redundancy).
 Empty list: values=[0] float32, shapes=[0,0], seg_index all -1.
 
+Image payloads
+--------------
+The ``hb_image_*`` keys carry one of two layouts, chosen by the encoder switch
+``hyperencoder_batched_patch_embed`` (data side and model side read the same
+switch):
+
+* off (default): each image is raw pixels ``[C, H, W]``.
+* on: each image is patch rows ``[H/p, W/p, C*p*p]`` from
+  ``modality_encoders.image_to_patch_rows``, so ``hb_image_values`` reshapes to
+  the whole ``[sum(h*w), C*p*p]`` patch matrix of the micro-batch.
+
 Call sites
 ----------
 * Data side (erniebot ``_hyperbody_hack_inputs`` / a future real collator):
   ``batch.update(pack_hyperbody_mm(image, audio))`` then drop the original list
-  keys, so the batch is Tensor-only and can enter the fleet pipeline.
+  keys, so the batch is Tensor-only and can enter the fleet pipeline. With the
+  switch on, ``image`` holds patch rows.
 * Model side (top of ``HyperBodyEncoderFrontEnd.forward``):
-  ``unpack_hyperbody_mm(dict_args)`` restores image/audio in place and cleans up
-  the packing keys.
+  ``unpack_hyperbody_mm(dict_args, image_as_patches=<switch>)`` restores the
+  inputs in place and cleans up the packing keys.
 """
 
 from __future__ import annotations
@@ -119,11 +131,28 @@ def pack_hyperbody_mm(image, audio):
     return packed
 
 
-def unpack_hyperbody_mm(dict_args):
-    """Restore image/audio in place and drop the packing keys; no-op if absent."""
+def unpack_hyperbody_mm(dict_args, image_as_patches=False):
+    """Restore image/audio in place and drop the packing keys; no-op if absent.
+
+    ``audio`` becomes a per-segment list. ``image`` does too by default; with
+    ``image_as_patches`` (the ``hyperencoder_batched_patch_embed`` layout) the
+    image keys are instead kept whole as
+    ``dict_args["image_patches"] = (values, shapes, seg_index)``: ``values`` is
+    the flat concat of all patch rows, ``shapes`` a host-side ``[K, 3]`` list,
+    ``seg_index`` a host-side ``[S]`` list.
+    """
     if f"{HB_IMAGE_PREFIX}_seg_index" not in dict_args:
         return dict_args
-    dict_args["image"] = unpack_optional_tensor_list(dict_args, HB_IMAGE_PREFIX)
+    if image_as_patches:
+        dict_args["image_patches"] = (
+            dict_args[f"{HB_IMAGE_PREFIX}_values"],
+            dict_args[f"{HB_IMAGE_PREFIX}_shapes"].tolist(),
+            dict_args[f"{HB_IMAGE_PREFIX}_seg_index"].tolist(),
+        )
+    else:
+        dict_args["image"] = unpack_optional_tensor_list(
+            dict_args, HB_IMAGE_PREFIX
+        )
     dict_args["audio"] = unpack_optional_tensor_list(dict_args, HB_AUDIO_PREFIX)
     for key in (
         f"{HB_IMAGE_PREFIX}_values",
