@@ -76,8 +76,9 @@ jobs:
 
       # Like bot-approval-required.yml: an APPROVED review by an approver on the
       # PR head skips the code health scan only; pre-commit still has to pass.
-      # Approving re-runs this job (rerun.yml). Every code health step below
-      # runs only when steps.health.outputs.run == 'true'.
+      # Approving re-runs this job (codestyle_approval.yml -> codestyle_check_rerun.yml);
+      # keep APPROVERS below in sync with the login check in codestyle_approval.yml.
+      # Every code health step below runs only when steps.health.outputs.run == 'true'.
       - name: Check approval
         id: health
         if: steps.check-bypass.outputs.can-skip != 'true'

@@ -1,0 +1,43 @@
+name: Codestyle-check Re-run
+
+on:
+  workflow_run:
+    workflows: [Codestyle Approval]
+    types: [completed]
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: codestyle-rerun-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  rerun-on-approval:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request_review' &&
+      github.event.workflow_run.head_sha != ''
+    runs-on:
+      group: APPROVAL
+    steps:
+      - name: Cleanup
+        run: |
+          rm -rf * .[^.]*
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      # From00 / sneaxiy approve 当前 head 后 Codestyle Check 会跳过代码健康检查，
+      # 所以只有这两人的 approve 需要重跑该 job。人员判断在 Codestyle Approval 里。
+      - name: Rerun Codestyle Check
+        uses: ./.github/actions/rerun-workflow
+        with:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          JOB_NAME: 'Codestyle Check'

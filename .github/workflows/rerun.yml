@@ -84,13 +84,3 @@ jobs:
           OWNER: ${{ github.repository_owner }}
           REPO: ${{ github.event.repository.name }}
           JOB_NAME: 'Require review-bot approval'
-
-      # Skips the code health scan when From00 / sneaxiy approved the head.
-      - name: Rerun Codestyle Check
-        uses: ./.github/actions/rerun-workflow
-        with:
-          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          OWNER: ${{ github.repository_owner }}
-          REPO: ${{ github.event.repository.name }}
-          JOB_NAME: 'Codestyle Check'

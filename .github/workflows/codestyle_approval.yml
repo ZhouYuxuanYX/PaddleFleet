@@ -1,0 +1,28 @@
+name: Codestyle Approval
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions: {}
+
+jobs:
+  # 审批人名单必须与 Codestyle-Check.yml 中 Check approval 步骤的 APPROVERS 保持一致：
+  # 这里决定谁的 approve 会触发重跑，那里决定重跑后是否跳过代码健康检查，改一处要同步另一处。
+  signal:
+    if: >-
+      github.event.review.state == 'approved' &&
+      github.event.review.commit_id == github.event.pull_request.head.sha &&
+      (github.event.review.user.login == 'From00' || github.event.review.user.login == 'sneaxiy')
+    runs-on:
+      group: APPROVAL
+    steps:
+      - name: Record codestyle approval
+        env:
+          REVIEWER: ${{ github.event.review.user.login }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          printf 'Reviewer: %s\n' "${REVIEWER}"
+          printf 'Pull request: %s\n' "${PR_NUMBER}"
+          printf 'Head SHA: %s\n' "${HEAD_SHA}"
