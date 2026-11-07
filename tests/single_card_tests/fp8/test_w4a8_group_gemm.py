@@ -27,6 +27,8 @@ Run:
         tests/single_card_tests/fp8/test_w4a8_group_gemm.py -v
 """
 
+import os
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -37,7 +39,9 @@ import paddle.nn.functional as F
 
 from paddlefleet.transformer.activations import situ_glu_scale_forward
 from paddlefleet.transformer.moe import fp8_utils
-from paddlefleet.transformer.moe.fp8_utils import W4A8_QUANT_BLOCK
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from w4a8_quant_reference import mxfp4_stack_dequant_python
 
 try:
     from paddlefleet_ops import deep_gemm as _pf_deep_gemm
@@ -54,21 +58,6 @@ IS_SM100 = (
 )
 
 FP4_E2M1_MAX = 6.0
-# e2m1 code (0~7) magnitudes
-_FP4_VALUES = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
-
-
-def _unpack_fp4_to_float(packed, sf):
-    """Unpack fp4 int8 [.., C/2] + scale [.., C/32] back to fp32 [.., C]."""
-    raw = packed.numpy().astype(np.uint8)
-    lo = raw & 0x0F
-    hi = raw >> 4
-    codes = np.stack([lo, hi], axis=-1).reshape(*raw.shape[:-1], -1)
-    mag = _FP4_VALUES[codes & 0x7]
-    val = np.where(codes >= 8, -mag, mag)
-    sf_np = sf.numpy().astype(np.float64)
-    val = val.reshape(*sf_np.shape, W4A8_QUANT_BLOCK) * sf_np[..., None]
-    return val.reshape(*raw.shape[:-1], raw.shape[-1] * 2)
 
 
 def _cos(a, b):
@@ -287,6 +276,27 @@ class TestW4A8GroupGemm(unittest.TestCase):
             ExpertsGroupGemmContiguousNode(
                 custom_map,
                 use_fp8_mlp=False,
+                moe_deep_gemm=True,
+                moe_expert_fusion=True,
+                use_ue8m0=True,
+                use_w4a8=True,
+            )
+
+    def test_init_rejects_paddlefleet_ops_without_w4a8_ops(self):
+        """An outdated paddlefleet_ops fails at node construction, not as a
+        NameError in the middle of a step."""
+        from paddlefleet.transformer.moe.fp8_utils import (
+            ExpertsGroupGemmContiguousNode,
+        )
+
+        _, custom_map = _make_experts_and_map(2, 128, 128)
+        with (
+            patch.object(fp8_utils, "HAS_W4A8_FUSED_QUANT", False),
+            self.assertRaisesRegex(RuntimeError, "Rebuild paddlefleet_ops"),
+        ):
+            ExpertsGroupGemmContiguousNode(
+                custom_map,
+                use_fp8_mlp=True,
                 moe_deep_gemm=True,
                 moe_expert_fusion=True,
                 use_ue8m0=True,
@@ -682,9 +692,10 @@ class TestW4A8GroupGemm(unittest.TestCase):
     def test_offline_cache_forward_backward_matches_online_exactly(self):
         """Cleared BF16 experts still produce identical output and all grads.
 
-        Gate-up recompute consumes the forward orientation again in backward;
-        dgrad consumes the independently quantized reverse orientation. Include
-        zero-token experts and rectangular weights to exercise both layouts.
+        Gate-up recompute consumes the forward orientation again in backward,
+        and so does the dgrad: offline it unpacks the cached forward FP4 weight,
+        online it fake-quantizes the live BF16 weight. Include zero-token
+        experts and rectangular weights to exercise both layouts.
         """
         from paddlefleet.transformer.moe.moe_layer import MoELayer
 
@@ -726,28 +737,54 @@ class TestW4A8GroupGemm(unittest.TestCase):
                     probs = paddle.rand([sum(tokens)], dtype="float32")
                     out_grad = paddle.randn([sum(tokens), k], dtype="bfloat16")
                     # Any hidden online fallback is a bug once BF16 is freed.
-                    with patch.object(
-                        fp8_utils,
-                        "mxfp4_stack_quant_without_cache",
-                        wraps=(
-                            None
-                            if offline
-                            else fp8_utils.mxfp4_stack_quant_without_cache
-                        ),
-                        side_effect=(
-                            AssertionError("offline GEMM read BF16 weights")
-                            if offline
-                            else None
-                        ),
-                    ) as raw_quant:
+                    with (
+                        patch.object(
+                            fp8_utils,
+                            "mxfp4_stack_quant_without_cache",
+                            wraps=(
+                                None
+                                if offline
+                                else fp8_utils.mxfp4_stack_quant_without_cache
+                            ),
+                            side_effect=(
+                                AssertionError("offline GEMM read BF16 weights")
+                                if offline
+                                else None
+                            ),
+                        ) as raw_quant,
+                        patch.object(
+                            fp8_utils,
+                            "mxfp4_stack_fake_quantize_1x32",
+                            wraps=(
+                                None
+                                if offline
+                                else fp8_utils.mxfp4_stack_fake_quantize_1x32
+                            ),
+                            side_effect=(
+                                AssertionError("offline dgrad read BF16")
+                                if offline
+                                else None
+                            ),
+                        ) as fake_quant,
+                        patch.object(
+                            fp8_utils,
+                            "mxfp4_stack_transpose_dequantize_1x32",
+                            wraps=fp8_utils.mxfp4_stack_transpose_dequantize_1x32,
+                        ) as cache_unpack,
+                    ):
                         out = node.forward(
                             x, probs.unsqueeze(-1), tokens
                         ).clone()
                         dx, probs_grad = node.backward(out_grad.clone(), probs)
+                        # one DQ(Q1(w)) per expert weight in the dgrad
                         if offline:
                             raw_quant.assert_not_called()
+                            fake_quant.assert_not_called()
+                            self.assertEqual(cache_unpack.call_count, 2)
                         else:
-                            self.assertGreaterEqual(raw_quant.call_count, 4)
+                            self.assertGreaterEqual(raw_quant.call_count, 2)
+                            self.assertEqual(fake_quant.call_count, 2)
+                            cache_unpack.assert_not_called()
                     results.append(
                         tuple(
                             tensor.clone()
@@ -771,6 +808,77 @@ class TestW4A8GroupGemm(unittest.TestCase):
                         ),
                         f"offline {name} differs from online",
                     )
+
+    # ---------------- dgrad against the forward FP4 weight ----------------
+
+    def _forward_fp4_weight(self, weight):
+        """bf16 DQ(Q1(w)) [E, R, C]: the forward's FP4 weight, unpacked."""
+        q, sf = fp8_utils.mxfp4_stack_quantize_1x32(weight, True)
+        return mxfp4_stack_dequant_python(q, sf)
+
+    def test_dgrad_uses_forward_fp4_weight(self):
+        """The dgrad is a bf16 GEMM against exactly the forward's FP4 weight,
+        for both expert weights, in the dgrad orientation."""
+        num_experts, k, n, tokens = 3, 128, 256, [128, 0, 256]
+        node, experts = self._make_node(num_experts, k, n)
+        m = sum(tokens)
+        node.m_indices = node.gen_m_indices(tokens)
+        for name, weight in (("w1", experts.weight1), ("w2", experts.weight2)):
+            with self.subTest(weight=name):
+                w_q = self._forward_fp4_weight(weight)
+                grad = paddle.randn([m, weight.shape[2]], dtype="bfloat16")
+                got = node._w4a8_dgrad(grad, weight)
+                expected = paddle.zeros([m, weight.shape[1]], dtype="bfloat16")
+                _pf_deep_gemm.m_grouped_bf16_gemm_nt_contiguous(
+                    grad, w_q, expected, node.m_indices
+                )
+                self.assertTrue(_bits_equal(got, expected))
+                start = 0
+                for e, t in enumerate(tokens):
+                    if t == 0:
+                        continue
+                    ref = (
+                        grad[start : start + t].astype("float32")
+                        @ w_q[e].astype("float32").T
+                    ).numpy()
+                    rows = got[start : start + t].astype("float32").numpy()
+                    rel = np.abs(rows - ref).max() / np.abs(ref).max()
+                    self.assertLess(rel, 1e-2, f"expert {e}")
+                    start += t
+        do1 = paddle.randn([m, 2 * n], dtype="bfloat16")
+        buf = paddle.full([m, k], float("nan"), dtype="bfloat16")
+        dx = node._bwd_gate_up_input_w4a8(do1, experts.weight1, dx=buf)
+        self.assertTrue(dx is buf)
+        self.assertTrue(_bits_equal(dx, node._w4a8_dgrad(do1, experts.weight1)))
+
+    def test_backward_is_gradient_of_forward_fp4_weight(self):
+        """dx and dprobs follow the fp32 gradient through the forward's FP4
+        weights, and track it more closely than the gradient through the
+        BF16 master weights."""
+        num_experts, k, n, tokens = 2, 256, 256, [128, 384]
+        m = sum(tokens)
+        node, experts = self._make_node(num_experts, k, n)
+        x = paddle.randn([m, k], dtype="bfloat16")
+        probs = paddle.rand([m], dtype="float32")
+        node.forward(x, probs.unsqueeze(-1), tokens)
+        out_grad = paddle.randn([m, k], dtype="bfloat16")
+        dx, probs_grad = node.backward(out_grad.clone(), probs)
+        fp4_experts = SimpleNamespace(
+            weight1=self._forward_fp4_weight(experts.weight1),
+            weight2=self._forward_fp4_weight(experts.weight2),
+        )
+        cos = {}
+        for ref_name, ref_experts in (("fp4", fp4_experts), ("bf16", experts)):
+            ref_dx, ref_pg, _, _ = self._autograd_reference(
+                x, probs, tokens, ref_experts, n, out_grad
+            )
+            cos[ref_name] = (
+                _cos(dx.astype("float32").numpy(), ref_dx.numpy()),
+                _cos(probs_grad.astype("float32").numpy(), ref_pg.numpy()),
+            )
+        for i, name in enumerate(("dx", "dprobs")):
+            self.assertGreater(cos["fp4"][i], cos["bf16"][i], f"{name}: {cos}")
+            self.assertGreater(cos["fp4"][i], 0.999, f"{name}: {cos}")
 
     # ---------------- private-method branches ----------------
 
@@ -833,6 +941,18 @@ class TestW4A8GroupGemm(unittest.TestCase):
         dx_buf = node._bwd_gate_up_input_w4a8(do1, experts.weight1, dx=buf)
         self.assertTrue(dx_buf is buf)
         self.assertTrue(_bits_equal(dx_fresh, dx_buf))
+
+    def test_bwd_gate_up_rejects_wrong_dx_shape(self):
+        """A wrong-shaped dx buffer raises instead of being overwritten."""
+        num_experts, k, n, tokens = 2, 128, 128, [128, 128]
+        node, experts = self._make_node(num_experts, k, n)
+        m = sum(tokens)
+        node.m_indices = node.gen_m_indices(tokens)
+        do1 = paddle.randn([m, 2 * n], dtype="bfloat16")
+        buf = paddle.full([m, k + 32], float("nan"), dtype="bfloat16")
+        with self.assertRaisesRegex(ValueError, "output buffer has shape"):
+            node._bwd_gate_up_input_w4a8(do1, experts.weight1, dx=buf)
+        self.assertTrue(bool(paddle.isnan(buf.astype("float32")).all()))
 
 
 if __name__ == "__main__":

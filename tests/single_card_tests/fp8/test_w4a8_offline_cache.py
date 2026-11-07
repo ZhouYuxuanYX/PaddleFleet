@@ -28,9 +28,9 @@ import paddle
 from paddlefleet.transformer.moe import fp8_utils
 from paddlefleet.transformer.moe.moe_layer import MoELayer
 
+# W4A8 caches only the forward (transpose=True) orientation: the forward GEMM
+# and the dgrad both read it.
 FP4_ATTRS = (
-    "fp4_weight_stacked",
-    "fp4_scale_stacked",
     "fp4_weight_stacked_transpose",
     "fp4_scale_stacked_transpose",
 )
@@ -180,50 +180,28 @@ class TestW4A8CacheDispatch(unittest.TestCase):
             "mxfp4_stack_quant_without_cache",
             side_effect=AssertionError("cache hit used online quant"),
         ):
-            for transpose in (False, True):
-                for weights in (weight, [weight], (weight,)):
-                    with self.subTest(
-                        transpose=transpose, container=type(weights).__name__
-                    ):
-                        suffix = "_transpose" if transpose else ""
-                        payload, scale = fp8_utils.mxfp4_stack_quant(
-                            weights, transpose
-                        )
-                        self.assertIs(
-                            payload,
-                            getattr(weight, "fp4_weight_stacked" + suffix),
-                        )
-                        self.assertIs(
-                            scale,
-                            getattr(weight, "fp4_scale_stacked" + suffix),
-                        )
+            for weights in (weight, [weight], (weight,)):
+                with self.subTest(container=type(weights).__name__):
+                    payload, scale = fp8_utils.mxfp4_stack_quant(weights, True)
+                    self.assertIs(payload, weight.fp4_weight_stacked_transpose)
+                    self.assertIs(scale, weight.fp4_scale_stacked_transpose)
+                    # The other orientation is not cached and BF16 may be
+                    # gone: refuse instead of reading it.
+                    with self.assertRaisesRegex(ValueError, "transpose=True"):
+                        fp8_utils.mxfp4_stack_quant(weights, False)
 
     def test_cache_lookup_only_reads_first_weight(self):
         class UnreadableWeight:
             def __getattribute__(self, name):
                 raise AssertionError("cache lookup read another expert")
 
-        owner = SimpleNamespace(
-            fp4_weight_stacked=object(),
-            fp4_scale_stacked=object(),
-            fp4_weight_stacked_transpose=object(),
-            fp4_scale_stacked_transpose=object(),
-        )
-        for transpose in (False, True):
-            suffix = "_transpose" if transpose else ""
-            with self.subTest(transpose=transpose):
-                pair = fp8_utils.mxfp4_stack_quant(
-                    [owner, UnreadableWeight()], transpose
-                )
-                self.assertIs(
-                    pair[0], getattr(owner, "fp4_weight_stacked" + suffix)
-                )
-                self.assertIs(
-                    pair[1], getattr(owner, "fp4_scale_stacked" + suffix)
-                )
+        owner = SimpleNamespace(**{name: object() for name in FP4_ATTRS})
+        pair = fp8_utils.mxfp4_stack_quant([owner, UnreadableWeight()], True)
+        self.assertIs(pair[0], owner.fp4_weight_stacked_transpose)
+        self.assertIs(pair[1], owner.fp4_scale_stacked_transpose)
 
     def test_missing_cached_scale_does_not_fall_back_to_bf16(self):
-        weight = SimpleNamespace(fp4_weight_stacked=object())
+        weight = SimpleNamespace(fp4_weight_stacked_transpose=object())
         with (
             patch.object(
                 fp8_utils,
@@ -232,7 +210,7 @@ class TestW4A8CacheDispatch(unittest.TestCase):
             ),
             self.assertRaises(AttributeError),
         ):
-            fp8_utils.mxfp4_stack_quant(weight, False)
+            fp8_utils.mxfp4_stack_quant(weight, True)
 
     def test_cache_does_not_bypass_ue8m0_requirement(self):
         weight = SimpleNamespace(**{name: object() for name in FP4_ATTRS})
@@ -403,12 +381,10 @@ class TestW4A8OfflineQuantParity(unittest.TestCase):
             self.assertEqual(got.numpy().tobytes(), ref.numpy().tobytes())
 
     def online_pairs(self, weights):
+        # Only the forward orientation is cached (see FP4_ATTRS).
         return {
-            (i, transpose): fp8_utils.mxfp4_stack_quant_without_cache(
-                weight, transpose
-            )
+            i: fp8_utils.mxfp4_stack_quant_without_cache(weight, True)
             for i, weight in enumerate(weights)
-            for transpose in (False, True)
         }
 
     def assert_cached_pairs(self, weights, expected, individually=False):
@@ -428,10 +404,12 @@ class TestW4A8OfflineQuantParity(unittest.TestCase):
             "mxfp4_stack_quant_without_cache",
             side_effect=AssertionError("offline path requantized BF16"),
         ):
-            for (i, transpose), pair in expected.items():
+            for i, pair in expected.items():
                 self.assert_pair_equal(
-                    fp8_utils.mxfp4_stack_quant(weights[i], transpose), pair
+                    fp8_utils.mxfp4_stack_quant(weights[i], True), pair
                 )
+                with self.assertRaisesRegex(ValueError, "transpose=True"):
+                    fp8_utils.mxfp4_stack_quant(weights[i], False)
 
     def clear_bf16(self, weights):
         for weight in weights:
@@ -442,7 +420,7 @@ class TestW4A8OfflineQuantParity(unittest.TestCase):
                 self.assertFalse(member._is_initialized())
                 self.assertEqual(tuple(member.shape), shape)
 
-    def test_grouped_and_list_caches_match_both_online_orientations(self):
+    def test_grouped_and_list_caches_match_online_forward_orientation(self):
         for grouped, batch_mode, count in (
             (True, True, 3),
             (True, False, 3),
@@ -466,13 +444,10 @@ class TestW4A8OfflineQuantParity(unittest.TestCase):
                         wraps=fp8_utils.mxfp4_stack_quant_without_cache,
                     ) as raw:
                         expected = {
-                            (i, transpose): fp8_utils.mxfp4_stack_quant(
-                                weight, transpose
-                            )
+                            i: fp8_utils.mxfp4_stack_quant(weight, True)
                             for i, weight in enumerate(weights)
-                            for transpose in (False, True)
                         }
-                        self.assertEqual(raw.call_count, 4)
+                        self.assertEqual(raw.call_count, 2)
                     MoELayer.fp8_quant_weight(
                         layer,
                         batch_mode=batch_mode,
@@ -511,7 +486,7 @@ class TestW4A8OfflineQuantParity(unittest.TestCase):
                         # Change payload signs and every nonzero block scale.
                         member.set_value(member * -4.0)
                 expected = self.online_pairs(weights)
-                for old, new in zip(before[(0, False)], expected[(0, False)]):
+                for old, new in zip(before[0], expected[0]):
                     self.assertTrue(bool((old != new).any()))
                 # No clear here: step-begin must overwrite the old cache.
                 MoELayer.fp8_quant_weight(
@@ -528,12 +503,12 @@ class TestW4A8OfflineQuantParity(unittest.TestCase):
                     "mxfp4_stack_quant_without_cache",
                     wraps=fp8_utils.mxfp4_stack_quant_without_cache,
                 ) as raw:
-                    for (i, transpose), pair in expected.items():
+                    for i, pair in expected.items():
                         self.assert_pair_equal(
-                            fp8_utils.mxfp4_stack_quant(weights[i], transpose),
+                            fp8_utils.mxfp4_stack_quant(weights[i], True),
                             pair,
                         )
-                    self.assertEqual(raw.call_count, 4)
+                    self.assertEqual(raw.call_count, 2)
                 MoELayer.fp8_quant_weight(layer, batch_mode=batch_mode)
                 self.clear_bf16(weights)
                 self.assert_cached_pairs(
@@ -542,7 +517,7 @@ class TestW4A8OfflineQuantParity(unittest.TestCase):
                     individually=not grouped and not batch_mode,
                 )
 
-    def test_grouped_proxy_keeps_both_orientations_after_bf16_clear(self):
+    def test_grouped_proxy_keeps_forward_orientation_after_bf16_clear(self):
         layer, weights = self.make_layer()
         expected = self.online_pairs(weights)
         MoELayer.fp8_quant_weight(layer, batch_mode=True)

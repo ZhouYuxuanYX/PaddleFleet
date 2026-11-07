@@ -30,6 +30,7 @@ from w4a8_quant_reference import (
     fuse_weighted_swiglu_fp8_quant_clamp_python,
     fuse_weighted_swiglu_fp8_quant_python,
     fused_act_dequant_python,
+    mxfp4_stack_dequant_python,
     quant_blockwize,
 )
 
@@ -52,7 +53,9 @@ IS_BLACKWELL = _prepare_blackwell()
 if IS_BLACKWELL:
     from paddlefleet_ops import (
         mxfp4_quantize_1x32,
+        mxfp4_stack_fake_quantize_1x32,
         mxfp4_stack_quantize_1x32,
+        mxfp4_stack_transpose_dequantize_1x32,
         mxfp8_dequantize_1x32,
         mxfp8_quantize_1x32,
         mxfp8_weighted_swiglu_quantize_1x32,
@@ -61,6 +64,33 @@ if IS_BLACKWELL:
 
 def _fp8_bits(value):
     return value.view("int8")
+
+
+def _special_value_weights():
+    """[2, 64, 256] weights whose first columns hit the quant edge cases.
+
+    Each column of a 32-row group is one 1x32 block of the transpose=True
+    quant (blocks along R).
+    """
+    midpoints = np.array(
+        [0.0, 0.25, -0.25, 0.75, -0.75, 1.25, -1.25, 1.75, -1.75, 2.5]
+        + [-2.5, 3.5, -3.5, 5.0, -5.0, 6.0]
+        + [0.0] * 16,
+        dtype=np.float32,
+    )
+    value = np.random.randn(2, 64, 256).astype(np.float32) * 3.0
+    value[:, :32, 0] = midpoints  # strict E2M1 midpoints at scale 1
+    value[:, :32, 1] = midpoints * 2.0**-3  # the same at scale 2^-3
+    value[:, :32, 2] *= 0.01
+    value[:, 7, 2] = 6.5  # amax just above 6 * 2^k: the scale carries
+    value[:, :32, 3] = 1.0e-6  # below the 1e-4 amax floor
+    value[:, :32, 4] = 0.0
+    value[:, :32, 5] = -0.0
+    value[:, 3, 6] = 1.0e30
+    value[:, 3, 7] = np.inf
+    value[:, 5, 8] = -np.inf
+    value[:, 9, 9] = np.nan
+    return paddle.to_tensor(value).astype("bfloat16")
 
 
 @unittest.skipUnless(IS_BLACKWELL, "requires a Blackwell CUDA device")
@@ -228,6 +258,80 @@ class TestW4A8CudaQuantParity(unittest.TestCase):
         expected = fused_act_dequant_python(quantized, scale)
         actual = mxfp8_dequantize_1x32(quantized, scale)
         self.assert_tensor_equal(actual, expected, "BF16 dequant differs")
+
+    def assert_bf16_bits_equal(self, actual, expected, message):
+        self.assertEqual(actual.dtype, paddle.bfloat16)
+        self.assertEqual(list(actual.shape), list(expected.shape))
+        self.assertTrue(
+            bool((actual.view("int16") == expected.view("int16")).all()),
+            message,
+        )
+
+    def test_stack_dequantize_fp4_every_byte(self):
+        """Every packed byte and a spread of scales, incl. partial tiles."""
+        for experts, cols, rows in ((3, 64, 256), (2, 40, 96)):
+            with self.subTest(shape=[experts, rows, cols]):
+                packed = paddle.to_tensor(
+                    np.random.randint(
+                        -128, 128, size=(experts, cols, rows // 2)
+                    ).astype(np.int8)
+                )
+                scale = paddle.to_tensor(
+                    np.exp2(
+                        np.random.randint(
+                            -20, 21, size=(experts, cols, rows // 32)
+                        )
+                    ).astype(np.float32)
+                )
+                actual = mxfp4_stack_transpose_dequantize_1x32(packed, scale)
+                expected = mxfp4_stack_dequant_python(packed, scale)
+                self.assert_bf16_bits_equal(
+                    actual, expected, "BF16 FP4 dequant differs"
+                )
+
+    def test_stack_fake_quantize_fp4(self):
+        """fake quant == dequant(mxfp4_stack_quantize_1x32(transpose=True)).
+
+        Covers the fused bf16 kernel (incl. a partial column tile and edge
+        values such as E2M1 midpoints, scale carry, the amax floor and +-Inf /
+        NaN), and the float32 and unaligned-bf16 paths that quantize first.
+        """
+        storage = paddle.randn([2 * 64 * 256 + 1], dtype="bfloat16")
+        unaligned = storage[1:].reshape([2, 64, 256])
+        self.assertTrue(unaligned.is_contiguous())
+        cases = {
+            "bf16": paddle.randn([3, 64, 256], dtype="bfloat16"),
+            "bf16_partial_tile": paddle.randn([2, 96, 160], dtype="bfloat16"),
+            "bf16_large": paddle.randn([4, 256, 512], dtype="bfloat16"),
+            "bf16_special_values": _special_value_weights(),
+            "float32": paddle.randn([3, 64, 256], dtype="float32"),
+            "bf16_unaligned": unaligned,
+        }
+        for name, weights in cases.items():
+            with self.subTest(case=name):
+                packed, scale = mxfp4_stack_quantize_1x32(weights, True)
+                expected = mxfp4_stack_dequant_python(packed, scale)
+                actual = mxfp4_stack_fake_quantize_1x32(weights)
+                self.assert_bf16_bits_equal(
+                    actual, expected, "BF16 FP4 fake quant differs"
+                )
+                self.assert_bf16_bits_equal(
+                    mxfp4_stack_transpose_dequantize_1x32(packed, scale),
+                    expected,
+                    "BF16 FP4 dequant differs",
+                )
+
+    def test_stack_fp4_dqdgrad_ops_reject_bad_shapes(self):
+        # PD_CHECK failures surface as OSError
+        with self.assertRaisesRegex(OSError, "divisible by 32"):
+            mxfp4_stack_fake_quantize_1x32(
+                paddle.randn([2, 48, 64], dtype="bfloat16")
+            )
+        packed = paddle.zeros([2, 64, 16], dtype="int8")
+        with self.assertRaisesRegex(OSError, r"scale shape must be"):
+            mxfp4_stack_transpose_dequantize_1x32(
+                packed, paddle.ones([2, 64, 2], dtype="float32")
+            )
 
 
 if __name__ == "__main__":

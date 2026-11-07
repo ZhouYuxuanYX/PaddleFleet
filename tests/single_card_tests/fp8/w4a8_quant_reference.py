@@ -21,10 +21,13 @@ copies live here as an independent, non-circular CPU ground truth so the W4A8
 GPU tests can validate the fused kernels. Not imported by any production module.
 """
 
+import numpy as np
 import paddle
 import paddle.nn.functional as F
 
 from paddlefleet.transformer.moe.fp8_utils import _stack_expert_weights
+
+_E2M1_MAGNITUDES = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
 
 
 def ceil_to_ue8m0(x):
@@ -187,6 +190,27 @@ def fuse_stack_transpose_fp8_quant_python(
         quant_dtype=quant_dtype,
         using_ue8m0_scale=using_ue8m0_scale,
     )
+
+
+def mxfp4_stack_dequant_python(q, sf):
+    """mxfp4_stack_quantize_1x32(w, transpose=True) 的反量化（numpy 实现）。
+
+    输入 q: [E, C, R/2] int8（低 nibble 存偶数行，bit3 为符号位，码 8 为 -0），
+    sf: [E, C, R/32] fp32。返回 w 原布局的 bf16 [E, R, C]。
+    E2M1 值乘 2 的幂 scale 是精确的（溢出时为 Inf），所以结果与前向用的
+    fp4 权重逐位一致。
+    """
+    raw = q.numpy().view(np.uint8)
+    codes = np.stack([raw & 0x0F, raw >> 4], axis=-1)
+    codes = codes.reshape(*raw.shape[:-1], -1)
+    mag = _E2M1_MAGNITUDES[codes & 0x7]
+    val = np.where(codes & 0x8, -mag, mag)
+    e, c, r = val.shape
+    scale = sf.numpy().astype(np.float64)[..., None]
+    val = val.reshape(e, c, r // 32, 32) * scale
+    with np.errstate(over="ignore"):
+        val = val.reshape(e, c, r).transpose(0, 2, 1).astype(np.float32)
+    return paddle.to_tensor(np.ascontiguousarray(val)).astype("bfloat16")
 
 
 def _weighted_swiglu_fp32(o1, probs, clamp_value=None):

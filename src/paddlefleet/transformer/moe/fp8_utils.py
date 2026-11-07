@@ -55,7 +55,9 @@ except (ImportError, RuntimeError):
 
 try:
     from paddlefleet_ops import (
+        mxfp4_stack_fake_quantize_1x32,
         mxfp4_stack_quantize_1x32,
+        mxfp4_stack_transpose_dequantize_1x32,
         mxfp8_dequantize_1x32,
         mxfp8_quantize_1x32,
         mxfp8_weighted_swiglu_quantize_1x32,
@@ -255,34 +257,28 @@ def fused_stack_quant(
 
 def mxfp4_stack_quant_without_cache(weights, transpose, use_ue8m0=True):
     """Quantize live BF16 weights, never a previously cached FP4 payload."""
-    if not use_ue8m0:
-        raise ValueError(
-            "mxfp4 stack quant requires use_ue8m0=True; "
-            "the fused SM100 kernels use UE8M0 scales"
-        )
-    if (
-        isinstance(weights, (list, tuple))
-        and len(weights) == 1
-        and weights[0].ndim == 2
-    ):
-        weights = weights[0].unsqueeze(0)
-    weights = _stack_expert_weights(weights)
-    return mxfp4_stack_quantize_1x32(weights, transpose)
+    _require_ue8m0(use_ue8m0)
+    return mxfp4_stack_quantize_1x32(_stack_live_weights(weights), transpose)
 
 
 def mxfp4_stack_quant(weights, transpose, use_ue8m0=True):
-    """Use an offline FP4 cache before touching cleared BF16 storage."""
-    if not use_ue8m0:
-        raise ValueError(
-            "mxfp4 stack quant requires use_ue8m0=True; "
-            "the fused SM100 kernels use UE8M0 scales"
-        )
-    owner = weights[0] if isinstance(weights, (list, tuple)) else weights
-    if hasattr(owner, "fp4_weight_stacked"):
-        suffix = "_transpose" if transpose else ""
+    """Use an offline FP4 cache before touching cleared BF16 storage.
+
+    The cache holds only the forward orientation (transpose=True), the one
+    the forward GEMM and the dgrad read; see ``_fp4_cache_owner``.
+    """
+    _require_ue8m0(use_ue8m0)
+    owner = _fp4_cache_owner(weights)
+    if owner is not None:
+        if not transpose:
+            raise ValueError(
+                "The offline W4A8 FP4 cache holds only the transpose=True "
+                "(forward) orientation; transpose=False needs live BF16 "
+                "weights, which may already be released."
+            )
         return (
-            getattr(owner, "fp4_weight_stacked" + suffix),
-            getattr(owner, "fp4_scale_stacked" + suffix),
+            owner.fp4_weight_stacked_transpose,
+            owner.fp4_scale_stacked_transpose,
         )
     return mxfp4_stack_quant_without_cache(weights, transpose, use_ue8m0)
 
@@ -327,6 +323,62 @@ def _stack_expert_weights(w):
         w = w[0] if len(w) == 1 else paddle.stack(w, axis=0)
     assert w.ndim == 3, w.shape
     return w
+
+
+def _require_ue8m0(use_ue8m0):
+    if not use_ue8m0:
+        raise ValueError(
+            "mxfp4 stack quant requires use_ue8m0=True; "
+            "the fused SM100 kernels use UE8M0 scales"
+        )
+
+
+def _fp4_cache_owner(weights):
+    """The weight carrying the offline FP4 cache, or None without one.
+
+    MoELayer.fp8_quant_weight stores the stacked cache on the first weight of
+    a list, so only that entry is read. The cache holds just the forward
+    orientation: fp4_weight_stacked_transpose / fp4_scale_stacked_transpose.
+    """
+    owner = weights[0] if isinstance(weights, (list, tuple)) else weights
+    if getattr(owner, "fp4_weight_stacked_transpose", None) is None:
+        return None
+    return owner
+
+
+def _stack_live_weights(weights):
+    """Live BF16 expert weights as one stacked [E, R, C] tensor."""
+    if (
+        isinstance(weights, (list, tuple))
+        and len(weights) == 1
+        and weights[0].ndim == 2
+    ):
+        weights = weights[0].unsqueeze(0)
+    return _stack_expert_weights(weights)
+
+
+def _mxfp4_forward_weight_dequant(weights, use_ue8m0=True):
+    """Return DQ(Q1(w)) as bf16 [E, R, C] for a stacked [E, R, C] weight.
+
+    Q1 is the forward's ``mxfp4_stack_quant(weights, transpose=True)`` (1x32
+    groups along R), so the W4A8 dgrad runs against exactly the FP4 weight the
+    forward used. Re-quantizing along C instead (transpose=False) would give a
+    different FP4 weight: 1x32 groups are not transpose-invariant.
+
+    With an offline FP4 cache the BF16 storage may be released, so the cached
+    forward payload is unpacked; otherwise one fused pass quantizes and
+    dequantizes the live weight. Both are bit-identical to the forward weight:
+    an E2M1 value times a UE8M0 scale is exact in bf16.
+    """
+    _require_ue8m0(use_ue8m0)
+    # Same cache lookup as mxfp4_stack_quant, so this matches the forward.
+    owner = _fp4_cache_owner(weights)
+    if owner is not None:
+        return mxfp4_stack_transpose_dequantize_1x32(
+            owner.fp4_weight_stacked_transpose,
+            owner.fp4_scale_stacked_transpose,
+        )
+    return mxfp4_stack_fake_quantize_1x32(_stack_live_weights(weights))
 
 
 def _mxfp8_quant(x):
@@ -580,14 +632,6 @@ class _PerExpertWeightView:
         return t._slice(self._local_id, self._local_id + 1)
 
     @property
-    def fp4_weight_stacked(self):
-        return self._slice_fp4("fp4_weight_stacked")
-
-    @property
-    def fp4_scale_stacked(self):
-        return self._slice_fp4("fp4_scale_stacked")
-
-    @property
     def fp4_weight_stacked_transpose(self):
         return self._slice_fp4("fp4_weight_stacked_transpose")
 
@@ -751,8 +795,7 @@ class ExpertsGroupGemmContiguousNode:
             local_id = expert_id - moe_rank * num_experts_per_device
             if (
                 hasattr(parent.weight1, "fp8_weight_stacked")
-                or getattr(parent.weight1, "fp4_weight_stacked", None)
-                is not None
+                or _fp4_cache_owner(parent.weight1) is not None
             ):
                 # Offline quant: bf16 weight may have been cleared, use proxy
                 self.grouped_gemm_experts = _PerExpertWeightProxy(
@@ -866,6 +909,17 @@ class ExpertsGroupGemmContiguousNode:
                 "use_w4a8 requires paddlefleet_ops.deep_gemm to provide the "
                 "fp8*fp4 grouped GEMM"
             )
+            if not HAS_W4A8_FUSED_QUANT:
+                # Otherwise the missing ops surface as a NameError mid-step.
+                raise RuntimeError(
+                    "use_w4a8 requires paddlefleet_ops built with the W4A8 "
+                    "1x32 ops (mxfp4_stack_quantize_1x32, "
+                    "mxfp4_stack_fake_quantize_1x32, "
+                    "mxfp4_stack_transpose_dequantize_1x32, mxfp8_*_1x32); "
+                    "the installed paddlefleet_ops lacks at least one of "
+                    "them. Rebuild paddlefleet_ops from the same source as "
+                    "paddlefleet."
+                )
             # Under w4a8, all dW goes through the bf16 grouped gemm
             self.use_bf16_gemm_weight_grad = True
         _check_expert_dw_deferral_supported(
@@ -1109,7 +1163,8 @@ class ExpertsGroupGemmContiguousNode:
 
     # ------------------------------------------------------------------
     # W4A8 path: online fp4 1x32 weight quant + fp8 1x32 activation quant +
-    # DeepGEMM fp8*fp4
+    # DeepGEMM fp8*fp4 forward; the dgrad is a bf16 grouped GEMM against the
+    # forward's FP4 weight dequantized to bf16
     # ------------------------------------------------------------------
 
     def _w4a8_grouped_gemm(self, x_fp8, x_sf, w_fp4, w_sf, out):
@@ -1127,6 +1182,32 @@ class ExpertsGroupGemmContiguousNode:
             recipe_a=(1, W4A8_QUANT_BLOCK),
             recipe_b=(1, W4A8_QUANT_BLOCK),
         )
+        return out
+
+    def _w4a8_dgrad(self, grad, expert_w, out=None):
+        """W4A8 dgrad: out = grad(bf16) @ DQ(Q1(w))^T, a bf16 grouped GEMM.
+
+        [m_sum, r] = [m_sum, c] * [num_groups, r, c]^T for w [E, R, C], where
+        DQ(Q1(w)) is the forward's own FP4 weight in bf16 (see
+        ``_mxfp4_forward_weight_dequant``), so the dgrad is the exact gradient
+        of the forward's quantized weight and grad is not quantized to fp8.
+        """
+        w_deq = _mxfp4_forward_weight_dequant(
+            expert_w, use_ue8m0=self.use_ue8m0
+        )
+        out_shape = [grad.shape[0], w_deq.shape[1]]
+        if out is None:
+            out = paddle.zeros(out_shape, dtype=grad.dtype)
+        elif list(out.shape) != out_shape:
+            # A wrong-shaped buffer would be silently overwritten by the GEMM.
+            raise ValueError(
+                f"W4A8 dgrad output buffer has shape {list(out.shape)}, "
+                f"expected {out_shape}"
+            )
+        if numpy.prod(grad.shape) != 0:
+            paddlefleet_deep_gemm.m_grouped_bf16_gemm_nt_contiguous(
+                grad, w_deq, out, self.m_indices
+            )
         return out
 
     def _fwd_gate_up_w4a8(self, x, expert_w1, scale=None):
@@ -1249,23 +1330,14 @@ class ExpertsGroupGemmContiguousNode:
     def _bwd_down_input_w4a8(
         self, expert_w2, unzipped_grad, o1, unzipped_probs
     ):
-        """W4A8 backward down dgrad: do2 = do3(fp8 1x32) @ w2(fp4 1x32)
+        """W4A8 backward down dgrad: do2 = do3(bf16) @ DQ(Q1(w2))(bf16)
 
         [m_sum, n] = [m_sum, k] * [num_groups, k, n]
         w2 [E, N, K] not transposed; the contracting dim is K (do3's columns).
+        DQ(Q1(w2)) is the FP4 weight the forward GEMM used; see
+        ``_w4a8_dgrad``.
         """
-        w2_fp4, w2_sf = mxfp4_stack_quant(
-            expert_w2,
-            transpose=False,
-            use_ue8m0=self.use_ue8m0,
-        )
-        grad_fp8, grad_sf = _mxfp8_quant(unzipped_grad)
-
-        do2_s = paddle.empty(
-            [grad_fp8.shape[0], w2_fp4.shape[1]], dtype=unzipped_grad.dtype
-        )
-        if numpy.prod(grad_fp8.shape) != 0:
-            self._w4a8_grouped_gemm(grad_fp8, grad_sf, w2_fp4, w2_sf, do2_s)
+        do2_s = self._w4a8_dgrad(unzipped_grad, expert_w2)
 
         # SiTU-GLU: reuse the validated
         # situ_glu_scale_backward on bf16; it returns (do1, o2_s, probs_grad),
@@ -1307,26 +1379,14 @@ class ExpertsGroupGemmContiguousNode:
         return do1, o2_s, probs_grad
 
     def _bwd_gate_up_input_w4a8(self, do1, expert_w1, dx=None):
-        """W4A8 backward up_gate dgrad: dx = do1(fp8 1x32) @ w1(fp4 1x32)
+        """W4A8 backward up_gate dgrad: dx = do1(bf16) @ DQ(Q1(w1))(bf16)
 
         [m_sum, k] = [m_sum, n] * [num_groups, n, k]
         w1 [E, K, N] not transposed; the contracting dim is N (do1's columns).
+        DQ(Q1(w1)) is the FP4 weight the forward GEMM used; see
+        ``_w4a8_dgrad``.
         """
-        w1_fp4, w1_sf = mxfp4_stack_quant(
-            expert_w1,
-            transpose=False,
-            use_ue8m0=self.use_ue8m0,
-        )
-        do1_fp8, do1_sf = _mxfp8_quant(do1)
-
-        dx_shape = [do1_fp8.shape[0], w1_fp4.shape[1]]
-        if dx is None:
-            dx = paddle.empty(shape=dx_shape, dtype=do1.dtype)
-        else:
-            assert dx.shape == dx_shape, f"{dx.shape} vs {dx_shape}"
-        if numpy.prod(do1_fp8.shape) != 0:
-            self._w4a8_grouped_gemm(do1_fp8, do1_sf, w1_fp4, w1_sf, dx)
-        return dx
+        return self._w4a8_dgrad(do1, expert_w1, dx)
 
     def fwd_swiglu(self, o1):
         o2 = swiglu(o1)

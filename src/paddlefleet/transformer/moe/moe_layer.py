@@ -2518,10 +2518,12 @@ class MoELayer(nn.Layer):
             return
         use_w4a8 = getattr(self, "use_w4a8", False)
         if use_w4a8 and quant_transpose is False:
-            # Packed 1x32 FP4 cannot switch quantization axes by transposing.
+            # The forward GEMM and the dgrad both read the transpose=True FP4
+            # payload, and packed 1x32 FP4 cannot switch axes by transposing.
             raise ValueError(
-                "Offline W4A8 requires quant_transpose=True or None: both "
-                "orientations must be quantized from BF16 before its release."
+                "Offline W4A8 requires quant_transpose=True or None: the "
+                "forward (transpose=True) FP4 weight must be quantized from "
+                "BF16 before its release."
             )
         if hasattr(self, "grouped_gemm_experts") and isinstance(
             self.grouped_gemm_experts, SonicMoEExpert
@@ -2537,15 +2539,12 @@ class MoELayer(nn.Layer):
                 weight_obj = weight_list[0]
 
             if use_w4a8:
-                fp4_weight, fp4_scale = mxfp4_stack_quant_without_cache(
-                    weight_list, transpose=False, use_ue8m0=self.use_ue8m0
-                )
+                # Only the forward orientation: the W4A8 dgrad also runs
+                # against it (fp8_utils._mxfp4_forward_weight_dequant).
                 fp4_weight_t, fp4_scale_t = mxfp4_stack_quant_without_cache(
                     weight_list, transpose=True, use_ue8m0=self.use_ue8m0
                 )
                 # Refresh from live BF16 even when an older cache exists.
-                weight_obj.fp4_weight_stacked = fp4_weight
-                weight_obj.fp4_scale_stacked = fp4_scale
                 weight_obj.fp4_weight_stacked_transpose = fp4_weight_t
                 weight_obj.fp4_scale_stacked_transpose = fp4_scale_t
                 return
@@ -2673,8 +2672,6 @@ class MoELayer(nn.Layer):
         )
 
         fp4_attrs = (
-            "fp4_weight_stacked",
-            "fp4_scale_stacked",
             "fp4_weight_stacked_transpose",
             "fp4_scale_stacked_transpose",
         )

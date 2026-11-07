@@ -24,6 +24,14 @@
 // loads and reorder the per-group amax reduction (commutative/associative
 // fmaxf), so the FP4 and UE8M0 scale bytes are bitwise identical to the
 // original kernels; every other shape/dtype falls through unchanged.
+//
+// mxfp4_stack_fake_quantize_1x32 and mxfp4_stack_transpose_dequantize_1x32
+// return the forward weight DQ(Q1(w)), Q1 = mxfp4_stack_quantize_1x32(w,
+// transpose=True), as bf16 [E, R, C] for the W4A8 expert dgrad (a bf16 grouped
+// GEMM, see _mxfp4_forward_weight_dequant in fp8_utils). An E2M1 value times a
+// UE8M0 scale is exact in fp32 and in bf16, so both reproduce the forward
+// weight bit for bit. The dequantize op only reads the transpose=True layout,
+// as its name says.
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -97,6 +105,25 @@ __device__ __forceinline__ uint8_t EncodeE2m1Strict(float value) {
     code |= 0x8u;
   }
   return code;
+}
+
+// Inverse of EncodeE2m1Strict; only the low 4 bits of code are read. The
+// magnitudes 0, 0.5 | 1, 1.5, 2, 3, 4, 6 are m / 2 for m < 2 and
+// 2^((m >> 1) - 1) * (1 + (m & 1) / 2) above.
+__device__ __forceinline__ float DecodeE2m1(uint32_t code) {
+  const uint32_t mag = code & 0x7u;
+  uint32_t bits = mag < 2u ? mag * 0x3f000000u
+                           : (((mag >> 1) + 126u) << 23) | ((mag & 1u) << 22);
+  bits |= (code & 0x8u) << 28;
+  return __uint_as_float(bits);
+}
+
+// Exact 1 / scale for a CeilUe8m0 result. Exponent 254 (only an Inf amax gets
+// there) has the subnormal reciprocal 2^-127.
+__device__ __forceinline__ float ReciprocalUe8m0(float scale) {
+  const uint32_t exponent = __float_as_uint(scale) >> 23;
+  return __uint_as_float(exponent < 254u ? (254u - exponent) << 23
+                                         : 0x00400000u);
 }
 
 inline int GridFor(int64_t work_items) {
@@ -607,6 +634,178 @@ __global__ void DequantizeFp8OneBy32Kernel(
   }
 }
 
+// -----------------------------------------------------------------------------
+// DQ(Q1(w)) for the W4A8 expert dgrad, bf16 [E, R, C].
+// -----------------------------------------------------------------------------
+
+__device__ __forceinline__ float Bf16LowToFloat(uint32_t pair) {
+  return __uint_as_float(pair << 16);
+}
+
+__device__ __forceinline__ float Bf16HighToFloat(uint32_t pair) {
+  return __uint_as_float(pair & 0xffff0000u);
+}
+
+__device__ __forceinline__ uint32_t PackBf16x2(float low, float high) {
+  const __nv_bfloat162 pair = __floats2bfloat162_rn(low, high);
+  return *reinterpret_cast<const uint32_t*>(&pair);
+}
+
+// A fake-quant block owns one 32-row group x 256 columns. Each thread keeps 4
+// rows x 8 columns in registers (one 16-byte load per row), so w is read once
+// and written once, both coalesced: a warp covers one 512-byte row segment.
+constexpr int kFakeQuantVec = 8;  // bf16 per 16-byte access
+constexpr int kFakeQuantColThreads = 32;
+constexpr int kFakeQuantThreads = 256;
+constexpr int kFakeQuantRowThreads = kFakeQuantThreads / kFakeQuantColThreads;
+constexpr int kFakeQuantRowsPerThread = kQuantBlock / kFakeQuantRowThreads;
+
+// bf16 w [E, R, C] -> DQ(Q1(w)) in one pass; grid.x = E * R / 32 row groups,
+// grid.y = column tiles. Same amax -> CeilUe8m0 -> EncodeE2m1Strict pipeline
+// as StackTransposeBf16Fp4Quantize1x32VecKernel. x * ReciprocalUe8m0(scale)
+// equals the quant kernel's x / scale: both are the correctly rounded x * 2^-k.
+// Keeping more rows per thread in registers spills and runs 2-4x slower.
+__global__ void __launch_bounds__(kFakeQuantThreads)
+    StackBf16Fp4FakeQuantize1x32Kernel(const uint4* __restrict__ input,
+                                       uint4* __restrict__ output,
+                                       int64_t col_vecs) {
+  // partial[row thread][column in the 8-wide vector][column vector]: lanes
+  // touch consecutive words in both phases, so neither has bank conflicts.
+  __shared__ float partial[kFakeQuantRowThreads][kFakeQuantVec]
+                          [kFakeQuantColThreads];
+  __shared__ float tile_scale[kFakeQuantVec][kFakeQuantColThreads];
+
+  const int lane_c = threadIdx.x % kFakeQuantColThreads;
+  const int lane_r = threadIdx.x / kFakeQuantColThreads;
+  const int64_t vec_col =
+      static_cast<int64_t>(blockIdx.y) * kFakeQuantColThreads + lane_c;
+  const bool active = vec_col < col_vecs;
+  const int64_t group_base =
+      static_cast<int64_t>(blockIdx.x) * kQuantBlock * col_vecs + vec_col;
+
+  uint4 data[kFakeQuantRowsPerThread];
+  float amax[kFakeQuantVec];
+#pragma unroll
+  for (int k = 0; k < kFakeQuantVec; ++k) {
+    amax[k] = 0.0f;
+  }
+#pragma unroll
+  for (int i = 0; i < kFakeQuantRowsPerThread; ++i) {
+    const int row = lane_r + i * kFakeQuantRowThreads;
+    data[i] = active ? __ldg(input + group_base + row * col_vecs)
+                     : make_uint4(0u, 0u, 0u, 0u);
+    const uint32_t* words = reinterpret_cast<const uint32_t*>(&data[i]);
+#pragma unroll
+    for (int w = 0; w < kFakeQuantVec / 2; ++w) {
+      amax[2 * w] = fmaxf(amax[2 * w], fabsf(Bf16LowToFloat(words[w])));
+      amax[2 * w + 1] =
+          fmaxf(amax[2 * w + 1], fabsf(Bf16HighToFloat(words[w])));
+    }
+  }
+#pragma unroll
+  for (int k = 0; k < kFakeQuantVec; ++k) {
+    partial[lane_r][k][lane_c] = amax[k];
+  }
+  __syncthreads();
+
+  // One thread per column finishes the 32-row amax.
+  for (int index = threadIdx.x; index < kFakeQuantVec * kFakeQuantColThreads;
+       index += kFakeQuantThreads) {
+    const int k = index / kFakeQuantColThreads;
+    const int c = index % kFakeQuantColThreads;
+    float column_amax = 0.0f;
+#pragma unroll
+    for (int r = 0; r < kFakeQuantRowThreads; ++r) {
+      column_amax = fmaxf(column_amax, partial[r][k][c]);
+    }
+    tile_scale[k][c] = CeilUe8m0(fmaxf(column_amax, kAmaxFloor) / kFp4Max);
+  }
+  __syncthreads();
+  if (!active) {
+    return;
+  }
+
+  float scale[kFakeQuantVec];
+  float inv_scale[kFakeQuantVec];
+#pragma unroll
+  for (int k = 0; k < kFakeQuantVec; ++k) {
+    scale[k] = tile_scale[k][lane_c];
+    inv_scale[k] = ReciprocalUe8m0(scale[k]);
+  }
+#pragma unroll
+  for (int i = 0; i < kFakeQuantRowsPerThread; ++i) {
+    const int row = lane_r + i * kFakeQuantRowThreads;
+    uint4 value = data[i];
+    uint32_t* words = reinterpret_cast<uint32_t*>(&value);
+#pragma unroll
+    for (int w = 0; w < kFakeQuantVec / 2; ++w) {
+      const float low = Bf16LowToFloat(words[w]) * inv_scale[2 * w];
+      const float high = Bf16HighToFloat(words[w]) * inv_scale[2 * w + 1];
+      words[w] =
+          PackBf16x2(DecodeE2m1(EncodeE2m1Strict(low)) * scale[2 * w],
+                     DecodeE2m1(EncodeE2m1Strict(high)) * scale[2 * w + 1]);
+    }
+    output[group_base + row * col_vecs] = value;
+  }
+}
+
+// packed [E, C, R/2] + scale [E, C, R/32] (the transpose=True quant layout) ->
+// bf16 [E, R, C]. A 64(c) x 64(r) tile is decoded into shared memory, then
+// written back along C, so both the packed loads and the stores coalesce.
+constexpr int kDequantTile = 64;
+constexpr int kDequantThreads = 256;
+
+__global__ void __launch_bounds__(kDequantThreads)
+    StackTransposeFp4Dequantize1x32Kernel(const uint32_t* __restrict__ packed,
+                                          const float* __restrict__ scale,
+                                          __nv_bfloat16* __restrict__ output,
+                                          int64_t rows,
+                                          int64_t cols) {
+  __shared__ __nv_bfloat16 tile[kDequantTile][kDequantTile + 2];  // [r][c]
+  const int64_t expert = blockIdx.z;
+  const int64_t row_base = static_cast<int64_t>(blockIdx.y) * kDequantTile;
+  const int64_t col_base = static_cast<int64_t>(blockIdx.x) * kDequantTile;
+  const int64_t words_per_col = rows / 8;  // one 4-byte word = 8 rows
+  const int64_t groups_per_col = rows / kQuantBlock;
+
+  // Load: 64 columns x 8 words (64 rows). Nibble j of a word is row j.
+  for (int linear = threadIdx.x; linear < kDequantTile * (kDequantTile / 8);
+       linear += kDequantThreads) {
+    const int local_col = linear / (kDequantTile / 8);
+    const int word = linear % (kDequantTile / 8);
+    const int64_t col = col_base + local_col;
+    const int64_t row = row_base + word * 8;
+    if (col < cols && row < rows) {
+      const int64_t expert_col = expert * cols + col;
+      const uint32_t bits =
+          __ldg(packed + expert_col * words_per_col + row / 8);
+      const float group_scale =
+          __ldg(scale + expert_col * groups_per_col + row / kQuantBlock);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        tile[word * 8 + j][local_col] =
+            __float2bfloat16_rn(DecodeE2m1(bits >> (4 * j)) * group_scale);
+      }
+    }
+  }
+  __syncthreads();
+
+  // Store: 64 rows x 8 vectors of 8 bf16 along C.
+  for (int linear = threadIdx.x; linear < kDequantTile * (kDequantTile / 8);
+       linear += kDequantThreads) {
+    const int local_row = linear / (kDequantTile / 8);
+    const int vec = linear % (kDequantTile / 8);
+    const int64_t row = row_base + local_row;
+    const int64_t col = col_base + vec * 8;
+    if (row < rows && col < cols) {
+      const uint32_t* words =
+          reinterpret_cast<const uint32_t*>(&tile[local_row][vec * 8]);
+      *reinterpret_cast<uint4*>(output + (expert * rows + row) * cols + col) =
+          make_uint4(words[0], words[1], words[2], words[3]);
+    }
+  }
+}
+
 void CheckGpuContiguous(const paddle::Tensor& input, const char* op_name) {
   PD_CHECK(input.is_gpu(), op_name, " requires a GPU tensor");
   PD_CHECK(input.is_contiguous(), op_name, " requires a contiguous tensor");
@@ -641,6 +840,34 @@ void DispatchFloatInput(const paddle::Tensor& input, Fn&& fn) {
     default:
       PD_THROW("MX 1x32 quantization supports only bfloat16 and float32 input");
   }
+}
+
+// packed int8 [E, C, R/2] + scale [E, C, R/32] -> output bf16 [E, R, C].
+void LaunchStackTransposeFp4Dequantize(const paddle::Tensor& packed,
+                                       const paddle::Tensor& scale,
+                                       paddle::Tensor* output,
+                                       const char* op_name) {
+  const int64_t experts = packed.shape()[0];
+  const int64_t cols = packed.shape()[1];
+  const int64_t rows = packed.shape()[2] * 2;
+  const int64_t row_tiles = (rows + kDequantTile - 1) / kDequantTile;
+  PD_CHECK(row_tiles <= 65535 && experts <= 65535,
+           op_name,
+           " tensor too large for the dequantize launch grid");
+  auto& mutable_packed = const_cast<paddle::Tensor&>(packed);
+  auto& mutable_scale = const_cast<paddle::Tensor&>(scale);
+  const dim3 grid((cols + kDequantTile - 1) / kDequantTile,
+                  static_cast<unsigned int>(row_tiles),
+                  static_cast<unsigned int>(experts));
+  StackTransposeFp4Dequantize1x32Kernel<<<grid,
+                                          kDequantThreads,
+                                          0,
+                                          packed.stream()>>>(
+      reinterpret_cast<const uint32_t*>(mutable_packed.data<int8_t>()),
+      mutable_scale.data<float>(),
+      reinterpret_cast<__nv_bfloat16*>(output->data<phi::bfloat16>()),
+      rows,
+      cols);
 }
 
 }  // namespace
@@ -1007,6 +1234,94 @@ std::vector<paddle::Tensor> MxFp8Dequantize1x32(const paddle::Tensor& input,
   return {output};
 }
 
+// bf16 [E, R, C] = DQ(mxfp4_stack_quantize_1x32(input, transpose=True)).
+std::vector<paddle::Tensor> MxFp4StackFakeQuantize1x32(
+    const paddle::Tensor& input) {
+  constexpr const char* kOpName = "mxfp4_stack_fake_quantize_1x32";
+  CheckGpuContiguous(input, kOpName);
+  PD_CHECK(input.shape().size() == 3, kOpName, " expects [E, R, C]");
+  const int64_t experts = input.shape()[0];
+  const int64_t rows = input.shape()[1];
+  const int64_t cols = input.shape()[2];
+  PD_CHECK(rows % kQuantBlock == 0 && cols % kQuantBlock == 0,
+           kOpName,
+           " R and C must be divisible by 32");
+
+  auto output =
+      paddle::empty(input.shape(), paddle::DataType::BFLOAT16, input.place());
+  if (input.numel() == 0) {
+    return {output};
+  }
+  if (input.dtype() == paddle::DataType::BFLOAT16 &&
+      IsBfloat16Aligned16(input)) {
+    const int64_t row_groups = experts * rows / kQuantBlock;
+    const int64_t col_vecs = cols / kFakeQuantVec;
+    const int64_t col_tiles =
+        (col_vecs + kFakeQuantColThreads - 1) / kFakeQuantColThreads;
+    PD_CHECK(row_groups <= INT32_MAX && col_tiles <= 65535,
+             kOpName,
+             " tensor too large for the launch grid");
+    auto& mutable_input = const_cast<paddle::Tensor&>(input);
+    StackBf16Fp4FakeQuantize1x32Kernel<<<
+        dim3(static_cast<unsigned int>(row_groups),
+             static_cast<unsigned int>(col_tiles)),
+        kFakeQuantThreads,
+        0,
+        input.stream()>>>(
+        reinterpret_cast<const uint4*>(mutable_input.data<phi::bfloat16>()),
+        reinterpret_cast<uint4*>(output.data<phi::bfloat16>()),
+        col_vecs);
+  } else {
+    // float32, or a bf16 view that is not 16-byte aligned: quantize with the
+    // forward op, then unpack.
+    const auto quantized = MxFp4StackQuantize1x32(input, /*transpose=*/true);
+    LaunchStackTransposeFp4Dequantize(
+        quantized[0], quantized[1], &output, kOpName);
+  }
+  CheckCudaLaunch(kOpName);
+  return {output};
+}
+
+// Inverse of mxfp4_stack_quantize_1x32(w, transpose=True): input int8
+// [E, C, R/2] (row 2i in the low nibble), scale [E, C, R/32] -> bf16 [E, R, C].
+std::vector<paddle::Tensor> MxFp4StackTransposeDequantize1x32(
+    const paddle::Tensor& input, const paddle::Tensor& scale) {
+  constexpr const char* kOpName = "mxfp4_stack_transpose_dequantize_1x32";
+  CheckGpuContiguous(input, kOpName);
+  CheckGpuContiguous(scale, kOpName);
+  PD_CHECK(input.dtype() == paddle::DataType::INT8,
+           kOpName,
+           " input must be int8 packed FP4");
+  PD_CHECK(scale.dtype() == paddle::DataType::FLOAT32,
+           kOpName,
+           " scale must be float32");
+  PD_CHECK(input.shape().size() == 3, kOpName, " input must be [E, C, R/2]");
+  const int64_t experts = input.shape()[0];
+  const int64_t cols = input.shape()[1];
+  const int64_t rows = input.shape()[2] * 2;
+  PD_CHECK(rows % kQuantBlock == 0 && cols % 8 == 0,
+           kOpName,
+           " R must be divisible by 32 and C by 8");
+  const std::vector<int64_t> expected_scale_shape = {
+      experts, cols, rows / kQuantBlock};
+  PD_CHECK(scale.shape() == expected_scale_shape,
+           kOpName,
+           " scale shape must be [E, C, R/32]");
+
+  auto output = paddle::empty(
+      {experts, rows, cols}, paddle::DataType::BFLOAT16, input.place());
+  if (input.numel() == 0) {
+    return {output};
+  }
+  auto& mutable_input = const_cast<paddle::Tensor&>(input);
+  PD_CHECK(reinterpret_cast<uintptr_t>(mutable_input.data<int8_t>()) % 4 == 0,
+           kOpName,
+           " input must be 4-byte aligned");
+  LaunchStackTransposeFp4Dequantize(input, scale, &output, kOpName);
+  CheckCudaLaunch(kOpName);
+  return {output};
+}
+
 std::vector<std::vector<int64_t>> MxFp8QuantInferShape(
     std::vector<int64_t> input_shape) {
   return {{input_shape[0], input_shape[1]},
@@ -1068,6 +1383,21 @@ std::vector<paddle::DataType> DequantInferDtype(paddle::DataType input_dtype,
   return {paddle::DataType::BFLOAT16};
 }
 
+std::vector<std::vector<int64_t>> StackFakeQuantInferShape(
+    std::vector<int64_t> input_shape) {
+  return {input_shape};
+}
+
+std::vector<paddle::DataType> StackFakeQuantInferDtype(
+    paddle::DataType input_dtype) {
+  return {paddle::DataType::BFLOAT16};
+}
+
+std::vector<std::vector<int64_t>> StackTransposeDequantInferShape(
+    std::vector<int64_t> input_shape, std::vector<int64_t> scale_shape) {
+  return {{input_shape[0], input_shape[2] * 2, input_shape[1]}};
+}
+
 PD_BUILD_OP(mxfp8_quantize_1x32)
     .Inputs({"input"})
     .Outputs({"output", "scale"})
@@ -1103,4 +1433,18 @@ PD_BUILD_OP(mxfp8_dequantize_1x32)
     .Outputs({"output"})
     .SetKernelFn(PD_KERNEL(MxFp8Dequantize1x32))
     .SetInferShapeFn(PD_INFER_SHAPE(DequantInferShape))
+    .SetInferDtypeFn(PD_INFER_DTYPE(DequantInferDtype));
+
+PD_BUILD_OP(mxfp4_stack_fake_quantize_1x32)
+    .Inputs({"input"})
+    .Outputs({"output"})
+    .SetKernelFn(PD_KERNEL(MxFp4StackFakeQuantize1x32))
+    .SetInferShapeFn(PD_INFER_SHAPE(StackFakeQuantInferShape))
+    .SetInferDtypeFn(PD_INFER_DTYPE(StackFakeQuantInferDtype));
+
+PD_BUILD_OP(mxfp4_stack_transpose_dequantize_1x32)
+    .Inputs({"input", "scale"})
+    .Outputs({"output"})
+    .SetKernelFn(PD_KERNEL(MxFp4StackTransposeDequantize1x32))
+    .SetInferShapeFn(PD_INFER_SHAPE(StackTransposeDequantInferShape))
     .SetInferDtypeFn(PD_INFER_DTYPE(DequantInferDtype));

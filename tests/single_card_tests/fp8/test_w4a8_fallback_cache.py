@@ -31,12 +31,15 @@ from paddlefleet.transformer.moe import fp8_utils
 from paddlefleet.transformer.moe.fusion_layer_utils import MlpNode
 
 FP4_ATTRS = (
-    "fp4_weight_stacked",
-    "fp4_scale_stacked",
     "fp4_weight_stacked_transpose",
     "fp4_scale_stacked_transpose",
 )
-FP8_ATTRS = tuple(name.replace("fp4", "fp8") for name in FP4_ATTRS)
+FP8_ATTRS = (
+    "fp8_weight_stacked",
+    "fp8_scale_stacked",
+    "fp8_weight_stacked_transpose",
+    "fp8_scale_stacked_transpose",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -67,6 +70,8 @@ def cache(weight, kind, count=3, offset=0):
         (count, 6, 2),
         (count, 6, 1),
     )
+    if kind == "fp4":
+        shapes = shapes[2:]  # W4A8 caches only the forward orientation
     for i, (name, shape) in enumerate(zip(attrs, shapes)):
         if kind == "fp8":
             shape = (shape[0] * shape[1], shape[2])
@@ -86,7 +91,7 @@ def grouped_weights(kind):
             weight._clear_data()
             assert not weight._is_initialized()
         elif kind == "none_attr":
-            weight.fp4_weight_stacked = None
+            weight.fp4_weight_stacked_transpose = None
     return parent
 
 
@@ -125,21 +130,21 @@ def assert_selected_weights(selected, parent, kind, local_id):
                 )
             assert not original._is_initialized()
             if kind == "fp4":
-                for transpose in (False, True):
-                    suffix = "_transpose" if transpose else ""
-                    payload, scale = fp8_utils.mxfp4_stack_quant(
-                        [actual], transpose
+                payload, scale = fp8_utils.mxfp4_stack_quant([actual], True)
+                for value, attr in zip(
+                    (payload, scale),
+                    (
+                        "fp4_weight_stacked_transpose",
+                        "fp4_scale_stacked_transpose",
+                    ),
+                ):
+                    assert_tensor(
+                        value,
+                        getattr(original, attr)[local_id : local_id + 1],
                     )
-                    for value, attr in zip(
-                        (payload, scale),
-                        ("fp4_weight_stacked", "fp4_scale_stacked"),
-                    ):
-                        assert_tensor(
-                            value,
-                            getattr(original, attr + suffix)[
-                                local_id : local_id + 1
-                            ],
-                        )
+                # Only the forward orientation is cached.
+                with pytest.raises(ValueError, match="transpose=True"):
+                    fp8_utils.mxfp4_stack_quant([actual], False)
         else:
             assert isinstance(actual, paddle.Tensor)
             assert_tensor(actual, original[local_id : local_id + 1])

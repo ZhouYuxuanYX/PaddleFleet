@@ -31,6 +31,7 @@ from paddlefleet.train_infer_consistent_ops.permute import (
 )
 from paddlefleet.transformer.moe.fp8_utils import (
     ExpertsGroupGemmContiguousNode,
+    _fp4_cache_owner,
     expert_weights_all_frozen,
     slice_expert_weight,
 )
@@ -1140,8 +1141,7 @@ class MlpNode:
                 parent = fused_gemm_node.grouped_gemm_experts
                 if (
                     hasattr(parent.weight1, "fp8_weight_stacked")
-                    or getattr(parent.weight1, "fp4_weight_stacked", None)
-                    is not None
+                    or _fp4_cache_owner(parent.weight1) is not None
                 ):
                     from paddlefleet.transformer.moe.fp8_utils import (
                         _PerExpertWeightProxy,
