@@ -52,6 +52,9 @@ from paddlefleet.accuracy_target import targets_hf
 from paddlefleet.recompute_utils import (
     module_needs_recompute,
     module_needs_refined_recompute,
+    validate_rr_layer_selector,
+    validate_rr_module_env,
+    validate_rr_recompute_region,
 )
 from paddlefleet.tensor_parallel.layers import (
     gen_linear_aoa_statements,
@@ -975,6 +978,7 @@ class MoELayer(nn.Layer):
                         p.is_distributed = True
 
         self.use_rr_deepep_combine = False
+        self.use_rr_deepep_dispatch = False
 
     def _update_layer_aware_recompute(self):
         """(Re-)resolve the selective-recompute flags that depend on the layer id.
@@ -1018,53 +1022,95 @@ class MoELayer(nn.Layer):
                 layer_number, is_mtp_layer=is_mtp_layer
             )
 
+    @property
+    def rr_dispatch_active(self):
+        """Whether this forward actually runs ``moe_dispatch`` RR."""
+        return self.use_rr_deepep_dispatch and self.training
+
+    @property
+    def rr_combine_active(self):
+        """Whether this forward actually runs ``moe_combine`` RR.
+
+        Same inference guard as ``rr_dispatch_active``.
+        """
+        return self.use_rr_deepep_combine and self.training
+
     def rr_recompute_update(self, in_full_recompute, in_mlp_recompute):
+        self._rr_dispatch_update(in_full_recompute, in_mlp_recompute)
+        modules = self.config.recompute_modules
+        if modules is None or "moe_combine" not in modules:
+            return
+        # Unlike moe_dispatch, combine RR hangs off the shared-expert overlap:
+        # it caches the overlapped combine's output.
         if (
-            self.config.recompute_modules is not None
-            and "moe_combine" in self.config.recompute_modules
-        ):
-            if (
-                self.moe_token_dispatcher_type != "deepep"
-                or not self.moe_shared_expert_overlap
-            ):
-                raise ValueError(
-                    "moe_combine RR is only supported in DeepEP mode with "
-                    "moe_shared_expert_overlap enabled (combine_overlap scenario)."
-                )
-            if self.config.recompute_granularity is None:
-                raise ValueError(
-                    "recompute_granularity must be set when moe_combine RR is enabled."
-                )
-            if isinstance(self.config.recompute_modules, dict):
-                spec = self.config.recompute_modules["moe_combine"]
-                # A layer count still means first_n only; a layer list carries
-                # its own layers and needs no method.
-                if isinstance(spec, int) and not isinstance(spec, bool):
-                    if spec >= 0 and self.config.recompute_method != "first_n":
-                        raise ValueError(
-                            "recompute_modules dict mode for moe_combine RR requires "
-                            f"recompute_method='first_n', got '{self.config.recompute_method}'."
-                        )
-                if not hasattr(self, "layer_number"):
-                    raise ValueError(
-                        "layer_number must be set before rr_recompute_update is called in dict mode. "
-                        "Ensure set_layer_number() is called first."
-                    )
-            self.use_rr_deepep_combine = module_needs_refined_recompute(
-                "moe_combine",
-                getattr(self, "layer_number", None),
-                self.config,
-                is_mtp_layer=getattr(self, "is_mtp_layer", False),
-            )
-        if (
-            (not in_full_recompute)
-            and (not in_mlp_recompute)
-            and self.use_rr_deepep_combine
+            self.moe_token_dispatcher_type != "deepep"
+            or not self.moe_shared_expert_overlap
         ):
             raise ValueError(
-                "Enabling rr for moe_combine is meaningless when neither full_recompute "
-                "nor mlp_recompute is active."
+                "moe_combine RR is only supported in DeepEP mode with "
+                "moe_shared_expert_overlap enabled (combine_overlap scenario)."
             )
+        validate_rr_module_env(
+            "moe_combine", self.config, self.moe_token_dispatcher_type
+        )
+        validate_rr_layer_selector(
+            "moe_combine", self.config, hasattr(self, "layer_number")
+        )
+        self.use_rr_deepep_combine = module_needs_refined_recompute(
+            "moe_combine",
+            getattr(self, "layer_number", None),
+            self.config,
+            is_mtp_layer=getattr(self, "is_mtp_layer", False),
+        )
+        validate_rr_recompute_region(
+            "moe_combine",
+            self.use_rr_deepep_combine,
+            in_full_recompute,
+            in_mlp_recompute,
+        )
+
+    def _rr_dispatch_update(self, in_full_recompute, in_mlp_recompute):
+        """Resolve ``moe_dispatch`` RR: run the forward dispatch a2a once.
+
+        Unlike ``moe_combine`` RR this needs no shared-expert overlap -- the
+        dispatch has nothing to overlap with -- but it does need a bf16
+        dispatch, because the cache only handles the plain row tensor.
+        """
+        modules = self.config.recompute_modules
+        if modules is None or "moe_dispatch" not in modules:
+            return
+        # fp8 / W4A8 / sonic quantize before the a2a and return a (fp8, scale)
+        # pair (DeepEPDispatch.forward); the RR cache stores a single row
+        # tensor, so that shape would be silently wrong.
+        if self.fp8_dispatch or self.use_w4a8 or self.using_sonic_moe:
+            raise ValueError(
+                "recompute_modules contains 'moe_dispatch', which does not "
+                f"support fp8 dispatch (fp8_dispatch={self.fp8_dispatch!r}, "
+                f"use_w4a8={self.use_w4a8}, "
+                f"using_sonic_moe={self.using_sonic_moe}). The RR cache only "
+                "handles the bf16 dispatch return shape. Note 'moe_dispatch' "
+                "is meant for the bf16 HyperBody encoder MoE (see the "
+                "encoder-scoped switch); the fp8 decoder cannot use it, so "
+                "drop it from the top-level recompute_modules."
+            )
+        validate_rr_module_env(
+            "moe_dispatch", self.config, self.moe_token_dispatcher_type
+        )
+        validate_rr_layer_selector(
+            "moe_dispatch", self.config, hasattr(self, "layer_number")
+        )
+        self.use_rr_deepep_dispatch = module_needs_refined_recompute(
+            "moe_dispatch",
+            getattr(self, "layer_number", None),
+            self.config,
+            is_mtp_layer=getattr(self, "is_mtp_layer", False),
+        )
+        validate_rr_recompute_region(
+            "moe_dispatch",
+            self.use_rr_deepep_dispatch,
+            in_full_recompute,
+            in_mlp_recompute,
+        )
 
     def _init_expert_parallel(self):
         def _parse_moe_expert_parallel(
@@ -1227,6 +1273,7 @@ class MoELayer(nn.Layer):
                 async_finish=async_finish,
                 use_ue8m0=self.use_ue8m0,
                 using_sonic_moe=self.using_sonic_moe,
+                use_rr_deepep_dispatch=self.rr_dispatch_active,
             )
         )
         return hidden_states, fp8_dispatched_handle
@@ -1272,7 +1319,7 @@ class MoELayer(nn.Layer):
         return self.token_dispatcher._comm_manager.combine(
             hidden_states,
             combine_overlap_handle,
-            use_rr_deepep_combine=self.use_rr_deepep_combine,
+            use_rr_deepep_combine=self.rr_combine_active,
             fp8_dispatch=self.fp8_dispatch_bwd,
             combine_grad_handle=fp8_combine_grad_handle,
         )
@@ -1668,6 +1715,7 @@ class MoELayer(nn.Layer):
                     ),
                     use_w4a8=self.use_w4a8,
                     w4a8_route_factor_post_w2=self.w4a8_route_factor_post_w2,
+                    rr_holds_dispatched=self.rr_dispatch_active,
                 )
 
         hidden_states = inspect_tensor(
@@ -1919,6 +1967,11 @@ class MoELayer(nn.Layer):
                     ),
                     use_w4a8=self.use_w4a8,
                     w4a8_route_factor_post_w2=self.w4a8_route_factor_post_w2,
+                    # Always False here: the overlap scheduler dispatches via
+                    # ``dispatch_overlap``, which has no RR branch, so nothing
+                    # aliases the row buffer and holding it would only raise
+                    # peak memory.
+                    rr_holds_dispatched=False,
                 )
 
             if is_first_fwd:

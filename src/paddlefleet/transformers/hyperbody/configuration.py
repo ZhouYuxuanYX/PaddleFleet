@@ -318,6 +318,12 @@ class HyperBodyEncoderConfig(PretrainedConfig):
         # GEMM for all images, one packed conv pass for all audio chunks)
         # instead of once per segment. Not bit-identical, hence off.
         hyperencoder_batched_patch_embed: bool = False,
+        # The encoder trunk only supports full recompute, which issues the MoE
+        # all-to-all twice per micro-batch. These switches add refined
+        # recompute so dispatch / combine is issued once instead; either one
+        # implies full recompute.
+        hyperencoder_recompute_dispatch: bool = False,
+        hyperencoder_recompute_combine: bool = False,
         # Encoder-only MoE aux loss, independent of the global coef (the decoder
         # runs noaux_tc at 0.0). MUST ride through ``super().__init__``: it is an
         # llm_meta key, so ``set_expected_keys`` overwrites anything assigned on
@@ -404,6 +410,12 @@ class HyperBodyEncoderConfig(PretrainedConfig):
         )
         self.hyperencoder_batched_patch_embed = bool(
             hyperencoder_batched_patch_embed
+        )
+        self.hyperencoder_recompute_dispatch = bool(
+            hyperencoder_recompute_dispatch
+        )
+        self.hyperencoder_recompute_combine = bool(
+            hyperencoder_recompute_combine
         )
         if self.hyperencoder_cp_shard and not bool(hyperencoder_packed_decoder):
             raise ValueError(

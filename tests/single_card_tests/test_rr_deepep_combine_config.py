@@ -260,6 +260,11 @@ class TestRRRecomputeUpdate(unittest.TestCase):
         # another mock.
         mock.config.num_empty_layers_add_in_head = 0
         mock.config.num_hidden_layers = overrides.get("num_hidden_layers", 8)
+        # Also a MagicMock stand-in otherwise, and the VPP guard compares it
+        # with ``> 1``, which raises TypeError instead of reading as "no VPP".
+        mock.config.virtual_pipeline_model_parallel_size = overrides.get(
+            "vpp", None
+        )
         if "layer_number" in overrides:
             mock.layer_number = overrides["layer_number"]
         return mock
@@ -381,7 +386,37 @@ class TestRRRecomputeUpdate(unittest.TestCase):
         mock.config.num_empty_layers_add_in_tail = 0
         mock.config.num_hidden_layers = 8
         mock.config.pipeline_model_parallel_size = 1
-        mock.config.virtual_pipeline_model_parallel_size = None
+        MoELayer.rr_recompute_update(
+            mock, in_full_recompute=True, in_mlp_recompute=False
+        )
+        self.assertTrue(mock.use_rr_deepep_combine)
+
+    def test_virtual_pipeline_raises(self):
+        """VPP replays chunks out of order, so RR frames would mispair.
+
+        This rejects configurations that previously started, hence a test: the
+        alternative is a silently wrong gradient.
+        """
+        from paddlefleet.transformer.moe.moe_layer import MoELayer
+
+        mock = self._make_moe_layer_mock(vpp=2)
+        with self.assertRaises(ValueError) as ctx:
+            MoELayer.rr_recompute_update(
+                mock, in_full_recompute=True, in_mlp_recompute=False
+            )
+        message = str(ctx.exception)
+        self.assertIn("virtual pipeline", message)
+        # The message must name the offending value and the reason.
+        self.assertIn(
+            "virtual_pipeline_model_parallel_size=2",
+            message,
+        )
+
+    def test_virtual_pipeline_one_is_no_vpp(self):
+        """``1`` is the normalized "no VPP" value and must pass."""
+        from paddlefleet.transformer.moe.moe_layer import MoELayer
+
+        mock = self._make_moe_layer_mock(vpp=1)
         MoELayer.rr_recompute_update(
             mock, in_full_recompute=True, in_mlp_recompute=False
         )

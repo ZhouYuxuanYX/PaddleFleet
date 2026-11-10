@@ -405,6 +405,7 @@ class MlpNode:
         use_accuracy_compatible=False,
         use_w4a8=False,
         w4a8_route_factor_post_w2=None,
+        rr_holds_dispatched=False,
     ):
         """
         Constructor
@@ -418,6 +419,12 @@ class MlpNode:
         self.owns_dispatch_buffers = getattr(
             custom_map, "owns_dispatch_buffers", True
         )
+        # NOTE(Difers): why this flag is needed
+        # RR caches an alias of the dispatch row buffer (too big to copy), so
+        # every ``self._free_dispatch_buffer(hs_2d_dispatched)`` in this class
+        # must sit behind this guard. Explicit, not read off ``custom_map``: it
+        # tracks the dispatch that actually ran, which is off during inference.
+        self.rr_holds_dispatched = bool(rr_holds_dispatched)
         self.moe_expert_fusion = moe_expert_fusion
         self.experts = getattr(custom_map, "experts", None)
         if activation_type is None:
@@ -1403,7 +1410,8 @@ class MlpNode:
                 hs_2d_dispatched_fp8, hs_2d_dispatched_scale = tilewise_quant(
                     hs_2d_dispatched
                 )
-            self._free_dispatch_buffer(hs_2d_dispatched)
+            if not self.rr_holds_dispatched:
+                self._free_dispatch_buffer(hs_2d_dispatched)
 
             # 4. 保存输入供 recompute 使用（仅逐专家路径需要）
         if self.recompute_moe_premute and hs_2d_dispatched_fp8 is not None:
@@ -1760,7 +1768,8 @@ class MlpNode:
             self.hs_2d_dispatched_bf16 = None
         elif use_fp8_path:
             hs_fp8, hs_fp8_scale = tilewise_quant(hs_2d_dispatched)
-            self._free_dispatch_buffer(hs_2d_dispatched)
+            if not self.rr_holds_dispatched:
+                self._free_dispatch_buffer(hs_2d_dispatched)
             self.hs_2d_dispatched_bf16 = None
         else:
             # BF16 path: no FP8 quantization
@@ -2986,7 +2995,7 @@ class MlpNode:
         else:
             # 路径 1：一次性 group GEMM → zip
             fwd_path = "group_gemm"
-            if not use_fp8_dispatch_a2a:
+            if not use_fp8_dispatch_a2a and not self.rr_holds_dispatched:
                 self._free_dispatch_buffer(hs_2d_dispatched)
             expert_out = self.experts_group_gemm_node.forward(
                 unzipped_tokens,
@@ -3012,9 +3021,12 @@ class MlpNode:
 
         if self.moe_subbatch_diag:
             logger.info(
-                "[FWD] path=%s, total_tokens=%d",
+                "[FWD] layer=%s, path=%s, zipped_tokens=%d, unzipped_tokens=%d, hidden=%d",
+                get_current_layer(),
                 fwd_path,
                 total_zipped_tokens,
+                self.token_offsets[-1],
+                hidden_size,
             )
 
         return expert_out
@@ -3207,6 +3219,7 @@ class FusionMoePyLayer(paddle.autograd.PyLayer):
         use_accuracy_compatible=False,
         use_w4a8=False,
         w4a8_route_factor_post_w2=None,
+        rr_holds_dispatched=False,
     ):
         """
         根据给定的参数执行前向传播操作。
@@ -3246,6 +3259,7 @@ class FusionMoePyLayer(paddle.autograd.PyLayer):
             use_accuracy_compatible=use_accuracy_compatible,
             use_w4a8=use_w4a8,
             w4a8_route_factor_post_w2=w4a8_route_factor_post_w2,
+            rr_holds_dispatched=rr_holds_dispatched,
         )
 
         if fp8_dispatched_handle is not None:

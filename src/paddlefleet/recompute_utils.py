@@ -321,7 +321,9 @@ RECOMPUTE_ALL_LAYERS = "all"
 LAYER_AGNOSTIC_RECOMPUTE_MODULES = frozenset({"lm_head", "loss_fn"})
 """Single-instance modules: no layer number, so a layer list is rejected."""
 
-REFINED_RECOMPUTE_MODULES = frozenset({"flash_attn", "moe_combine"})
+REFINED_RECOMPUTE_MODULES = frozenset(
+    {"flash_attn", "moe_combine", "moe_dispatch"}
+)
 """RR modules: count-based selectors always use ``first_n``."""
 
 BLOCK_SCOPED_RECOMPUTE_MODULES = frozenset({"mhc_block"})
@@ -525,8 +527,8 @@ def module_needs_refined_recompute(
     while ``0`` selects nothing and enables it everywhere; a list-mode entry
     carries no layer info and also enables it everywhere.
 
-    Count-based selectors always resolve with ``first_n``; only ``moe_combine``
-    rejects a different ``recompute_method``, and it does so itself.
+    Count-based selectors always resolve with ``first_n``; a different
+    ``recompute_method`` is refused by ``validate_rr_layer_selector``.
     """
     module_configured, layer_selector = _get_module_recompute_config(
         module_name, config
@@ -578,6 +580,68 @@ def module_needs_refined_recompute(
         "rr", module_name, layer_number, enabled, is_mtp_layer
     )
     return enabled
+
+
+def validate_rr_module_env(module_name, config, dispatcher_type):
+    """Cross-field checks every RR module shares: DeepEP, recompute on, no VPP.
+
+    ``dispatcher_type`` is passed in rather than read off ``config``: MoELayer
+    overrides it on the instance (``use_accuracy_compatible`` forces
+    ``alltoall``), so the config value can be stale.
+    """
+    if dispatcher_type != "deepep":
+        raise ValueError(
+            f"{module_name} RR is only supported in DeepEP mode, got "
+            f"moe_token_dispatcher_type={dispatcher_type!r}."
+        )
+    if config.recompute_granularity is None:
+        raise ValueError(
+            f"recompute_granularity must be set when {module_name} RR is "
+            "enabled."
+        )
+    vpp = getattr(config, "virtual_pipeline_model_parallel_size", None)
+    if vpp is not None and vpp > 1:
+        raise ValueError(
+            f"{module_name} RR does not support virtual pipeline "
+            f"(virtual_pipeline_model_parallel_size={vpp}): VPP replays a "
+            "chunk's recompute out of order against the first forward, so the "
+            "RR queue would hand a layer's cached frame to a different "
+            "chunk's replay -- wrong results, no error."
+        )
+
+
+def validate_rr_layer_selector(module_name, config, layer_number_set):
+    """Dict mode resolves per layer, so the layer id must already be set."""
+    modules = config.recompute_modules
+    if not isinstance(modules, dict):
+        return
+    spec = modules[module_name]
+    # A layer count still means first_n only; a layer list carries its own
+    # layers and needs no method.
+    if isinstance(spec, int) and not isinstance(spec, bool):
+        if spec >= 0 and config.recompute_method != "first_n":
+            raise ValueError(
+                f"recompute_modules dict mode for {module_name} RR requires "
+                f"recompute_method='first_n', got "
+                f"'{config.recompute_method}'."
+            )
+    if not layer_number_set:
+        raise ValueError(
+            "layer_number must be set before rr_recompute_update is called "
+            "in dict mode. Ensure set_layer_number() is called first."
+        )
+
+
+def validate_rr_recompute_region(
+    module_name, active, in_full_recompute, in_mlp_recompute
+):
+    """RR caches a frame that only a replay pass consumes."""
+    if (not in_full_recompute) and (not in_mlp_recompute) and active:
+        raise ValueError(
+            f"Enabling rr for {module_name} is meaningless when neither "
+            "full_recompute nor mlp_recompute is active: the first forward "
+            "would cache a frame that no recompute pass ever consumes."
+        )
 
 
 def _validate_mhc_block_recompute(config):

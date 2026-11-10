@@ -2939,6 +2939,11 @@ class TransformerLayerWithOverlap(TransformerLayer):
                     f"either switch to deepep/hybridep or disable "
                     f"forward_backward_overlap_scheduler."
                 )
+            if getattr(self.mlp, "use_rr_deepep_dispatch", False):
+                raise ValueError(
+                    "moe_dispatch RR is not supported under "
+                    "forward_backward_overlap_scheduler."
+                )
 
     def compute_attention(self, dict_args, is_first_fwd=False):
         with profile("attn"):

@@ -428,23 +428,7 @@ class HyperEncoderProvider(GPTConfig, ModelProviderMixin["HyperEncoderModel"]):
             self.pad_token_id = 0
 
         # Detach recompute first, so the parent's post_init sees "recompute off".
-        for name, pinned, where in (
-            ("recompute_method", "uniform", "recompute_method"),
-            ("recompute_num_layers", 1, "recompute_num_layers"),
-        ):
-            got = getattr(self, name, None)
-            if got is not None and got != pinned:
-                raise ValueError(
-                    f"{name}={got!r} is not allowed ({where} is pinned to {pinned!r}). "
-                    "HyperEncoder recompute has only one degree of freedom: "
-                    "`recompute_granularity in (None, 'full')`."
-                )
-        rg = getattr(self, "recompute_granularity", None)
-        if rg not in (None, "full"):
-            raise ValueError(
-                f"recompute_granularity={rg!r} is not supported; only 'full' is "
-                "allowed, set None to disable."
-            )
+        rg = self._validate_recompute()
         if getattr(self, "sequence_parallel", False):
             raise ValueError(
                 "Do not set sequence_parallel explicitly: it is derived from "
@@ -495,10 +479,70 @@ class HyperEncoderProvider(GPTConfig, ModelProviderMixin["HyperEncoderModel"]):
         self.first_k_dense_replace = None
 
         # ---- Recompute. See the docstring: must be set after super() ----
+        # ``recompute_modules`` needs no detach/restore: setting granularity to
+        # None above makes the parent skip its granularity branch, but
+        # ``validate_recompute_modules`` still runs unconditionally and sees the
+        # list (which in list mode only checks that every entry is a str).
         if _recompute_on:
             self.recompute_granularity = "full"
             self.recompute_method = "uniform"
             self.recompute_num_layers = 1
+            # num_layers=1 does not restrict a list-mode RR entry:
+            # `module_needs_refined_recompute` returns True straight away for a
+            # list, without consulting the selector (recompute_utils.py:543).
+
+    def _validate_recompute(self) -> str | None:
+        """Accept only the encoder's one supported mode; return granularity.
+
+        One degree of freedom: ``recompute_granularity in (None, "full")``.
+        ``recompute_method`` / ``recompute_num_layers`` are derived, so an
+        explicit value is refused rather than silently overwritten.
+        """
+        for name, pinned in (
+            ("recompute_method", "uniform"),
+            ("recompute_num_layers", 1),
+        ):
+            got = getattr(self, name, None)
+            if got is not None and got != pinned:
+                raise ValueError(
+                    f"{name}={got!r} is not allowed ({name} is pinned to "
+                    f"{pinned!r}). HyperEncoder recompute has only one degree "
+                    "of freedom: `recompute_granularity in (None, 'full')`."
+                )
+        rg = getattr(self, "recompute_granularity", None)
+        if rg not in (None, "full"):
+            raise ValueError(
+                f"recompute_granularity={rg!r} is not supported; only 'full' "
+                "is allowed, set None to disable."
+            )
+        modules = getattr(self, "recompute_modules", None)
+        if modules:
+            self._validate_recompute_modules(rg, modules)
+        return rg
+
+    def _validate_recompute_modules(self, rg, modules) -> None:
+        """Under "full" only RR entries apply.
+
+        Plain selective flags are gated on "selective" and would be silently
+        dead, so reject them instead of ignoring them.
+        """
+        from paddlefleet.recompute_utils import REFINED_RECOMPUTE_MODULES
+
+        if rg is None:
+            raise ValueError(
+                f"recompute_modules={modules!r} needs recompute to be on; "
+                "got recompute_granularity=None."
+            )
+        plain = [m for m in modules if m not in REFINED_RECOMPUTE_MODULES]
+        if plain:
+            raise ValueError(
+                f"recompute_modules={modules!r} under "
+                "recompute_granularity='full' may only list "
+                "refined-recompute modules "
+                f"({sorted(REFINED_RECOMPUTE_MODULES)}); {plain} are plain "
+                "selective entries, which MoELayer ignores unless granularity "
+                "is 'selective' -- they would be silently dead."
+            )
 
     def _check_divisibility(self) -> None:
         """The divisibility assertions for the model geometry."""
