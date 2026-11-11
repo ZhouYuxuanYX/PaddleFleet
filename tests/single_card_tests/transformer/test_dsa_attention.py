@@ -971,6 +971,12 @@ class TestDSAIndexerLossLoggingHelperReduce(unittest.TestCase):
         DSAIndexerLossLoggingHelper.tracker = {}
         DSAIndexerLossLoggingHelper.num_layers = None
 
+    @staticmethod
+    def _fake_sum_all_reduce(tensor, group=None, **kwargs):
+        """In-place all_reduce stand-in: every rank holds the same values,
+        so the SUM over ``group`` is ``values * group.nranks``."""
+        paddle.assign(tensor * group.nranks, output=tensor)
+
     def test_reduce_empty_tracker_noop(self):
         """Reduce with no 'values' should be a no-op."""
         DSAIndexerLossLoggingHelper.reduce_loss_in_tracker()
@@ -1083,11 +1089,17 @@ class TestDSAIndexerLossLoggingHelperReduce(unittest.TestCase):
         DSAIndexerLossLoggingHelper.save_loss_to_tracker(
             loss, layer_number=1, num_layers=2
         )
-        with patch("paddle.distributed.all_reduce"):
+        with patch(
+            "paddle.distributed.all_reduce",
+            side_effect=self._fake_sum_all_reduce,
+        ) as mock_all_reduce:
             DSAIndexerLossLoggingHelper.reduce_loss_in_tracker()
-            # After DP reduce, values should be divided by nranks
-            # (all_reduce is mocked, so actual value won't change, but the
-            #  division path is exercised)
+            mock_all_reduce.assert_called_once()
+
+        # SUM over 4 ranks is 16; the DP average must be written back.
+        np.testing.assert_allclose(
+            DSAIndexerLossLoggingHelper.tracker["values"].numpy(), [4.0, 0.0]
+        )
 
     @patch("paddlefleet.transformer.dsa_attention.parallel_state")
     def test_reduce_with_reduce_group(self, mock_ps):
@@ -1125,9 +1137,48 @@ class TestDSAIndexerLossLoggingHelperReduce(unittest.TestCase):
             num_layers=2,
             avg_group=avg_group,
         )
-        with patch("paddle.distributed.all_reduce") as mock_all_reduce:
+        with patch(
+            "paddle.distributed.all_reduce",
+            side_effect=self._fake_sum_all_reduce,
+        ) as mock_all_reduce:
             DSAIndexerLossLoggingHelper.reduce_loss_in_tracker()
             mock_all_reduce.assert_called_once()
+
+        # SUM over 3 ranks is 9; the avg_group average must be written back.
+        np.testing.assert_allclose(
+            DSAIndexerLossLoggingHelper.tracker["values"].numpy(), [3.0, 0.0]
+        )
+
+    @patch("paddlefleet.transformer.dsa_attention.parallel_state")
+    def test_reduce_with_avg_group_and_dp_group(self, mock_ps):
+        """avg_group and DP averages should both land in the tracker."""
+        mock_ps.get_context_parallel_world_size.return_value = 1
+        mock_ps.get_global_context_parallel_world_size.return_value = 1
+        mock_ps.get_pipeline_model_parallel_group.return_value = None
+        dp_group = MagicMock()
+        dp_group.nranks = 4
+        mock_ps.get_data_parallel_group.return_value = dp_group
+
+        avg_group = MagicMock()
+        avg_group.nranks = 2
+        loss = paddle.to_tensor(2.0, dtype="float32")
+        DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+            loss,
+            layer_number=2,
+            num_layers=2,
+            avg_group=avg_group,
+        )
+        with patch(
+            "paddle.distributed.all_reduce",
+            side_effect=self._fake_sum_all_reduce,
+        ) as mock_all_reduce:
+            DSAIndexerLossLoggingHelper.reduce_loss_in_tracker()
+            self.assertEqual(mock_all_reduce.call_count, 2)
+
+        # 2 -> SUM 4 -> /2 = 2 -> SUM 8 -> /4 = 2.
+        np.testing.assert_allclose(
+            DSAIndexerLossLoggingHelper.tracker["values"].numpy(), [0.0, 2.0]
+        )
 
     @patch("paddlefleet.transformer.dsa_attention.parallel_state")
     def test_reduce_pp_group_single_rank_skipped(self, mock_ps):

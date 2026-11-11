@@ -1334,6 +1334,11 @@ class DSAIndexerLossLoggingHelper:
         PP all-reduce must be called on every rank in the pipeline group.
         Ranks without local indexer layers lazily create a zero tracker so they
         still participate in the collective and do not hang other ranks.
+
+        ``values`` is rebound rather than divided in place: Paddle's ``/=`` on a
+        dygraph tensor is not in-place, so the quotient lands in a fresh tensor
+        and the CP/DP averaging would be dropped unless it is written back to
+        ``tracker["values"]`` at the end.
         """
         tracker = DSAIndexerLossLoggingHelper.tracker
         num_layers = DSAIndexerLossLoggingHelper._infer_num_layers(num_layers)
@@ -1359,7 +1364,7 @@ class DSAIndexerLossLoggingHelper:
         # CP avg
         if tracker.get("avg_group") is not None:
             paddle.distributed.all_reduce(values, group=tracker["avg_group"])
-            values /= tracker["avg_group"].nranks
+            values = values / tracker["avg_group"].nranks
 
         # DP avg
         dp_group = parallel_state.get_data_parallel_group(
@@ -1369,7 +1374,8 @@ class DSAIndexerLossLoggingHelper:
         )
         if dp_group is not None and dp_group.nranks > 1:
             paddle.distributed.all_reduce(values, group=dp_group)
-            values /= dp_group.nranks
+            values = values / dp_group.nranks
+        tracker["values"] = values
 
     @staticmethod
     def track_indexer_metrics(
