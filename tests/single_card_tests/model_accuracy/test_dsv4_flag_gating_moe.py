@@ -605,6 +605,7 @@ class TestDeepEPDispatchOverlapResetsGlobalProbs(unittest.TestCase):
             dispatched_probs=None,
             global_input_probs="STALE",
             _use_w4a8=False,
+            _sonic_fp8_group_size=32,
         )
         with patch.object(
             token_dispatcher,

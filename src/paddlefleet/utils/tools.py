@@ -145,6 +145,13 @@ def get_env_device():
     return "cpu"
 
 
+def get_gpu_capability() -> int:
+    """Compute capability major of the current CUDA device, 0 without one."""
+    if paddle.is_compiled_with_cuda() and paddle.device.cuda.device_count() > 0:
+        return paddle.device.cuda.get_device_capability()[0]
+    return 0
+
+
 def compare_version(version, pair_version):
     """
     Args:

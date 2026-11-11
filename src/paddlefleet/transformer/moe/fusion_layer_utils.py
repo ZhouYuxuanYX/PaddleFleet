@@ -3523,7 +3523,6 @@ def run_sonic_moe(
             attach_preallocated_gated_outputs is not None
             and hidden_states.dtype == paddle.float8_e4m3fn
             and gated_n % 256 == 0
-            and _resolve_sonic_config_bool(fp8_config, "fused_gated")
             and _resolve_sonic_config_bool(fp8_config, "fuse_y1_quant")
         )
         if preallocate_gated_outputs:

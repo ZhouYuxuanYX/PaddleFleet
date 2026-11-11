@@ -38,7 +38,11 @@ from paddlefleet.tensor_parallel.random import (
 from paddlefleet.transformer.activations import situ, situ_glu
 from paddlefleet.transformer.layer import FleetLayer
 from paddlefleet.transformer.mlp import MLP, MLPSublayersSpec
-from paddlefleet.transformer.transformer_config import TransformerConfig
+from paddlefleet.transformer.transformer_config import (
+    TransformerConfig,
+    sonic_moe_fp8_block_size,
+)
+from paddlefleet.utils.tools import get_gpu_capability
 
 if paddlefleet_ops.is_sonic_moe_available():
     try:
@@ -57,6 +61,9 @@ try:
         clear_all_fp8_weight_caches,
     )
     from paddlefleet_ops.sonicmoe.quack_utils import quantize_native_fp8_weights
+    from paddlefleet_ops.sonicmoe.quack_utils.sm90_funcs import (
+        quantize_sm90_weights,
+    )
 except (ImportError, RuntimeError):
     pass
 
@@ -746,6 +753,11 @@ class SonicMoEExpert(GroupedMLPExpert):
         self.sonic_moe_config.fp8_wgrad = self.config.fp8_wgrad
         self.sonic_moe_config.fuse_y1_quant = True
         self.sonic_moe_config.fuse_y1_bf16_trunc = False
+        block_size = sonic_moe_fp8_block_size(
+            self.config.fp8_weight_quant_format
+        )
+        self.sonic_moe_config.activation_group_size = block_size
+        self.sonic_moe_config.weight_block_size = block_size
         self.sonic_moe_config.recompute_z = False
         clamp_value = self.config.activation_func_clamp_value
         self.sonic_moe_config.swiglu_clamp_value = (
@@ -929,6 +941,27 @@ class SonicMoEExpert(GroupedMLPExpert):
         self.convert_weights_to_sonic_layout()
         self.clear_fp8_weights()
 
+        if get_gpu_capability() == 9:
+            quant_format = self.config.fp8_weight_quant_format
+            if quant_format not in ("32x32", "128x128"):
+                raise ValueError(
+                    "SM90 SonicMoE supports fp8_weight_quant_format "
+                    f"32x32 or 128x128, got {quant_format}"
+                )
+            block_size = sonic_moe_fp8_block_size(quant_format)
+            payload = quantize_sm90_weights(
+                self.weight1, self.weight2, block_size
+            )
+            w1_fp8, w1_scale = payload["w1"]
+            w2_fp8, w2_scale = payload["w2"]
+            # SM90 WGMMA fp8 is K-major only, so the transposed operand cannot
+            # alias ``fp8``. Instead of keeping a second persistent copy, sonic
+            # backward builds it transiently from ``fp8`` (transposed_fp8=None).
+            self.weight1.fp8 = (w1_fp8, w1_scale)
+            self.weight2.fp8 = (w2_fp8, w2_scale)
+            self._forward_counter = 0
+            return
+
         iso32 = self.config.fp8_weight_quant_format == "32x32"
         assert self.config.fp8_weight_quant_format in ["32x32", "1x32"], (
             f"fp8_weight_quant_format {self.config.fp8_weight_quant_format} is not supported."
@@ -964,10 +997,16 @@ class SonicMoEExpert(GroupedMLPExpert):
             weight.transposed_fp8 = None
 
     def need_quant_weight(self):
-        for w in [self.weight1, self.weight2]:
-            if not hasattr(w, "fp8") or w.fp8 is None:
+        # SM90 builds transposed_fp8 lazily in sonic backward.
+        # So it doesn't need transposed_fp8.
+        need_transposed = get_gpu_capability() != 9
+        for weight in (self.weight1, self.weight2):
+            if not hasattr(weight, "fp8") or weight.fp8 is None:
                 return True
-            if not hasattr(w, "transposed_fp8") or w.transposed_fp8 is None:
+            if need_transposed and (
+                not hasattr(weight, "transposed_fp8")
+                or weight.transposed_fp8 is None
+            ):
                 return True
         return False
 

@@ -160,7 +160,7 @@ class TestSonicScaleWordPacking(unittest.TestCase):
     """E8M0 uint8 scale bytes carried across DeepEP as int32 words."""
 
     def test_pack_aligned_views_four_bytes_into_one_word(self):
-        # hidden=128 -> num_groups=(128+31)//32=4 (multiple of 4), so 4 uint8
+        # hidden=128 -> num_groups=128//32=4 (multiple of 4), so 4 uint8
         # bytes are reinterpreted as one little-endian int32 word: (2,4)->(2,1).
         x_fp8 = paddle.zeros([2, 128], dtype=paddle.float8_e4m3fn)
         rows = [[1, 2, 3, 4], [5, 6, 7, 8]]
@@ -173,14 +173,13 @@ class TestSonicScaleWordPacking(unittest.TestCase):
         )
         np.testing.assert_array_equal(out.numpy(), expected)
 
-    def test_pack_already_packed_int32_returned_unchanged(self):
-        # An int32 [num_tokens, packed_groups]=[2,1] scale is recognised as
-        # already-packed and returned as the same object, untouched.
+    def test_pack_rejects_already_packed_int32(self):
+        # Pack only accepts raw uint8 [num_tokens, num_groups]=[2,4] bytes. An
+        # int32 [2,1] carrier that is already packed fails the shape check.
         x_fp8 = paddle.zeros([2, 128], dtype=paddle.float8_e4m3fn)
         scale = paddle.to_tensor(np.array([[10], [20]], dtype=np.int32))
-        out = _pack_sonic_fp8_scale_for_deepep(x_fp8, scale)
-        self.assertIs(out, scale)
-        np.testing.assert_array_equal(out.numpy(), [[10], [20]])
+        with self.assertRaisesRegex(RuntimeError, "Invalid Sonic FP8 scale"):
+            _pack_sonic_fp8_scale_for_deepep(x_fp8, scale)
 
     def test_pack_unaligned_groups_casts_values_not_bytes(self):
         # hidden=96 -> num_groups=3 (not a multiple of 4): the fallback casts

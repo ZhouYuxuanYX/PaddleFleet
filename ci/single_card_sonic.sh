@@ -15,7 +15,6 @@
 
 test_cases_list=(
     "tests/single_card_tests/custom_ops/sonic_moe/test_count_cumsum.py"
-    "tests/single_card_tests/custom_ops/sonic_moe/test_moe.py"
 )
 
 

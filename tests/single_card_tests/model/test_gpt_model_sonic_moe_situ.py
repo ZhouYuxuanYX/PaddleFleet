@@ -71,6 +71,15 @@ def situ_epilogue_available():
     return True
 
 
+def is_sm90():
+    """SM90 SonicMoE fp8 gated forward only implements SwiGLU for now."""
+    return (
+        paddle.is_compiled_with_cuda()
+        and paddle.device.cuda.device_count() > 0
+        and paddle.device.cuda.get_device_capability()[0] == 9
+    )
+
+
 def calc_diff(x: paddle.Tensor, y: paddle.Tensor):
     x, y = x.double(), y.double()
     denominator = (x * x + y * y).sum()
@@ -268,6 +277,7 @@ class TestSonicMoESituPrecision(unittest.TestCase):
         situ_epilogue_available(),
         "installed paddlefleet_ops has no SiTU-GLU fp8 epilogue",
     )
+    @unittest.skipIf(is_sm90(), "SM90 SonicMoE does not support SiTU yet")
     def test_situ_fp8_error_not_worse_than_swiglu(self):
         """SiTU on SonicMoE must not be noisier than SwiGLU on SonicMoE.
 

@@ -17,6 +17,7 @@ import importlib.util
 import logging
 import os
 import sys
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -143,7 +144,7 @@ if paddle.is_compiled_with_cuda():
 
     SONIC_MOE_HINT = (
         "For developers: guard imports with `is_sonicmoe_available()` and only call `paddlefleet_ops.sonicmoe` when flag branch enabled.\n"
-        "For users: set `using_sonic_moe=False` or upgrade to Python >= 3.12, CUDA >= 12.9, and a GPU with compute capability >= 10.0 (Blackwell) to enable."
+        "For users: set `using_sonic_moe=False` or upgrade to Python >= 3.12, CUDA >= 12.9, and a GPU with compute capability >= 9.0 (Hopper) to enable."
     )
 
     CUDNN_FRONTEND_HINT = "For developers: guard imports with `is_cudnn_frontend_available()` and only call `paddlefleet_ops.cudnn` when flag branch enabled."
@@ -227,9 +228,9 @@ def _sonic_moe_requirement(
         )
     if _cuda_version < (12, 9):
         reasons.append(f"CUDA >= 12.9 required (current {_cuda_version_str})")
-    if not cuda_capability or cuda_capability[0] < 10:
+    if not cuda_capability or cuda_capability[0] < 9:
         reasons.append(
-            f"GPU compute capability >= 10.0 (Blackwell) required (current {_capability_str})"
+            f"GPU compute capability >= 9.0 (Hopper) required (current {_capability_str})"
         )
     reason = "; ".join(reasons) if reasons else "Runtime requirements not met."
     return _build_notice(lib_module, reason, hint_for_error=hint)
@@ -259,7 +260,7 @@ if paddle.is_compiled_with_cuda():
             _HYBRID_EP_AVAILABLE = True
     if (
         sys.version_info >= (3, 12)
-        and paddle.cuda.get_device_capability()[0] >= 10
+        and paddle.cuda.get_device_capability()[0] >= 9
         and _cuda_version >= (12, 9)
     ):
         _SONIC_MOE_AVAILABLE = True
@@ -338,6 +339,27 @@ def _try_load_nvshmem(ops_dir: Path):
             ) from e
 
 
+def _alias_sonicmoe_namespace():
+    packaged_prefix = "paddlefleet_ops.sonicmoe"
+    public_prefix = "sonicmoe"
+    packaged_modules = tuple(
+        (name, module)
+        for name, module in sys.modules.items()
+        if name == packaged_prefix or name.startswith(packaged_prefix + ".")
+    )
+    for name, module in packaged_modules:
+        public_name = public_prefix + name[len(packaged_prefix) :]
+        existing = sys.modules.get(public_name)
+        if existing is not None and existing is not module:
+            raise RuntimeError(
+                "Cannot load paddlefleet_ops.sonicmoe alongside a distinct "
+                f"'{public_name}' module from {getattr(existing, '__file__', None)!r}"
+            )
+    for name, module in packaged_modules:
+        public_name = public_prefix + name[len(packaged_prefix) :]
+        sys.modules[public_name] = module
+
+
 def _safe_load_ecosystem_lib(
     lib_name: str,
     ops_dir: Path,
@@ -347,10 +369,22 @@ def _safe_load_ecosystem_lib(
     lib_names = [lib_name]
     if extra_libs_name:
         lib_names += extra_libs_name
-    with ModuleContext(lib_names, ops_dir):
+    with ModuleContext(lib_names, ops_dir) as module_context:
         try:
             module = importlib.import_module(lib_name)
             patch_module_namespace(lib_name, "paddlefleet_ops.")
+            if lib_name == "sonicmoe":
+                stale = tuple(
+                    name
+                    for name in module_context._stash
+                    if name == lib_name or name.startswith(lib_name + ".")
+                )
+                if stale:
+                    raise RuntimeError(
+                        "Cannot load paddlefleet_ops.sonicmoe after a distinct top-level "
+                        f"SonicMoE runtime was imported: {', '.join(stale)}"
+                    )
+                _alias_sonicmoe_namespace()
             if extra_libs_name:
                 for extra_lib in extra_libs_name:
                     if extra_lib != "quack":
@@ -412,9 +446,21 @@ if paddle.is_compiled_with_cuda():
         blocked_import_messages["paddlefleet_ops.hybrid_ep"] = error
 
     if is_sonic_moe_available():
-        with paddle.use_compat_guard(
-            enable=True, scope={"sonicmoe", "quack", "triton"}, silent=True
+        with (
+            paddle.use_compat_guard(
+                enable=True, scope={"sonicmoe", "quack", "triton"}, silent=True
+            ),
+            warnings.catch_warnings(),
         ):
+            # SonicMoE/QuACK pass torch.compile-only metadata (device_types,
+            # schema, register_fake) to torch.library; Paddle's shim accepts
+            # and ignores it, so its "not implemented" warning is expected.
+            warnings.filterwarnings(
+                "ignore",
+                message=r"The feature '(device_types|schema|register_fake)' "
+                r"in function 'torch\.library\.",
+                category=UserWarning,
+            )
             _safe_load_ecosystem_lib("sonicmoe", ops_dir, globals(), ["quack"])
     else:
         warning, error = _sonic_moe_requirement(

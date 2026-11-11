@@ -86,15 +86,101 @@ class TestSonicMoEConfigDefaults(unittest.TestCase):
             hidden_size=64, num_attention_heads=4, **overrides
         )
 
-    def test_canonical_field_default_and_old_names_gone(self):
-        # Source transformer_config.py: ``fp8_weight_quant_format: str =
-        # "32x32"`` and ``using_sonic_moe: bool = False``. The rename dropped
-        # the old spellings, so they must not exist as attributes.
+    def _make_config_on_sm(self, major, **overrides):
+        # The SonicMoE quant format default and whitelist depend on the current
+        # GPU's compute capability major, so pin it to ``major``. Both only
+        # apply when SonicMoE is enabled.
+        overrides.setdefault("using_sonic_moe", True)
+        with (
+            mock.patch("paddle.is_compiled_with_cuda", return_value=True),
+            mock.patch("paddle.device.cuda.device_count", return_value=1),
+            mock.patch(
+                "paddle.device.cuda.get_device_capability",
+                return_value=(major, 0),
+            ),
+        ):
+            return self._make_config(**overrides)
+
+    def test_canonical_field_and_old_names_gone(self):
+        # Source transformer_config.py: ``using_sonic_moe: bool = False``. The
+        # rename dropped the old spellings, so they must not exist as attributes.
         config = self._make_config()
-        self.assertEqual(config.fp8_weight_quant_format, "32x32")
         self.assertIs(config.using_sonic_moe, False)
         self.assertFalse(hasattr(config, "sonicmoe_quant_format"))
         self.assertFalse(hasattr(config, "sonicmoe_save_upgate_out_in_fp8"))
+
+    def test_default_quant_format_on_sm90(self):
+        config = self._make_config_on_sm(9)
+        self.assertEqual(config.fp8_weight_quant_format, "128x128")
+
+    def test_default_quant_format_on_sm100(self):
+        config = self._make_config_on_sm(10)
+        self.assertEqual(config.fp8_weight_quant_format, "32x32")
+
+    def test_explicit_quant_format_overrides_default(self):
+        config = self._make_config_on_sm(9, fp8_weight_quant_format="32x32")
+        self.assertEqual(config.fp8_weight_quant_format, "32x32")
+
+    def test_no_default_without_sonic_moe(self):
+        config = self._make_config_on_sm(9, using_sonic_moe=False)
+        self.assertIsNone(config.fp8_weight_quant_format)
+
+    def test_supported_formats_accepted_per_arch(self):
+        for major, quant_format in (
+            (9, "128x128"),
+            (9, "32x32"),
+            (10, "32x32"),
+            (10, "1x32"),
+        ):
+            with self.subTest(major=major, quant_format=quant_format):
+                config = self._make_config_on_sm(
+                    major, fp8_weight_quant_format=quant_format
+                )
+                self.assertEqual(config.fp8_weight_quant_format, quant_format)
+
+    def test_unsupported_format_rejected_per_arch(self):
+        # 1x32 has no SM90 kernel and 128x128 has no SM100 kernel; both must
+        # fail at config construction instead of in quant_weight.
+        for major, quant_format in ((9, "1x32"), (10, "128x128")):
+            with (
+                self.subTest(major=major, quant_format=quant_format),
+                self.assertRaisesRegex(ValueError, "fp8_weight_quant_format"),
+            ):
+                self._make_config_on_sm(
+                    major, fp8_weight_quant_format=quant_format
+                )
+
+    def test_unsupported_arch_rejected(self):
+        # SonicMoE only runs on SM90 and SM100.
+        for major in (8, 12):
+            with (
+                self.subTest(major=major),
+                self.assertRaisesRegex(ValueError, "SM90 and SM100"),
+            ):
+                self._make_config_on_sm(major)
+
+    def test_no_gpu_rejected_separately(self):
+        # No CUDA build or no visible device is reported as "no GPU", not as an
+        # unsupported architecture.
+        for compiled, count in ((False, 0), (True, 0)):
+            with (
+                self.subTest(compiled_with_cuda=compiled, device_count=count),
+                mock.patch(
+                    "paddle.is_compiled_with_cuda", return_value=compiled
+                ),
+                mock.patch(
+                    "paddle.device.cuda.device_count", return_value=count
+                ),
+                self.assertRaisesRegex(ValueError, "none was detected") as ctx,
+            ):
+                self._make_config(using_sonic_moe=True)
+            self.assertNotIn("SM90 and SM100", str(ctx.exception))
+
+    def test_unsupported_format_ignored_without_sonic_moe(self):
+        config = self._make_config_on_sm(
+            10, using_sonic_moe=False, fp8_weight_quant_format="128x128"
+        )
+        self.assertEqual(config.fp8_weight_quant_format, "128x128")
 
 
 @unittest.skipUnless(_HAVE_CONFIG, _CONFIG_SKIP)

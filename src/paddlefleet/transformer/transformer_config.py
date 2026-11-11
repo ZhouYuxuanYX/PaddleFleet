@@ -36,6 +36,7 @@ from ..utils import (
     scaled_init_method_normal,
     truncated_init_method_normal,
 )
+from ..utils.tools import get_gpu_capability
 from .activations import situ
 
 if TYPE_CHECKING:
@@ -208,6 +209,57 @@ def dspark_layers_active(config) -> bool:
     """Return whether DSpark is enabled and has target layers."""
     ids = getattr(config, "dspark_target_layer_ids", None)
     return ids is not None and len(ids) > 0
+
+
+# SonicMoE fp8 weight quant formats supported per compute capability major
+# (SonicMoE only runs on SM90 and SM100). The first entry is the default when
+# ``fp8_weight_quant_format`` is unset.
+_SONIC_MOE_FP8_WEIGHT_QUANT_FORMATS = {
+    # Same 1x128 act / 128x128 weight blocks as the baseline fp8 path.
+    9: ("128x128", "32x32"),
+    10: ("32x32", "1x32"),
+}
+
+
+def sonic_moe_fp8_block_size(quant_format: str | None) -> int:
+    """SonicMoE fp8 block size: 1x128 act / 128x128 weight blocks for
+    "128x128", 1x32 act / 32-wide weight blocks otherwise."""
+    return 128 if quant_format == "128x128" else 32
+
+
+def _resolve_sonic_moe_fp8_weight_quant_format(
+    using_sonic_moe: bool, quant_format: str | None
+) -> str | None:
+    """Fill in the per-architecture default and reject unsupported formats.
+
+    Returns ``quant_format`` untouched when SonicMoE is disabled.
+    """
+    if not using_sonic_moe:
+        return quant_format
+    major = get_gpu_capability()
+    if major == 0:
+        raise ValueError(
+            "using_sonic_moe=True requires a CUDA GPU, but none was detected: "
+            "paddle is not compiled with CUDA or no CUDA device is visible "
+            "(check CUDA_VISIBLE_DEVICES). Set using_sonic_moe=False to run "
+            "without SonicMoE."
+        )
+    supported = _SONIC_MOE_FP8_WEIGHT_QUANT_FORMATS.get(major)
+    if supported is None:
+        raise ValueError(
+            "using_sonic_moe=True is only supported on SM90 and SM100, but the "
+            f"current GPU has compute capability {major}.x. Set "
+            "using_sonic_moe=False on this GPU."
+        )
+    if quant_format is None:
+        return supported[0]
+    if quant_format not in supported:
+        raise ValueError(
+            f"fp8_weight_quant_format={quant_format!r} is not supported by "
+            f"SonicMoE on SM{major}0; supported formats are {supported} "
+            f"(default {supported[0]!r} when unset)."
+        )
+    return quant_format
 
 
 @dataclass
@@ -1550,8 +1602,12 @@ class TransformerConfig(ModelParallelConfig):
     using_sonic_moe: bool = False
     """When using_sonic_moe is enabled, the computation part of the moelayer will use the implementation provided by SonicMoE."""
 
-    fp8_weight_quant_format: str = "32x32"
-    """Quantization format for quantizing weights, options are 32x32 and 1x32. Currently only used in SonicMoE."""
+    fp8_weight_quant_format: str | None = None
+    """SonicMoE weight quantization format: 128x128 or 32x32 on SM90; 32x32 or 1x32 on SM100.
+    Only resolved and validated when using_sonic_moe=True: None then becomes 128x128 on SM90
+    (same 1x128 act / 128x128 weight blocks as the baseline fp8 path) and 32x32 on SM100, and a
+    format the current GPU does not support, a GPU other than SM90/SM100, or no detected CUDA GPU
+    raises ValueError. Left untouched otherwise."""
 
     ####################
     # MLA
@@ -2583,6 +2639,11 @@ class TransformerConfig(ModelParallelConfig):
                     "dspark_dpace_alpha must be in [0, 1], got "
                     f"{self.dspark_dpace_alpha!r}."
                 )
+        self.fp8_weight_quant_format = (
+            _resolve_sonic_moe_fp8_weight_quant_format(
+                self.using_sonic_moe, self.fp8_weight_quant_format
+            )
+        )
         # ``True`` predates the "hf" target and has always meant Megatron, so
         # canonicalize it to the explicit name; every falsy spelling collapses to
         # False. An unknown target raises rather than falling back to the default

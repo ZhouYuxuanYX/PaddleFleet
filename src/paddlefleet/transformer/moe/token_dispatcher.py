@@ -408,8 +408,9 @@ class _HybridEPManager(_DispatchManager):
         fp8_dispatch: bool = False,
         async_finish: bool = False,
         use_ue8m0: bool = False,
+        using_sonic_moe: bool = False,
     ) -> paddle.Tensor:
-        del async_finish
+        del async_finish, using_sonic_moe
         self.token_indices = token_indices
         self.token_probs = token_weights
         hidden_states, self.dispatched_probs, scale = hybrid_ep_dispatch(
@@ -727,6 +728,7 @@ class _MoonEPManager(_DispatchManager):
         fp8_dispatch: bool = False,
         async_finish: bool = False,
         use_ue8m0: bool = False,
+        using_sonic_moe: bool = False,
     ):
         del (
             hidden_states,
@@ -735,6 +737,7 @@ class _MoonEPManager(_DispatchManager):
             fp8_dispatch,
             async_finish,
             use_ue8m0,
+            using_sonic_moe,
         )
         raise NotImplementedError("MoonEP does not support dispatch overlap.")
 
@@ -873,6 +876,7 @@ class _DeepEPManager(_DispatchManager):
         moe_ep_barrier: bool = True,
         use_accuracy_compatible: bool = False,
         use_w4a8: bool = False,
+        sonic_fp8_group_size: int = 32,
     ):
         self.group = group
         self.router_topk = router_topk
@@ -886,6 +890,9 @@ class _DeepEPManager(_DispatchManager):
         # scale slot and handed to the UNMODIFIED deep_ep fp8 dispatch (deep_ep code
         # is NOT changed). Static config, so it rides on the manager (mirrors HybridEP).
         self._use_w4a8 = use_w4a8
+        # SonicMoE fp8 activation quant block size (32 or 128), shared by the
+        # dispatch forward and the combine backward. Static config as well.
+        self._sonic_fp8_group_size = sonic_fp8_group_size
 
         # Metadata
         self.token_indices = None
@@ -930,6 +937,7 @@ class _DeepEPManager(_DispatchManager):
         fp8_dispatch: bool = False,
         async_finish: bool = False,
         use_ue8m0: bool = False,
+        using_sonic_moe: bool = False,
     ) -> paddle.Tensor:
         hidden_states, dispatched_probs, states, scale = fused_dispatch(
             hidden_states,
@@ -941,6 +949,8 @@ class _DeepEPManager(_DispatchManager):
             async_finish=async_finish,
             use_ue8m0=use_ue8m0,
             use_w4a8=self._use_w4a8,
+            using_sonic_moe=using_sonic_moe,
+            sonic_fp8_group_size=self._sonic_fp8_group_size,
         )
         self.handle = states["handle"]
         self.tokens_per_expert = states["tokens_per_expert"]
@@ -1002,6 +1012,7 @@ class _DeepEPManager(_DispatchManager):
                 use_ue8m0=use_ue8m0,
                 using_sonic_moe=using_sonic_moe,
                 use_w4a8=self._use_w4a8,
+                sonic_fp8_group_size=self._sonic_fp8_group_size,
             )
         self.handle = states["handle"]
         self.tokens_per_expert = states["tokens_per_expert"]
@@ -1092,6 +1103,7 @@ class _DeepEPManager(_DispatchManager):
             use_rr_deepep_combine=use_rr_deepep_combine,
             fp8_dispatch=fp8_dispatch,
             combine_grad_handle=combine_grad_handle,
+            sonic_fp8_group_size=self._sonic_fp8_group_size,
         )
         # Release the handle and token_indices after combine operation
         self.handle = None
@@ -1222,6 +1234,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         moe_deep_gemm: bool = False,
         use_accuracy_compatible: bool = False,
         use_w4a8: bool = False,
+        sonic_fp8_group_size: int = 32,
     ):
         super().__init__(ep_group)
 
@@ -1251,6 +1264,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         elif manager_cls is _DeepEPManager:
             manager_kwargs["use_accuracy_compatible"] = use_accuracy_compatible
             manager_kwargs["use_w4a8"] = use_w4a8
+            manager_kwargs["sonic_fp8_group_size"] = sonic_fp8_group_size
         self._comm_manager = manager_cls(**manager_kwargs)
         self.global_input_probs = None
 
@@ -1304,6 +1318,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         fp8_dispatch: bool,
         async_finish: bool = False,
         use_ue8m0: bool = False,
+        using_sonic_moe: bool = False,
     ):
         return self._comm_manager.dispatch_overlap(
             hidden_states,
@@ -1312,6 +1327,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             fp8_dispatch,
             async_finish,
             use_ue8m0=use_ue8m0,
+            using_sonic_moe=using_sonic_moe,
         )
 
     def token_dispatch(

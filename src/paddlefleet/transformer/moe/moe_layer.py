@@ -72,10 +72,12 @@ from paddlefleet.transformer.dw_overlap import (
 from paddlefleet.transformer.paddle_norm import WrappedPaddleNorm
 from paddlefleet.transformer.transformer_config import (
     dw_overlap_enabled,
+    sonic_moe_fp8_block_size,
     w4a8_route_factor_post_w2_scale,
 )
 from paddlefleet.transformer.utils import profile
 from paddlefleet.utils import use_dsv4_accuracy_compatible
+from paddlefleet.utils.tools import get_gpu_capability
 
 from .fp8_utils import (
     fused_stack_quant_without_cache,
@@ -342,6 +344,17 @@ class MoESublayers:
 _HYPERBODY_ENCODER_AUX_N_MB = None
 
 
+def _check_ue8m0_supported(using_sonic_moe: bool) -> None:
+    """use_ue8m0 needs SM100, or SM90 with SonicMoE."""
+    major = get_gpu_capability()
+    if not (major == 10 or (major == 9 and using_sonic_moe)):
+        raise ValueError(
+            "use_ue8m0 requires SM100, or SM90 with SonicMoE; got GPU "
+            f"compute capability {major} and "
+            f"using_sonic_moe={using_sonic_moe}."
+        )
+
+
 def set_hyperbody_encoder_aux_n_mb(value) -> None:
     """Set this forward's HyperBody-encoder aux scale.
 
@@ -487,6 +500,11 @@ class MoELayer(nn.Layer):
         self.fp8_wgrad = config.fp8_wgrad
         self.fp8_dispatch_bwd = (
             self.fp8_dispatch and self.using_sonic_moe and self.fp8_wgrad
+        )
+        # SonicMoE fp8 dispatch quantizes activations in 1x128 blocks to match
+        # 128x128 weights, and in 1x32 blocks otherwise.
+        self.sonic_fp8_group_size = sonic_moe_fp8_block_size(
+            config.fp8_weight_quant_format
         )
         self.moe_expert_fusion = config.moe_expert_fusion
         self._activation_type = "situ" if self.hidden_act == situ else "swiglu"
@@ -690,6 +708,7 @@ class MoELayer(nn.Layer):
                         "moe_expert_fusion is only supported when moe_token_dispatcher_type is 'deepep' or 'hybridep' and on GPU architecture SM90 or higher. If these conditions are not met, please set it to false in the configuration yaml."
                     )
                 self.fp8_dispatch = False
+                self.fp8_dispatch_bwd = False
 
         if self.fp8:
             if paddle.version.cuda() == "12.6":
@@ -701,9 +720,7 @@ class MoELayer(nn.Layer):
             )
 
         if self.use_ue8m0:
-            assert paddle.device.cuda.get_device_capability()[0] == 10, (
-                "use_ue8m0 requires Blackwell GPU (SM100)"
-            )
+            _check_ue8m0_supported(self.using_sonic_moe)
 
         expert_args = {}
         expert_args["config"] = routed_expert_config
@@ -858,6 +875,7 @@ class MoELayer(nn.Layer):
                         self, "use_accuracy_compatible", False
                     ),
                     use_w4a8=self.use_w4a8,
+                    sonic_fp8_group_size=self.sonic_fp8_group_size,
                 )
                 if (
                     self.moe_token_dispatcher_type == "deepep"
@@ -1886,6 +1904,7 @@ class MoELayer(nn.Layer):
                     self.fp8_dispatch,
                     async_finish=async_finish,
                     use_ue8m0=self.use_ue8m0,
+                    using_sonic_moe=self.using_sonic_moe,
                 )
             )
             dispatched_probs = (
