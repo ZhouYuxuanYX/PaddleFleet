@@ -943,6 +943,53 @@ class TestTransformerConfigCpBalanceMode(unittest.TestCase):
             TransformerConfig(cp_balance_mode="invalid_mode")
         self.assertIn("invalid", str(ctx.exception))
 
+    def test_swa_cp_mode_accepts_contiguous_layouts(self):
+        """swa_cp_mode needs only a contiguous layout, not Ulysses."""
+        from paddlefleet.transformer.transformer_config import TransformerConfig
+
+        for mode in ("contiguous_allgather", "contiguous_a2a"):
+            with self.subTest(cp_balance_mode=mode):
+                config = TransformerConfig(
+                    cp_balance_mode=mode,
+                    swa_cp_mode="contiguous_swap2p",
+                    multi_latent_attention=True,
+                )
+                self.assertEqual(config.swa_cp_mode, "contiguous_swap2p")
+
+    def test_swa_cp_mode_rejects_dualchunk_layout(self):
+        """The previous-rank window exchange is wrong under dualchunk."""
+        from paddlefleet.transformer.transformer_config import TransformerConfig
+
+        with self.assertRaises(ValueError) as ctx:
+            TransformerConfig(
+                cp_balance_mode="dualchunk_allgather",
+                swa_cp_mode="contiguous_swap2p",
+                multi_latent_attention=True,
+            )
+        self.assertIn("swa_cp_mode", str(ctx.exception))
+
+    def test_swa_cp_mode_rejects_unknown_value(self):
+        from paddlefleet.transformer.transformer_config import TransformerConfig
+
+        with self.assertRaises(ValueError):
+            TransformerConfig(
+                cp_balance_mode="contiguous_allgather",
+                swa_cp_mode="a2a",
+                multi_latent_attention=True,
+            )
+
+    def test_swa_cp_mode_rejects_non_mla_model(self):
+        """Only MLA SWA layers are routed by it; elsewhere it would be ignored."""
+        from paddlefleet.transformer.transformer_config import TransformerConfig
+
+        with self.assertRaises(ValueError) as ctx:
+            TransformerConfig(
+                cp_balance_mode="contiguous_allgather",
+                swa_cp_mode="contiguous_swap2p",
+                multi_latent_attention=False,
+            )
+        self.assertIn("multi_latent_attention", str(ctx.exception))
+
 
 # PLACEHOLDER_SECTION_8
 
@@ -1347,6 +1394,92 @@ class TestDotProductAttentionContiguousA2a(unittest.TestCase):
                 is_swa=True,
             )
         self.assertIn("hybrid_mla_cp_mode", str(ctx.exception))
+
+    @patch(
+        "paddlefleet.transformer.dot_product_attention.flashmask_attention_cp"
+    )
+    def test_swa_cp_mode_routing(self, mock_cp_attn):
+        """Only MLA SWA layers go P2P: under a2a, or allgather + swa_cp_mode."""
+        from paddlefleet.transformer.dot_product_attention import (
+            DotProductAttention,
+        )
+        from paddlefleet.transformer.enums import AttnMaskType
+
+        cases = [
+            # (cp_balance_mode, swa_cp_mode, is_swa, mla, expected mode)
+            (
+                "contiguous_allgather",
+                "contiguous_swap2p",
+                True,
+                True,
+                "contiguous_swap2p",
+            ),
+            ("contiguous_allgather", None, True, True, "contiguous_allgather"),
+            (
+                "contiguous_allgather",
+                "contiguous_swap2p",
+                False,
+                True,
+                "contiguous_allgather",
+            ),
+            ("contiguous_a2a", None, True, True, "contiguous_swap2p"),
+            # non-MLA SWA stays on a2a (DSV4 hybrid attention relies on it)
+            ("contiguous_a2a", None, True, False, "contiguous_a2a"),
+        ]
+        for cp_mode, swa_mode, is_swa, mla, expected in cases:
+            with self.subTest(
+                cp_balance_mode=cp_mode,
+                swa_cp_mode=swa_mode,
+                is_swa=is_swa,
+                mla=mla,
+            ):
+                mock_cp_attn.reset_mock()
+                mock_cp_attn.return_value = paddle.randn(
+                    [2, 4, 4, 32], dtype="bfloat16"
+                )
+                config = self._make_config(
+                    cp_balance_mode=cp_mode,
+                    swa_cp_mode=swa_mode,
+                    multi_latent_attention=mla,
+                    sliding_window=(3, 0),
+                )
+                with patch(
+                    "paddlefleet.transformer.dot_product_attention.get_context_parallel_world_size",
+                    return_value=2,
+                ):
+                    attn = DotProductAttention(
+                        config=config,
+                        layer_number=1,
+                        attn_mask_type=AttnMaskType.causal,
+                        attention_type="self",
+                        is_swa=is_swa,
+                    )
+                attn.eval()
+                expanded = paddle.zeros([2, 1, 8, 2], dtype="int32")
+                with patch.object(
+                    attn,
+                    "expand_attn_mask_startend_row_indices_for_cp",
+                    return_value=expanded,
+                ):
+                    attn(
+                        paddle.randn([2, 4, 4, 32], dtype="bfloat16"),
+                        paddle.randn([2, 4, 4, 32], dtype="bfloat16"),
+                        paddle.randn([2, 4, 4, 32], dtype="bfloat16"),
+                        None,
+                        attn_mask_startend_row_indices=paddle.zeros(
+                            [2, 1, 8, 2], dtype="int32"
+                        ),
+                        attn_mask_type=AttnMaskType.causal,
+                        use_rr_flash_attention=False,
+                    )
+                kwargs = mock_cp_attn.call_args[1]
+                self.assertEqual(kwargs.get("mode"), expected)
+                if expected == "contiguous_swap2p":
+                    # left window of (3, 0); P2P is a non-causal flashmask call
+                    self.assertEqual(kwargs.get("window_size"), 3)
+                    self.assertFalse(kwargs.get("causal"))
+                else:
+                    self.assertNotIn("window_size", kwargs)
 
 
 # =============================================================================

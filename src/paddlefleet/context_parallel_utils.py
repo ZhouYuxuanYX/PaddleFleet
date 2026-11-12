@@ -1323,8 +1323,9 @@ def _scatter_kv_to_global_tensor(key, value, recv_key, recv_value, group):
         return key, value
 
     scratch_shape = [key.shape[0], total_seqlen, key.shape[2], key.shape[3]]
-    key_tensor = paddle.empty(scratch_shape, dtype=key.dtype)
-    value_tensor = paddle.empty(scratch_shape, dtype=value.dtype)
+    # zeros, not empty: the kernel loads K/V per tile, so masked garbage still yields NaN
+    key_tensor = paddle.zeros(scratch_shape, dtype=key.dtype)
+    value_tensor = paddle.zeros(scratch_shape, dtype=value.dtype)
     key_tensor[:, local_start:local_end, :, :] = key
     value_tensor[:, local_start:local_end, :, :] = value
 

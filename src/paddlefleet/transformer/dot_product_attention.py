@@ -517,6 +517,15 @@ class DotProductAttention(FleetLayer):
             )
         return attn_mask_startend_row_indices
 
+    def _uses_swa_p2p(self, cp_balance_mode, use_mla):
+        """Whether this layer takes the one-hop P2P SWA window exchange."""
+        if not (self.is_swa and use_mla):
+            return False
+        return (
+            cp_balance_mode == "contiguous_a2a"
+            or getattr(self.config, "swa_cp_mode", None) == "contiguous_swap2p"
+        )
+
     def forward(
         self,
         query: Tensor,
@@ -773,35 +782,34 @@ class DotProductAttention(FleetLayer):
                         "refined recompute."
                     )
                     extra_kwargs["mode"] += "_overlap"
-                if cp_balance_mode == "contiguous_a2a":
-                    # allow non-MLA (for DSV4 hybrid attn)
-                    if self.is_swa and use_mla:
-                        extra_kwargs["mode"] = "contiguous_swap2p"
-                        left_window = get_sliding_window_left_size(
-                            self.sliding_window
+                # MLA SWA layers: P2P under contiguous_a2a or when swa_cp_mode asks
+                use_swa_p2p = self._uses_swa_p2p(cp_balance_mode, use_mla)
+                if use_swa_p2p:
+                    # P2P has no overlap variant, so this rewrite drops "_overlap"
+                    extra_kwargs["mode"] = "contiguous_swap2p"
+                    left_window = get_sliding_window_left_size(
+                        self.sliding_window
+                    )
+                    # The P2P kernel asserts window_size > 0: an infinite (-1) or
+                    # zero window carries no SWA truncation and is not
+                    # representable here, so reject it up front.
+                    if left_window <= 0:
+                        raise ValueError(
+                            "Context-parallel SWA (contiguous_swap2p on an "
+                            "MLA layer) requires a finite "
+                            "positive sliding_window, but got "
+                            f"{self.sliding_window!r} (left window "
+                            f"{left_window}). An infinite window (-1) has "
+                            "no sliding-window truncation and is not "
+                            "supported on this path; disable SWA for this "
+                            "layer or configure a positive window size."
                         )
-                        # The CP contiguous_swap2p SWA fast path requires a
-                        # finite positive left window (the flashmask P2P kernel
-                        # in refined_recompute.flash_attn asserts
-                        # window_size > 0). An infinite window (`-1`) or `0`
-                        # carries no SWA truncation and is not representable on
-                        # this path, so reject it up front with an actionable
-                        # message instead of failing deep inside the kernel.
-                        if left_window <= 0:
-                            raise ValueError(
-                                "Context-parallel SWA (cp_balance_mode="
-                                "'contiguous_a2a' with MLA) requires a finite "
-                                "positive sliding_window, but got "
-                                f"{self.sliding_window!r} (left window "
-                                f"{left_window}). An infinite window (-1) has "
-                                "no sliding-window truncation and is not "
-                                "supported on this path; disable SWA for this "
-                                "layer or configure a positive window size."
-                            )
-                        extra_kwargs["window_size"] = left_window
-                        is_causal = False  # only support non-causal for flashmask_attention_cp
-                        assert attn_mask_startend_row_indices.shape[-1] == 2
-                else:
+                    extra_kwargs["window_size"] = left_window
+                    is_causal = False  # only support non-causal for flashmask_attention_cp
+                    assert attn_mask_startend_row_indices.shape[-1] == 2
+                elif cp_balance_mode != "contiguous_a2a":
+                    # a2a keeps the layer's own causality; other layouts do not.
+                    # Non-MLA SWA layers stay here on a2a (DSV4 hybrid attn).
                     is_causal = False  # only support non-causal for flashmask_attention_cp
                     assert attn_mask_startend_row_indices.shape[-1] == 2
             elif use_rr_flash_attention:

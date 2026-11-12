@@ -69,6 +69,7 @@ try:
     import paddle
 
     from paddlefleet.context_parallel_utils import (
+        _scatter_kv_to_global_tensor,
         context_parallel_parameter_disable_scale_grad,
         mark_context_parallel_parameter_disable_scale_grad,
         scatter_balance,
@@ -273,6 +274,92 @@ class TestScatterWithPaddingSplit(unittest.TestCase):
         np.testing.assert_array_equal(
             out2.numpy(), np.zeros([1, 2], dtype=np.float32)
         )
+
+
+def _kv_group(cp_size, rank):
+    """Stand-in group for the SWA P2P KV layout: it reads ``rank`` / ``world_size``."""
+    return SimpleNamespace(world_size=cp_size, rank=rank)
+
+
+@unittest.skipUnless(_PADDLE_AVAILABLE, _SKIP_REASON)
+class TestSwaP2PGlobalKvBuffer(unittest.TestCase):
+    """SWA P2P global KV buffer: zero outside the local chunk and prev window."""
+
+    LOCAL, WINDOW, H, D = 4, 2, 2, 3
+
+    def _tensors(self, batch):
+        # Distinguishable content, so a wrong offset shows up as a wrong value.
+        def seq_tensor(length, base):
+            flat = paddle.arange(
+                batch * length * self.H * self.D, dtype="float32"
+            )
+            return flat.reshape([batch, length, self.H, self.D]) + base
+
+        key = seq_tensor(self.LOCAL, 100.0)
+        return (
+            key,
+            key + 1000.0,
+            seq_tensor(self.WINDOW, 10000.0),
+            seq_tensor(self.WINDOW, 11000.0),
+        )
+
+    def _expected(self, cp_size, rank, src, offset):
+        batch = src.shape[0]
+        total = self.LOCAL * cp_size
+        out = np.zeros([batch, total, self.H, self.D], dtype="float32")
+        start = rank * self.LOCAL
+        out[:, start : start + self.LOCAL] = src.numpy()
+        if rank > 0:
+            out[:, start - self.WINDOW : start] = offset
+        return out
+
+    def _check(self, cp_size, rank, batch=1):
+        key, value, recv_key, recv_value = self._tensors(batch)
+        # Best effort: makes an `empty` regression likely to pick up NaN, but
+        # allocator reuse is not guaranteed -- the zero assertion below is the
+        # actual contract.
+        poison = paddle.full(
+            [batch, self.LOCAL * cp_size, self.H, self.D],
+            float("nan"),
+            dtype="float32",
+        )
+        del poison
+        got_key, got_value = _scatter_kv_to_global_tensor(
+            key, value, recv_key, recv_value, _kv_group(cp_size, rank)
+        )
+        self.assertEqual(
+            got_key.shape, [batch, self.LOCAL * cp_size, self.H, self.D]
+        )
+        self.assertEqual(got_key.dtype, key.dtype)
+        np.testing.assert_array_equal(
+            got_key.numpy(),
+            self._expected(cp_size, rank, key, recv_key.numpy()),
+        )
+        np.testing.assert_array_equal(
+            got_value.numpy(),
+            self._expected(cp_size, rank, value, recv_value.numpy()),
+        )
+
+    def test_rank_zero_fills_prefix_only(self):
+        self._check(cp_size=4, rank=0)
+
+    def test_middle_rank_fills_window_and_chunk(self):
+        self._check(cp_size=4, rank=2)
+
+    def test_last_rank_fills_window_and_chunk(self):
+        self._check(cp_size=4, rank=3)
+
+    def test_batch_axis_layout(self):
+        """Batch > 1 keeps every row's local chunk and window at its own offset."""
+        self._check(cp_size=4, rank=2, batch=2)
+
+    def test_single_rank_passes_through(self):
+        key, value, recv_key, recv_value = self._tensors(1)
+        got_key, got_value = _scatter_kv_to_global_tensor(
+            key, value, recv_key, recv_value, _kv_group(1, 0)
+        )
+        self.assertIs(got_key, key)
+        self.assertIs(got_value, value)
 
 
 if __name__ == "__main__":

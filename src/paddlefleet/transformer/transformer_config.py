@@ -1385,7 +1385,10 @@ class TransformerConfig(ModelParallelConfig):
     """Context parallel scatter/gather layout mode.
     "dualchunk_allgather": balanced front+rear chunk splitting (default).
     "contiguous_allgather": simple rank-order contiguous slicing.
-    "contiguous_a2a".
+    "contiguous_a2a": contiguous slicing, Ulysses all-to-all attention.
+    Sets the token layout and, by default, the CP algorithm of every attention
+    layer; layers may override the algorithm (``hybrid_mla_cp_mode``,
+    ``swa_cp_mode``, ``linear_cp_mode``), never the layout.
     An optional "_overlap"/"_nonoverlap" suffix selects `flashmask_cp_overlap`; it is
     stripped from this field during post-init.
     """
@@ -1732,6 +1735,17 @@ class TransformerConfig(ModelParallelConfig):
     to run Ulysses on the MLA layers of a DSV4 MLA+HCA hybrid while the HCA
     layers keep ``contiguous_allgather``; both modes share one global token
     layout, which is what makes mixing them safe.
+    """
+
+    swa_cp_mode: str | None = None
+    """CP algorithm of the MLA SWA layers; the layout stays ``cp_balance_mode``'s.
+
+    ``None``: P2P (``contiguous_swap2p``) under ``contiguous_a2a``, otherwise
+    follow ``cp_balance_mode``. ``"contiguous_swap2p"``: P2P under any contiguous
+    layout, e.g. ``contiguous_allgather`` when heads % cp != 0. MLA only.
+
+    P2P has no overlap variant, so these layers stay non-overlapped even when
+    ``flashmask_cp_overlap`` is set (the other layers still overlap).
     """
 
     mqa_indexer_cp_mode: str | None = None
@@ -4232,6 +4246,22 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "hybrid_mla_cp_mode can only be set in dsv4_hybrid with "
                     "-2 in csa_compress_ratios."
+                )
+
+        # swa_cp_mode: P2P on MLA SWA layers, contiguous layout only
+        if self.swa_cp_mode is not None:
+            if (
+                self.swa_cp_mode != "contiguous_swap2p"
+                or not self.cp_balance_mode.startswith("contiguous")
+            ):
+                raise ValueError(
+                    f"swa_cp_mode={self.swa_cp_mode!r} needs to be None or "
+                    "'contiguous_swap2p' with a contiguous cp_balance_mode, "
+                    f"got cp_balance_mode={self.cp_balance_mode!r}."
+                )
+            if not self.multi_latent_attention:
+                raise ValueError(
+                    "swa_cp_mode needs multi_latent_attention=True."
                 )
 
         # only support mqa_indexer_cp_mode == dualchunk_p2p if not None
