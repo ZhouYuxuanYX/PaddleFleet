@@ -201,7 +201,7 @@ def check_submodule_updated():
             "HybridEP",
             "quack",
             "sonic-moe",
-            "flash-attention",
+            "FlashMask",
             "flash-linear-attention",
             "FlashMLA",
             "fast-hadamard-transform",
@@ -313,6 +313,18 @@ def _detect_local_gpu_arch():
         return None
 
 
+def _has_sm100_gpu():
+    """True if any visible GPU has compute capability >= 10.0 (B200/B300)."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+            stderr=subprocess.DEVNULL,
+        )
+        return any(float(cap) >= 10.0 for cap in out.decode().split())
+    except Exception:
+        return False
+
+
 def get_cuda_version():
     nvcc_path = shutil.which("nvcc")
     if nvcc_path is None:
@@ -404,6 +416,14 @@ def get_libs():
         ";".join(a for a in re.split(r"[;,]", _raw) if a.strip() in _supported)
         or _default_arch
     )
+    # The FlashMask overlap bridge is B-card only (SM100+): build it for the
+    # SM100+ archs in PADDLE_CUDA_ARCH_LIST (wheels are built on GPU-less hosts,
+    # where FlashMask would otherwise target sm_90a), else for a local B card.
+    _flashmask_ovl_arch = ";".join(
+        {"10.0": "100a", "10.3": "103a"}[a]
+        for a in re.split(r"[;,]", os.environ.get("PADDLE_CUDA_ARCH_LIST", ""))
+        if a in ("10.0", "10.3")
+    )
 
     LIBRARIES: list[EcosystemLibrary] = [
         EcosystemLibrary(
@@ -431,17 +451,18 @@ def get_libs():
             include_dirs=["csrc/"],
         ),
         EcosystemLibrary(
-            name="flash-attention",
-            source_rel_path="third_party/flash-attention/flashmask",
+            name="FlashMask",
+            source_rel_path="third_party/FlashMask",
             artifacts=[
-                Artifact("flash_mask", "flash_mask"),
+                Artifact("flashmask", "flashmask"),
             ],
-            extra_env={"FLASHMASK_BUILD": "fa4+utils+ovl"},
-            include_dirs=[
-                "flash_mask/flashmask_attention_v3/csrc",
-                "flash_mask/flashmask_attention_v3",
-                "flash_mask/flashmask_attention_v3/cutlass/include",
-            ],
+            extra_env={
+                "FLASHMASK_BUILD": "core+utils+ovl"
+                if _flashmask_ovl_arch or _has_sm100_gpu()
+                else "core+utils",
+                "FM4_OVERLAP_CUDA_ARCH": _flashmask_ovl_arch,
+                "FLASHMASK_FRAMEWORK": "paddle",
+            },
         ),
         EcosystemLibrary(
             name="FlashMLA",

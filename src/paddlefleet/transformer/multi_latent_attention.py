@@ -548,7 +548,8 @@ class MultiLatentAttention(Attention):
         # The dense path feeds it to ``flashmask_attention_func(...,
         # learnable_sink=...)`` (dot_product_attention.py:653), which only exists
         # on the FA4 (cute) kernel: gated on ``FLAGS_flash_attn_version in
-        # (3, 4)`` and asserting a bf16 sink (flash_mask/cute/interface.py).
+        # (3, 4)``, with the sink dtype checked in ``_flash_attn_fwd``
+        # (flashmask/cute/ops/fwd.py).
         # With the default flag value of 2 the run dies at the *first forward*
         # with no hint about the cause, so fail at construction time. We
         # deliberately do NOT set the flag ourselves: it is process-global and

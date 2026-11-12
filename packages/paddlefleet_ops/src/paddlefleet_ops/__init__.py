@@ -176,7 +176,7 @@ else:
     MOON_EP_HINT = "moonep is not supported on XPU backend."
 
 FLASH_MASK_HINT = (
-    "For developers: guard imports with `is_flash_mask_available()` and only call `paddlefleet_ops.flash_mask` when flag branch enabled.\n"
+    "For developers: guard imports with `is_flash_mask_available()` and only call `paddlefleet_ops.flashmask` when flag branch enabled.\n"
     "For users: use a GPU with compute capability >= 9.0 (Hopper or Blackwell) to enable."
 )
 
@@ -492,13 +492,13 @@ if paddle.is_compiled_with_cuda():
         blocked_import_messages["paddlefleet_ops.fla"] = error
 
     if is_flash_mask_available():
-        _safe_load_ecosystem_lib("flash_mask", ops_dir, globals())
+        _safe_load_ecosystem_lib("flashmask", ops_dir, globals())
     else:
         warning, error = _hopper_requirement(
-            "paddlefleet_ops.flash_mask", hint=FLASH_MASK_HINT
+            "paddlefleet_ops.flashmask", hint=FLASH_MASK_HINT
         )
         logger.warning(warning)
-        blocked_import_messages["paddlefleet_ops.flash_mask"] = error
+        blocked_import_messages["paddlefleet_ops.flashmask"] = error
 
     if is_fast_hadamard_transform_available():
         _safe_load_ecosystem_lib(

@@ -349,7 +349,7 @@ class TestBackendSelection(unittest.TestCase):
     def test_missing_flash_mask_extension_raises(self):
         """FA4 as a flag value is not FA4 as a backend.
 
-        Without the flash_mask (cute) extension ``get_fa_version`` degrades to
+        Without the flashmask (cute) extension ``get_fa_version`` degrades to
         FA2, so the pinned flag value of 4 never reaches a kernel that cannot
         serve it. The check here is that the layer says so in its own terms --
         naming the head-dim pair, the flags and ``flash_mask_available`` --
@@ -419,7 +419,8 @@ class TestCpRowBounds(unittest.TestCase):
 
     The assertion is the mask itself rather than the numbers in the bounds: with
     ``causal=False`` and two bounds the kernel masks ``row >= LTS or row < UTE``
-    (``flash_mask/cute/mask.py:513-518``), i.e. column ``j`` is visible on rows
+    (the ``[LTS, LTE, UTS, UTE]`` band handling in ``flashmask/cute/mask.py``),
+    i.e. column ``j`` is visible on rows
     ``[UTE_j, LTS_j)``. Decoding the returned pair through *that* rule and
     comparing against a brute-force per-document causal mask, sliced to this
     rank's rows, is what makes the test independent of how the shift is spelled.

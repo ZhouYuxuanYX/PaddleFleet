@@ -236,7 +236,7 @@ class TestHySparseWholeFlowPrecision(unittest.TestCase):
         sharing only the document-relative block coordinates:
 
         * Structure 1 (full-layer scoring) runs on DECOMPRESSED MHA with head_dim
-          ``d_score`` <= 256 (FA4 flash_mask caps head_dim at 256): independent
+          ``d_score`` <= 256 (FA4 flashmask caps head_dim at 256): independent
           query/key/value heads. It emits the document-relative TopK block
           indices consumed downstream.
         * Structures 2/3 (SWA main + block-sparse gather) run on the ABSORBED-MLA

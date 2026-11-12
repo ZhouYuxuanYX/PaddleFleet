@@ -2038,7 +2038,7 @@ class MQALatentAttention(FleetLayer):
                 "FLAGS_cudnn_deterministic="
                 f"{flags['FLAGS_cudnn_deterministic']}. Run on a device whose "
                 "compute capability selects FA4 (SM100+, which is also what the "
-                "sparse phase-3 kernels require) with the flash_mask (cute) "
+                "sparse phase-3 kernels require) with the flashmask (cute) "
                 "extension built into paddlefleet_ops, and leave "
                 "FLAGS_flash_attn_version at the value the trainer derives."
             )
@@ -2105,8 +2105,10 @@ class MQALatentAttention(FleetLayer):
 
         ``flashmask_attention``'s own ``causal=True`` bottom-right-aligns the
         diagonal: it masks column ``j`` above row ``j + seqlen_k - seqlen_q``
-        (``flash_mask/cute/flashmask_utils.py:650``, ``:411``, and the comment at
-        ``flash_bwd_sm100_bigd.py:2009``). Under CP this rank holds query rows
+        (``offset = seqlen_k - seqlen_q`` in ``compute_flashmask_block_lists``
+        and ``n_idx_right`` in ``reduce_block_count_kernel``, both in
+        ``flashmask/cute/flashmask_utils.py``, and the causal comment in
+        ``flashmask/cute/flash_bwd_sm100_bigd.py``). Under CP this rank holds query rows
         ``[cp_rank * s_local, (cp_rank + 1) * s_local)`` against an all-gathered
         ``s_global`` key, so that implied offset -- ``s_global - s_local`` -- is
         only the right one for the last rank. Handing the kernel the global
@@ -2126,8 +2128,10 @@ class MQALatentAttention(FleetLayer):
         (``context_parallel_utils.py:1116-1119``).
 
         With ``causal=False`` and two bounds the kernel reads them as
-        ``[LTS, UTE]`` (``flashmask_utils.py:261-270``) and masks
-        ``row >= LTS or row < UTE`` (``mask.py:513-518``), i.e. column ``j`` is
+        ``[LTS, UTE]`` (``prepare_block_maxmin`` in
+        ``flashmask/cute/flashmask_utils.py``) and masks
+        ``row >= LTS or row < UTE`` (the ``[LTS, LTE, UTS, UTE]`` band handling
+        in ``flashmask/cute/mask.py``), i.e. column ``j`` is
         visible on rows ``[UTE_j, LTS_j)``. So ``UTE_j = j`` reproduces the
         causal diagonal in *global* rows, ``LTS_j`` stays the caller's document
         end, and ``preprocess_index`` -- the same helper

@@ -14,7 +14,7 @@
 
 """FA4-fused full block-score attention (HySparse full layers).
 
-The fused FlashAttention-v4 sm100 forward kernel (``paddlefleet_ops.flash_mask``)
+The fused FlashAttention-v4 sm100 forward kernel (``paddlefleet_ops.flashmask``)
 now optionally emits the HySparse per-(query, key-block) max logit alongside the
 attention output, computed inside the softmax epilogue (see the ``has_block_logit``
 path in ``flash_fwd_sm100.py``). This wrapper allocates the block-logit buffer,
@@ -39,8 +39,8 @@ supports is honoured automatically.
 """
 
 import paddle
-from paddlefleet_ops.flash_mask.cute.flashmask_utils import FlashMaskInfoPaddle
-from paddlefleet_ops.flash_mask.cute.interface import (
+from paddlefleet_ops.flashmask.cute.flashmask_utils import FlashMaskInfoPaddle
+from paddlefleet_ops.flashmask.cute.interface import (
     _flash_attn_bwd,
     _flash_attn_fwd,
 )

@@ -34,7 +34,10 @@ wrong aux gradient is visible. The optimizer is not run.
         tests/multi_card_tests/test_hyperbody_encoder_cp_shard.py
 
 Env: ``HB_TEST_CP`` (4), ``HB_TEST_CP_MODE`` (dualchunk_allgather |
-contiguous_allgather; default runs both modes).
+contiguous_allgather, optionally with ``_overlap``; default runs every mode the
+installed FlashMask supports), ``HB_TEST_EXPERTS`` (max(4, cp); EP == CP needs
+an expert count divisible by cp), ``HB_TEST_SEQ_ALIGN`` (32; overlap needs a pad
+multiple of 4 * cp).
 """
 
 import os
@@ -66,7 +69,14 @@ def _np(t):
     return t.astype("float32").numpy()  # bf16 -> fp32 is exact
 
 
+_EXPERTS = int(os.environ.get("HB_TEST_EXPERTS", "0")) or None
+_SEQ_ALIGN = int(os.environ.get("HB_TEST_SEQ_ALIGN", "32"))
+
+
 def _build(cp, shard, mode):
+    experts = _EXPERTS or max(
+        4, cp
+    )  # EP == CP, so the routed experts must split
     from paddlefleet.models.hyperbody import get_hyperbody_encoder_layer_specs
     from paddlefleet.transformers.hyperbody.configuration import HyperBodyConfig
     from paddlefleet.transformers.hyperbody.modeling import (
@@ -82,7 +92,7 @@ def _build(cp, shard, mode):
             "intermediate_size": 128,
             "num_hidden_layers": 1,
             "num_attention_heads": 4,
-            "n_routed_experts": 4,
+            "n_routed_experts": experts,
             "moe_intermediate_size": 32,
             "num_experts_per_tok": 2,
             "n_shared_experts": 1,
@@ -94,12 +104,12 @@ def _build(cp, shard, mode):
             "num_hidden_layers": 2,
             "num_attention_heads": 2,  # head_dim 128, as in production
             "moe_intermediate_size": 64,
-            "n_routed_experts": 4,
+            "n_routed_experts": experts,
             "num_experts_per_tok": 2,
             "n_shared_experts": 1,
             "first_k_dense_replace": 1,
             "hyperencoder_query_length": _Q,
-            "hyperencoder_seq_align": 32,
+            "hyperencoder_seq_align": _SEQ_ALIGN,
             "hyperencoder_attn_backend": "flashmask",
             "hyperencoder_packed_decoder": True,
             "hyperencoder_cp_shard": shard,
@@ -212,9 +222,15 @@ def _worst(a, b):
 
 def main():
     cp = int(os.environ.get("HB_TEST_CP", "4"))
-    supported_modes = ("dualchunk_allgather", "contiguous_allgather")
+    from paddlefleet.overlap_context_parallel import OVERLAP_SUPPORTED
+
+    layouts = ("dualchunk_allgather", "contiguous_allgather")
+    supported_modes = layouts + tuple(m + "_overlap" for m in layouts)
     requested_mode = os.environ.get("HB_TEST_CP_MODE")
-    modes = (requested_mode,) if requested_mode is not None else supported_modes
+    if requested_mode is not None:
+        modes = (requested_mode,)
+    else:
+        modes = supported_modes if OVERLAP_SUPPORTED else layouts
     if any(mode not in supported_modes for mode in modes):
         raise ValueError(f"Unsupported HB_TEST_CP_MODE: {requested_mode!r}")
     strategy = fleet.DistributedStrategy()

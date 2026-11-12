@@ -184,11 +184,6 @@ class ModelConfig:
     _attn_implementation: str = field(
         default="flashmask", metadata={"help": "Attention implementation"}
     )
-    flashmask_use_varlen: str = field(
-        default=False,
-        metadata={"help": "If True, convert flashmask to varlen in attention."},
-    )
-
     # long sequence strategy
     use_long_sequence_strategies: bool = field(
         default=False,

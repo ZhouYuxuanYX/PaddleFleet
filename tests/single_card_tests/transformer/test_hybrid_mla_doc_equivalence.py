@@ -502,8 +502,8 @@ class TestMQAKernelPackedVsSingle(unittest.TestCase):
 
     def _module(self, sink=None):
         # bf16 throughout: the full-causal phase hands the sink to dense FA4 as
-        # ``learnable_sink``, which asserts bf16 on it
-        # (``flash_mask/cute/interface.py:598``), and that is what production's
+        # ``learnable_sink`` (dtype checked in ``_flash_attn_fwd``,
+        # ``flashmask/cute/ops/fwd.py``), and bf16 is what production's
         # ``build_softmax_offset`` gives via ``params_dtype``.
         return _build_module(_create_mqa_config("mqa"), bf16=True, sink=sink)
 
@@ -917,9 +917,9 @@ class TestSinkNormalizationFP64(unittest.TestCase):
     def test_mqa_sink_matches_fp64_oracle(self):
         seqlen, layout = 256, [40, 88, 128]
         sink = np.linspace(1.0, 3.0, H)
-        # bf16 sink: dense FA4 asserts that dtype on ``learnable_sink``
-        # (``flash_mask/cute/interface.py:598``), matching production's
-        # ``params_dtype``. The oracle is then fed the rounded values the kernel
+        # bf16 sink, matching production's ``params_dtype`` (dense FA4 checks
+        # the ``learnable_sink`` dtype in ``_flash_attn_fwd``,
+        # ``flashmask/cute/ops/fwd.py``). The oracle is then fed the rounded values the kernel
         # actually saw, so the comparison isolates the softmax arithmetic rather
         # than re-measuring bf16 storage of the sink.
         module = _build_module(_create_mqa_config("mqa"), bf16=True, sink=sink)

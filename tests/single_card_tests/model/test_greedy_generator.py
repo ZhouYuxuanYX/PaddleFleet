@@ -488,7 +488,6 @@ class TestGenerateUseCacheIsCausal(unittest.TestCase):
         config.params_dtype = "bfloat16"
         config.init_method = MagicMock()
         config._attn_implementation = "flash"
-        config.flashmask_use_varlen = False
         config.experimental_dataflow = False
 
         attn = DotProductAttention(

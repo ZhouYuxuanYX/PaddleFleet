@@ -213,6 +213,10 @@ tests:
   - test_case: [tests/multi_card_tests/transformer/test_flash_mask_cp_a2a.py]
     products:
       - num_gpus: 2
+  # transformer: FlashMask CP in-kernel overlap vs all-gather, both layouts (CP=4)
+  - test_case: [tests/multi_card_tests/transformer/test_flash_mask_cp_overlap.py]
+    products:
+      - num_gpus: 4
   # transformer: latent-MQA indexer dual-chunk row rebalance (CP=2)
   - test_case: [tests/multi_card_tests/transformer/test_mqa_indexer_dualchunk_cp.py]
     products:

@@ -21,11 +21,10 @@ attention output that the first pass already produced and stashed in
 ``ctx.save_for_backward`` so the custom backward can call the right gradient
 kernel. That save-set differs by FlashAttention version -- v2 must also carry
 the RNG ``seed_offset`` and ``dropout`` needed by ``flash_attn_grad``, while
-the v3/cutedsl paths must not.
+the v3/v4 (cutedsl) path must not.
 
-The version decision (``get_fa_version``) and the cutedsl routing
-(``uses_cutedsl_backend``) are collaborators owned by the facade and tested
-there; here they are pinned to fixed returns so each surrogate branch is
+The version decision (``get_fa_version``) is a collaborator owned by the facade
+and tested there; here it is pinned to fixed returns so each surrogate branch is
 exercised deterministically on CPU. ``ctx`` is Paddle's autograd context (also
 not under test); it is replaced by a recording stub so the exact save-set can
 be observed. The logic under test is the production ``forward`` body: what it
@@ -184,15 +183,12 @@ class TestFlashAttnFunctorSurrogateForward(unittest.TestCase):
         ctx = _RecordingCtx()
         with (
             mock.patch.object(fa_mod, "get_fa_version", return_value=3),
-            mock.patch.object(
-                fa_mod, "uses_cutedsl_backend", return_value=False
-            ),
         ):
             out = FlashAttnFunctor.forward(ctx, self.q, self.k, self.v, hold)
 
         self.assertIs(out, hold["result_attention"])
         self.assertEqual(ctx.fa_version, 3)
-        # v3 backward (``flash_attn_v3_grad``) needs no RNG state: exactly
+        # v3 backward (cutedsl ``_flash_attn_bwd``) needs no RNG state: exactly
         # q,k,v + output + lse + causal, and no seed_offset/dropout keys are
         # even required in hold_tensors (a KeyError here would fail the test).
         expected = (
@@ -213,9 +209,6 @@ class TestFlashAttnFunctorSurrogateForward(unittest.TestCase):
         ctx = _RecordingCtx()
         with (
             mock.patch.object(fa_mod, "get_fa_version", return_value=3),
-            mock.patch.object(
-                fa_mod, "uses_cutedsl_backend", return_value=False
-            ),
         ):
             FlashAttnFunctor.forward(ctx, self.q, self.k, self.v, hold)
         self.assertEqual(ctx.softmax_scale, 0.25)
@@ -226,9 +219,6 @@ class TestFlashAttnFunctorSurrogateForward(unittest.TestCase):
         ctx2 = _RecordingCtx()
         with (
             mock.patch.object(fa_mod, "get_fa_version", return_value=3),
-            mock.patch.object(
-                fa_mod, "uses_cutedsl_backend", return_value=False
-            ),
         ):
             FlashAttnFunctor.forward(
                 ctx2, self.q, self.k, self.v, hold_no_scale

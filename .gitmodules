@@ -10,9 +10,9 @@
 [submodule "third_party/sonic-moe"]
 	path = packages/paddlefleet_ops/third_party/sonic-moe
 	url = https://github.com/PFCCLab/supersonic-moe.git
-[submodule "third_party/flash-attention"]
-	path = packages/paddlefleet_ops/third_party/flash-attention
-	url = https://github.com/PaddlePaddle/flash-attention.git
+[submodule "packages/paddlefleet_ops/third_party/FlashMask"]
+	path = packages/paddlefleet_ops/third_party/FlashMask
+	url = https://github.com/PaddlePaddle/FlashMask.git
 [submodule "third_party/HybridEP"]
 	path = packages/paddlefleet_ops/third_party/HybridEP
 	url = https://github.com/PFCCLab/DeepEP.git

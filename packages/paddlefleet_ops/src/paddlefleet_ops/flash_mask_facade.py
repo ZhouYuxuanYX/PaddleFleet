@@ -18,78 +18,9 @@ import paddle
 
 from . import is_flash_mask_available
 
-FA3_BACKEND_CHOICES = ("cutedsl", "cpp")
-
-# Which kernel FA3 FlashMask runs on. Not an environment variable: the value
-# comes from ``TransformerConfig.flash_attn_fa3_backend`` and is handed over by
-# :func:`set_fa3_backend` in ``__post_init__``. An env switch would be fixed
-# before ``from_config`` runs, so no config could override it and the choice
-# would neither be validated nor stored alongside the config.
-#
-# Resolved once per process. Version dispatch, backend pick
-# (``uses_cutedsl_backend``) and value padding (``needs_value_padding``) all read
-# this module global, and ``PyLayer.forward``/``backward`` read it independently,
-# so a mid-process flip would pair two different kernels -- and a second config
-# would reroute a model that is already running. ``set_fa3_backend`` therefore
-# accepts the same choice any number of times and rejects a different one;
-# ``_FA3_BACKEND`` is what it has resolved so far (``None`` before the first
-# call).
-_FA3_BACKEND = None
-FLASHMASK_FA3_USE_CUTEDSL = True
-
-
-def set_fa3_backend(backend: str) -> None:
-    """Point FA3 FlashMask at ``backend``; called from config, not by user code.
-
-    Resolved once per process: repeating the same choice is a no-op, asking for a
-    different one raises instead of silently rerouting kernels behind models that
-    are already running.
-
-    Args:
-        backend: One of ``FA3_BACKEND_CHOICES``. ``"cutedsl"`` selects the CuTe
-            DSL kernels, ``"cpp"`` the C++ FA3 kernels behind Paddle's built-in
-            FlashMask op.
-
-    Raises:
-        ValueError: If ``backend`` is not a known choice -- the string is parsed
-            here only, so every consumer reads a plain bool -- or if it differs
-            from the choice already resolved in this process.
-    """
-    global FLASHMASK_FA3_USE_CUTEDSL, _FA3_BACKEND
-    if backend not in FA3_BACKEND_CHOICES:
-        raise ValueError(
-            f"unknown FA3 backend {backend!r}, expected one of "
-            f"{list(FA3_BACKEND_CHOICES)}"
-        )
-    if _FA3_BACKEND is not None and _FA3_BACKEND != backend:
-        raise ValueError(
-            "flash_attn_fa3_backend cannot change within a process: already "
-            f"{_FA3_BACKEND!r}, got {backend!r} -- a forward and its backward "
-            "read the choice independently, so a mid-process flip would pair "
-            "two different kernels. Give every TransformerConfig in this "
-            "process the same value."
-        )
-    _FA3_BACKEND = backend
-    FLASHMASK_FA3_USE_CUTEDSL = backend == "cutedsl"
-
-
-def _reset_fa3_backend() -> None:
-    """Drop the resolved choice so the next ``set_fa3_backend`` wins. Tests only.
-
-    Not part of the public surface: production code resolves the backend exactly
-    once, from ``TransformerConfig.flash_attn_fa3_backend``.
-    """
-    global FLASHMASK_FA3_USE_CUTEDSL, _FA3_BACKEND
-    _FA3_BACKEND = None
-    FLASHMASK_FA3_USE_CUTEDSL = True
-
 
 def _cutedsl_hdim_ok(fa_version: int, head_dim: int, head_dim_v: int) -> bool:
     """Whether the cutedsl kernels serve ``(head_dim, head_dim_v)``.
-
-    One whitelist for both callers in :func:`_dispatch_fa_version` -- the FA4
-    branch is reached with ``FLASHMASK_FA3_USE_CUTEDSL`` either way (FA4 is
-    cutedsl-only), so the two used to hold the same literal pairs twice.
 
     ``deterministic`` is not a parameter: no pair in this whitelist is
     deterministic-only. FA3 on cutedsl has an ordered-accumulation backward, and
@@ -129,16 +60,10 @@ def _dispatch_fa_version(
     Dispatch rules:
       * XPU device -> FA2.
       * Otherwise, respect ``FLAGS_flash_attn_version`` by default.
-      * If ``fa_version == 3`` and ``FLASHMASK_FA3_USE_CUTEDSL`` is off, FA3 runs
-        on the Paddle kernel, which only supports ``head_dim <= 128`` when
-        deterministic is required. For ``head_dim > 128``, fall back to FA2. On
-        the cutedsl backend FA3 needs no such degrade -- its backward has an
-        ordered-accumulation variant, so deterministic holds for every head dim
-        in the cutedsl whitelist below.
-      * FA3 and FA4 on cutedsl are used only for the head-dim pairs in
-        :func:`_cutedsl_hdim_ok`; every other pair degrades to FA2. That
-        whitelist does not narrow under ``FLAGS_cudnn_deterministic`` -- see the
-        note there.
+      * FA3 and FA4 both run on the cutedsl kernels. Without them
+        (``is_flash_mask_available()`` is False) both degrade to FA2, and so does
+        every head-dim pair outside :func:`_cutedsl_hdim_ok`. That whitelist does
+        not narrow under ``FLAGS_cudnn_deterministic`` -- see the note there.
 
     Args:
         head_dim: Query/Key head dim (always equal).
@@ -159,28 +84,12 @@ def _dispatch_fa_version(
         "FLAGS_flash_attn_version"
     ]
 
-    deterministic = paddle.get_flags(["FLAGS_cudnn_deterministic"])[
-        "FLAGS_cudnn_deterministic"
-    ]
-
-    if fa_version == 4 or (fa_version == 3 and FLASHMASK_FA3_USE_CUTEDSL):
+    if fa_version in (3, 4):
         if not is_flash_mask_available():
             return 2
-
-    _head_dim_v = head_dim_v if head_dim_v is not None else head_dim
-
-    if FLASHMASK_FA3_USE_CUTEDSL:
-        if fa_version in (3, 4):
-            if not _cutedsl_hdim_ok(fa_version, head_dim, _head_dim_v):
-                return 2
-    else:
-        if fa_version == 3:
-            if deterministic and head_dim > 128:
-                return 2
-
-        if fa_version == 4:
-            if not _cutedsl_hdim_ok(4, head_dim, _head_dim_v):
-                return 2
+        _head_dim_v = head_dim_v if head_dim_v is not None else head_dim
+        if not _cutedsl_hdim_ok(fa_version, head_dim, _head_dim_v):
+            return 2
 
     return fa_version
 
@@ -214,8 +123,7 @@ def get_fa_version(
 def uses_cutedsl_backend(fa_version: int) -> bool:
     """Whether ``fa_version`` runs on the cutedsl backend.
 
-    FA4 is cutedsl-only, FA3 depends on ``FLASHMASK_FA3_USE_CUTEDSL``, FA2 never
-    uses it.
+    FA3 and FA4 are cutedsl-only; FA2 runs on Paddle's built-in kernel.
 
     Args:
         fa_version: The version returned by :func:`get_fa_version`.
@@ -223,12 +131,7 @@ def uses_cutedsl_backend(fa_version: int) -> bool:
     Returns:
         ``True`` when the call site must use the cutedsl kernels.
     """
-    if fa_version == 3:
-        return FLASHMASK_FA3_USE_CUTEDSL
-    elif fa_version == 4:
-        return True
-    else:
-        return False
+    return fa_version in (3, 4)
 
 
 def needs_value_padding(
@@ -246,10 +149,8 @@ def needs_value_padding(
     Returns:
         ``True`` when ``value`` needs padding.
     """
-    fa3_native_pair = (
-        FLASHMASK_FA3_USE_CUTEDSL
-        and (fa_version == 3)
-        and (head_dim == 192 and head_dim_v == 128)
+    fa3_native_pair = (fa_version == 3) and (
+        head_dim == 192 and head_dim_v == 128
     )
     fa4_native_pair = (fa_version == 4) and (
         (head_dim == 192 and head_dim_v == 128)
@@ -275,7 +176,6 @@ def flashmask_attention(
     name: str | None = None,
     softmax_scale: float | None = None,
     block_mask: paddle.Tensor | None = None,
-    use_varlen: bool = False,
     learnable_sink: paddle.Tensor | None = None,
 ):
     bsz, q_len, num_heads, q_head_dim = query.shape
@@ -283,23 +183,16 @@ def flashmask_attention(
     fa_version = get_fa_version(q_head_dim, v_head_dim, startend_row_indices)
 
     if uses_cutedsl_backend(fa_version):
-        try:
-            from .flash_mask import (
-                flashmask_attention as _flashmask_attention,
-            )
-        except (ImportError, ModuleNotFoundError):
-            from .flash_mask.cute.interface import (
-                flashmask_attention as _flashmask_attention,
-            )
+        # The paddle frontend, not the top-level ``flashmask.flashmask_attention``:
+        # the latter dispatches on tensor type with a ``(*args, **kwargs)``
+        # signature, which would hide ``learnable_sink`` from the probe below.
+        from .flashmask.frontend.paddle import (
+            flashmask_attention as _flashmask_attention,
+        )
     else:
         from paddle.nn.functional.flash_attention import (
             flashmask_attention as _flashmask_attention,
         )
-
-    if use_varlen:
-        assert (
-            "use_varlen" in inspect.signature(_flashmask_attention).parameters
-        ), "The flash_mask installed does not support use_varlen"
 
     if learnable_sink is not None:
         if (
@@ -323,9 +216,6 @@ def flashmask_attention(
         value = paddle.concat([value, value_padding], axis=-1)
 
     extra_kwargs = {}
-    if use_varlen:
-        # use_varlen is no longer used and will be removed soon.
-        extra_kwargs["use_varlen"] = True
     if learnable_sink is not None:
         extra_kwargs["learnable_sink"] = learnable_sink
 
@@ -335,7 +225,11 @@ def flashmask_attention(
         query=query,
         key=key,
         value=value,
-        startend_row_indices=startend_row_indices.clone(),
+        startend_row_indices=(
+            startend_row_indices.clone()
+            if startend_row_indices is not None
+            else None
+        ),
         dropout=dropout,
         causal=causal,
         window_size=window_size,
@@ -387,20 +281,6 @@ def flash_attention(
     # startend_row_indices is None
     fa_version = get_fa_version(q_head_dim, v_head_dim)
 
-    if uses_cutedsl_backend(fa_version):
-        try:
-            from .flash_mask import (
-                flash_attention as _flash_attention,
-            )
-        except (ImportError, ModuleNotFoundError):
-            from .flash_mask.cute.interface import (
-                flash_attention as _flash_attention,
-            )
-    else:
-        from paddle.nn.functional.flash_attention import (
-            flash_attention as _flash_attention,
-        )
-
     need_value_padding = needs_value_padding(fa_version, q_head_dim, v_head_dim)
 
     if need_value_padding:
@@ -410,19 +290,48 @@ def flash_attention(
         )
         value = paddle.concat([value, value_padding], axis=-1)
 
-    attn_output, softmax_result = _flash_attention(
-        query=query,
-        key=key,
-        value=value,
-        dropout=dropout,
-        causal=causal,
-        return_softmax=return_softmax,
-        fixed_seed_offset=fixed_seed_offset,
-        rng_name=rng_name,
-        training=training,
-        name=name,
-        softmax_scale=softmax_scale,
-    )
+    if uses_cutedsl_backend(fa_version):
+        # flashmask has no mask-free entry point; without startend_row_indices
+        # its flashmask_attention is plain (causal) attention.
+        from .flashmask.frontend.paddle import (
+            flashmask_attention as _flashmask_attention,
+        )
+
+        if training and dropout != 0.0:
+            raise NotImplementedError(
+                f"flashmask does not support dropout, got dropout={dropout}"
+            )
+        if return_softmax:
+            raise NotImplementedError(
+                "flashmask does not return the softmax; pass return_softmax=False"
+            )
+        attn_output = _flashmask_attention(
+            query,
+            key,
+            value,
+            None,
+            causal=causal,
+            softmax_scale=softmax_scale,
+        )
+        softmax_result = None
+    else:
+        from paddle.nn.functional.flash_attention import (
+            flash_attention as _flash_attention,
+        )
+
+        attn_output, softmax_result = _flash_attention(
+            query=query,
+            key=key,
+            value=value,
+            dropout=dropout,
+            causal=causal,
+            return_softmax=return_softmax,
+            fixed_seed_offset=fixed_seed_offset,
+            rng_name=rng_name,
+            training=training,
+            name=name,
+            softmax_scale=softmax_scale,
+        )
 
     if need_value_padding:
         attn_output = attn_output[..., :v_head_dim]
@@ -433,11 +342,9 @@ def flash_attention(
 
 
 __all__ = [
-    "FA3_BACKEND_CHOICES",
     "flashmask_attention",
     "flash_attention",
     "get_fa_version",
     "needs_value_padding",
-    "set_fa3_backend",
     "uses_cutedsl_backend",
 ]

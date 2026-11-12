@@ -62,7 +62,7 @@ def merge_coverage_files(coverage_files):
         "ops/deep_ep",
         "ops/deep_gemm",
         "ops/quack",
-        "ops/flash_mask",
+        "ops/flashmask",
     ]
 
     for file_path in coverage_files:

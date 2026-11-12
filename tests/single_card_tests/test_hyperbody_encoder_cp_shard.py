@@ -155,13 +155,31 @@ class TestEncoderCpShardConfig(unittest.TestCase):
         self.assertTrue(view.hyperencoder_cp_shard)
         self.assertFalse(view.cp_replicated_sequence)
 
-    def test_rejects_flashmask_cp_overlap(self):
+    def test_flashmask_cp_overlap(self):
+        # Both spellings switch the encoder on: the mode suffix (stripped from the
+        # view) and the explicit flag. The pad never changes with overlap.
         for mode in _MODES:
-            with (
-                self.subTest(mode=mode),
-                self.assertRaises(NotImplementedError),
+            for top in (
+                {"cp_balance_mode": mode + "_overlap"},
+                {"cp_balance_mode": mode, "flashmask_cp_overlap": True},
             ):
-                _view(cp_balance_mode=mode, flashmask_cp_overlap=True)
+                with self.subTest(**top):
+                    view = _view(cp=4, **top)
+                    self.assertEqual(view.cp_balance_mode, mode)
+                    self.assertTrue(view.flashmask_cp_overlap)
+                    self.assertEqual(view.hyperencoder_seq_align, 128)
+        # A pad overlap cannot take is rejected, never widened: H_kv * D = 256
+        # asks 4 local rows, i.e. 4 * cp for the pad, on any number of nodes.
+        overlap = {"cp_balance_mode": "contiguous_allgather_overlap"}
+        with self.assertRaises(ValueError):
+            _view(cp=4, enc={"hyperencoder_seq_align": 24}, **overlap)
+        view = _view(cp=16, enc={"n_routed_experts": 16}, **overlap)
+        self.assertEqual(
+            view.hyperencoder_seq_align, 128
+        )  # 128 % (4 * 16) == 0
+        view = _view(cp=4, cp_balance_mode="contiguous_allgather_nonoverlap")
+        self.assertFalse(view.flashmask_cp_overlap)
+        self.assertEqual(view.hyperencoder_seq_align, 128)
         # CP=1 / shard off stay inert even with the decoder on overlap.
         view = _view(cp=1, flashmask_cp_overlap=True)
         self.assertFalse(view.hyperencoder_cp_shard)

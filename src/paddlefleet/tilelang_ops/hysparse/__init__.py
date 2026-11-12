@@ -34,7 +34,7 @@ from .swa_attn import sliding_window_mqa_attention
 def block_score_fa4_attn_fwd(*args, **kwargs):
     """Lazy wrapper for the FA4-fused block scorer.
 
-    ``block_score_fa4`` imports ``paddlefleet_ops.flash_mask.cute.*``, which is
+    ``block_score_fa4`` imports ``paddlefleet_ops.flashmask.cute.*``, which is
     only available on SM10/Blackwell (guarded by ``is_flash_mask_available()``).
     Importing it eagerly at package init would break ``from ... import
     sliding_window_mqa_attention`` / ``select_topk_blocks`` on non-Blackwell

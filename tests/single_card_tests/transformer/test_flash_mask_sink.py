@@ -28,11 +28,10 @@ Covers PR "Support FA4 sink." (ab8c450) on the non-CP paths:
 
 import math
 import unittest
-from unittest.mock import patch
 
 import numpy as np
 import paddle
-from paddlefleet_ops import flash_mask_facade, is_flash_mask_available
+from paddlefleet_ops import is_flash_mask_available
 
 _FA_VERSION_KEY = "FLAGS_flash_attn_version"
 _SAVED_FA_VERSION = None
@@ -192,7 +191,7 @@ class TestCuteFlashmaskSink(unittest.TestCase):
         causal,
         use_sink,
     ):
-        from paddlefleet_ops.flash_mask.cute.interface import (
+        from paddlefleet_ops.flashmask.cute.interface import (
             flashmask_attention,
         )
 
@@ -292,7 +291,7 @@ class TestCuteFlashmaskSink(unittest.TestCase):
         # (``ctx.needs_grad``) and honours it, so backward returns the 4-tuple
         # (dq, dk, dv, None) rather than an unconditional dsink: q/k/v get their
         # gradients and the frozen sink receives nothing.
-        from paddlefleet_ops.flash_mask.cute.interface import (
+        from paddlefleet_ops.flashmask.cute.interface import (
             flashmask_attention,
         )
 
@@ -336,7 +335,7 @@ class TestCuteFlashmaskSink(unittest.TestCase):
         # flash-attention 5007a05 ("fp16/fp32 sink") widened the bf16-only
         # assert to _LEARNABLE_SINK_DTYPES = (fp16, bf16, fp32); anything else
         # still raises.
-        from paddlefleet_ops.flash_mask.cute.interface import (
+        from paddlefleet_ops.flashmask.cute.interface import (
             flashmask_attention,
         )
 
@@ -475,7 +474,6 @@ def _make_config(
     # kernel requires bf16 sink, so params_dtype must be bf16.
     config.params_dtype = paddle.bfloat16
     config.perform_initialization = False
-    config.flashmask_use_varlen = False
     config.experimental_dataflow = False
     return config
 
@@ -609,7 +607,7 @@ class TestRefinedRecomputeFlashMaskSink(unittest.TestCase):
 
     def _run(self, causal, use_sink, sink_trainable=True):
         from paddle import framework
-        from paddlefleet_ops.flash_mask.cute.interface import (
+        from paddlefleet_ops.flashmask.cute.interface import (
             flashmask_attention,
         )
 
@@ -724,12 +722,10 @@ class TestRefinedRecomputeFlashMaskSink(unittest.TestCase):
     def test_rr_fixed_sink_no_grad(self):
         self._run(causal=True, use_sink=True, sink_trainable=False)
 
-    def test_rr_non_fa4_sink_raises(self):
-        # Sink lives in the cute kernels only, and on SM90 those serve FA3 too,
-        # so pinning FLAGS_flash_attn_version=3 no longer means "no sink" by
-        # itself -- the cpp kernel is what cannot serve it. Turn the hotfix
-        # switch off as well so FA3 resolves to the cpp backend, which is the
-        # case the rr entry point must reject.
+    def test_rr_fa2_sink_raises(self):
+        # Sink lives in the cute kernels only, which serve FA3 and FA4. FA2
+        # runs on Paddle's kernel, which has no sink, so the rr entry point
+        # must reject it.
         from paddlefleet.refined_recompute.flash_attn import (
             RefinedRcomputeFlashMaskAttention,
         )
@@ -744,14 +740,9 @@ class TestRefinedRecomputeFlashMaskSink(unittest.TestCase):
         old = paddle.get_flags(["FLAGS_flash_attn_version"])[
             "FLAGS_flash_attn_version"
         ]
-        paddle.set_flags({"FLAGS_flash_attn_version": 3})
+        paddle.set_flags({"FLAGS_flash_attn_version": 2})
         try:
-            with (
-                patch.object(
-                    flash_mask_facade, "FLASHMASK_FA3_USE_CUTEDSL", False
-                ),
-                self.assertRaises(NotImplementedError),
-            ):
+            with self.assertRaises(NotImplementedError):
                 rr_attn.forward(q, q, q, idx, learnable_sink=sink)
         finally:
             paddle.set_flags({"FLAGS_flash_attn_version": old})

@@ -96,6 +96,7 @@ from paddlefleet.transformer.moe.moe_router import TopKRouter
 from paddlefleet.transformer.multi_token_prediction import (
     MultiTokenPredictionLayer,
 )
+from paddlefleet.transformer.transformer_config import split_cp_overlap_suffix
 
 from ...nn.pp_model import GeneralModelForCausalLMPipe
 from ..model_utils import PretrainedModel
@@ -1805,7 +1806,9 @@ def _configure_encoder_cp(view, config):
         return
     from paddlefleet.models.hyperencoder.attn_backend import use_packed_decoder
 
-    mode = config.cp_balance_mode
+    mode, overlap = split_cp_overlap_suffix(config.cp_balance_mode)
+    if overlap is None:
+        overlap = getattr(config, "flashmask_cp_overlap", False)
     # Runtime switches may be setattr'd after __init__, so re-check here.
     if not use_packed_decoder(view):
         raise ValueError(
@@ -1827,17 +1830,21 @@ def _configure_encoder_cp(view, config):
             "hyperencoder_cp_shard needs moe_router_load_balancing_type="
             f"'seq_aux_loss', got {view.moe_router_load_balancing_type!r}."
         )
-    # The overlapped FlashMask CP kernel only takes a local length in
-    # {4096, ..., 131072}, while the packed encoder length varies per batch
-    # (padded to seq_align only), and its CP math was not checked here.
-    if getattr(config, "flashmask_cp_overlap", False):
-        raise NotImplementedError(
-            "hyperencoder_cp_shard with flashmask_cp_overlap=True."
-        )
     view.cp_balance_mode = mode
-    view.flashmask_cp_overlap = False
+    view.flashmask_cp_overlap = overlap
     # The scatter cuts 2*cp chunks; FlashMask CP also needs an even local length.
     view.hyperencoder_seq_align = math.lcm(view.hyperencoder_seq_align, 2 * cp)
+    if overlap:
+        # FlashMask overlap takes S_local % 4 == 0 and S_local * H_kv * D % 512 == 0.
+        # Overlap must not pad further: the pad rows reach the seq-aux router loss,
+        # so the pad must already fit.
+        kv = view.num_key_value_heads * view.head_dim
+        align = cp * math.lcm(4, 512 // math.gcd(512, kv))
+        if view.hyperencoder_seq_align % align:
+            raise ValueError(
+                "flashmask_cp_overlap needs hyperencoder_seq_align to be a "
+                f"multiple of {align}, got {view.hyperencoder_seq_align}."
+            )
 
 
 def _instantiate_layer_mapping(mapping, model_prefix, checkpoint_prefix):

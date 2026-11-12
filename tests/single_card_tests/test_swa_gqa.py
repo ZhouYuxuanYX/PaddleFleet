@@ -2326,7 +2326,6 @@ class TestDotProductAttentionFlashMaskSWA(unittest.TestCase):
         config.add_swa_attention_sink_bias = False
         config.head_wise_swa_ratio = 0.0
         config._attn_implementation = "flash"
-        config.flashmask_use_varlen = False
 
         attn = DotProductAttention(
             config=config,

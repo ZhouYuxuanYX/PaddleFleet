@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
 import logging
 import queue
 
@@ -20,7 +19,6 @@ import paddle
 from paddle import _C_ops, framework
 from paddle.autograd import PyLayer
 from paddle.distributed import fleet
-from paddle.nn.functional.flash_attention import flashmask_attention
 from paddlefleet_ops import is_flash_mask_available
 from paddlefleet_ops.flash_mask_facade import (
     get_fa_version,
@@ -40,10 +38,10 @@ from paddlefleet.context_parallel_utils import (
 from paddlefleet.refined_recompute.queue_check import global_rr_queue_log
 
 if is_flash_mask_available():
-    from paddlefleet_ops.flash_mask.cute.flashmask_utils import (
+    from paddlefleet_ops.flashmask.cute.flashmask_utils import (
         FlashMaskInfoPaddle,
     )
-    from paddlefleet_ops.flash_mask.cute.interface import (
+    from paddlefleet_ops.flashmask.cute.interface import (
         _flash_attn_bwd,
         _flash_attn_fwd,
     )
@@ -126,13 +124,6 @@ class FlashAttnFunctor(PyLayer):
                 dropout,
                 causal,
             )
-        elif not uses_cutedsl_backend(fa_version):
-            result_attention = hold_tensors["result_attention"]
-            softmax_lse = hold_tensors["softmax_lse"]
-            causal = hold_tensors["causal"]
-            ctx.save_for_backward(
-                q, k, v, result_attention, softmax_lse, causal
-            )
         else:
             result_attention = hold_tensors["result_attention"]
             softmax_lse = hold_tensors["softmax_lse"]
@@ -186,24 +177,6 @@ class FlashAttnFunctor(PyLayer):
                 causal,
             )
             seed_offset._clear_dataptr()
-        elif not uses_cutedsl_backend(fa_version):
-            q, k, v, result_attention, softmax_lse, causal = ctx.saved_tensor()
-            q_grad, k_grad, v_grad = _C_ops.flash_attn_v3_grad(
-                q.detach(),
-                k.detach(),
-                v.detach(),
-                result_attention,
-                softmax_lse,
-                grad,
-                q.shape[-1] ** (-0.5)
-                if ctx.softmax_scale is None
-                else ctx.softmax_scale,  # softmax_scale
-                causal,
-                -1,  # window_size_left
-                -1,  # window_size_right
-                0.0,  # softcap
-                0,  # sm_margin
-            )
         else:
             flashmask_info = None
             q, k, v, result_attention, softmax_lse, causal = ctx.saved_tensor()
@@ -335,34 +308,6 @@ class RefinedRcomputeFlashAttention:
                 "dropout": dropout,
                 "causal": causal,
             }
-        elif not uses_cutedsl_backend(fa_version):
-            (result_attention, softmax_lse) = _C_ops.flash_attn_v3(
-                query_states,
-                key_states,
-                value_states,
-                None,
-                None,
-                None,
-                None,
-                query_states.shape[-1] ** (-0.5)
-                if softmax_scale is None
-                else softmax_scale,
-                causal,
-                -1,
-                -1,
-                0.0,
-                1,
-                False,
-                False,
-                0,
-            )
-            hold_tensors = {
-                "result_attention": result_attention,
-                "softmax_lse": softmax_lse,
-                "causal": causal,
-                "softmax_scale": softmax_scale,
-            }
-            result_softmax = None  # FA v3 does not return softmax.
         else:
             (result_attention, softmax_lse) = _flash_attn_fwd(
                 query_states,
@@ -452,19 +397,6 @@ class FlashMaskAttnFunctor(PyLayer):
                 dropout,
                 causal,
             )
-        elif not uses_cutedsl_backend(fa_version):
-            result_attention = hold_tensors["result_attention"]
-            softmax_lse = hold_tensors["softmax_lse"]
-            causal = hold_tensors["causal"]
-            ctx.save_for_backward(
-                q,
-                k,
-                v,
-                startend_row_indices,
-                result_attention,
-                softmax_lse,
-                causal,
-            )
         else:
             result_attention = hold_tensors["result_attention"]
             softmax_lse = hold_tensors["softmax_lse"]
@@ -516,65 +448,6 @@ class FlashMaskAttnFunctor(PyLayer):
                 causal,
             )
             seed_offset._clear_dataptr()
-        elif not uses_cutedsl_backend(fa_version):
-            (
-                q,
-                k,
-                v,
-                startend_row_indices,
-                result_attention,
-                softmax_lse,
-                causal,
-            ) = ctx.saved_tensor()
-
-            sig_params = inspect.signature(flashmask_attention).parameters
-
-            softmax_scale = (
-                q.shape[-1] ** (-0.5)
-                if ctx.softmax_scale is None
-                else ctx.softmax_scale
-            )
-
-            if "group" in sig_params:
-                q_grad, k_grad, v_grad = _C_ops.flashmask_attention_v2_grad(
-                    q.detach(),
-                    k.detach(),
-                    v.detach(),
-                    result_attention,
-                    softmax_lse,
-                    startend_row_indices,
-                    None,  # block_mask
-                    grad,
-                    softmax_scale,
-                    causal,
-                    0,  # rank
-                    1,  # nranks
-                )
-            elif "block_mask" in sig_params:
-                q_grad, k_grad, v_grad = _C_ops.flashmask_attention_v2_grad(
-                    q.detach(),
-                    k.detach(),
-                    v.detach(),
-                    result_attention,
-                    softmax_lse,
-                    startend_row_indices,
-                    None,  # block_mask
-                    grad,
-                    softmax_scale,
-                    causal,
-                )
-            else:
-                q_grad, k_grad, v_grad = _C_ops.flashmask_attention_v2_grad(
-                    q.detach(),
-                    k.detach(),
-                    v.detach(),
-                    result_attention,
-                    softmax_lse,
-                    startend_row_indices,
-                    grad,
-                    softmax_scale,
-                    causal,
-                )
         else:
             (
                 q,
@@ -744,51 +617,6 @@ class RefinedRcomputeFlashMaskAttention:
                 "result_softmax": result_softmax,
                 "dropout": dropout,
                 "causal": causal,
-            }
-        elif not uses_cutedsl_backend(fa_version):
-            sig_params = inspect.signature(flashmask_attention).parameters
-            scale = (
-                query_states.shape[-1] ** (-0.5)
-                if softmax_scale is None
-                else softmax_scale
-            )
-            if "group" in sig_params:
-                (result_attention, softmax_lse) = _C_ops.flashmask_attention_v2(
-                    query_states,
-                    key_states,
-                    value_states,
-                    startend_row_indices,
-                    None,  # block_mask
-                    None,  # nvshmem unique id
-                    scale,
-                    causal,
-                    0,  # rank
-                    1,  # nranks
-                )
-            elif "block_mask" in sig_params:
-                (result_attention, softmax_lse) = _C_ops.flashmask_attention_v2(
-                    query_states,
-                    key_states,
-                    value_states,
-                    startend_row_indices,
-                    None,  # block_mask
-                    scale,
-                    causal,
-                )
-            else:
-                (result_attention, softmax_lse) = _C_ops.flashmask_attention_v2(
-                    query_states,
-                    key_states,
-                    value_states,
-                    startend_row_indices,
-                    scale,
-                    causal,
-                )
-            hold_tensors = {
-                "result_attention": result_attention,
-                "softmax_lse": softmax_lse,
-                "causal": causal,
-                "softmax_scale": softmax_scale,
             }
         else:
             (result_attention, softmax_lse) = _flash_attn_fwd(
@@ -1035,53 +863,6 @@ class FlashMaskUlyssesCpFunctor(PyLayer):
                 causal,
             )
             seed_offset._clear_dataptr()
-        elif not uses_cutedsl_backend(ctx.fa_version):
-            sig_params = inspect.signature(flashmask_attention).parameters
-            scale = (
-                q.shape[-1] ** (-0.5)
-                if ctx.softmax_scale is None
-                else ctx.softmax_scale
-            )
-            if "group" in sig_params:
-                q_grad, k_grad, v_grad = _C_ops.flashmask_attention_v2_grad(
-                    q.detach(),
-                    k.detach(),
-                    v.detach(),
-                    result_attention,
-                    softmax_lse,
-                    startend_row_indices,
-                    None,
-                    local_grad,
-                    scale,
-                    causal,
-                    0,
-                    1,
-                )
-            elif "block_mask" in sig_params:
-                q_grad, k_grad, v_grad = _C_ops.flashmask_attention_v2_grad(
-                    q.detach(),
-                    k.detach(),
-                    v.detach(),
-                    result_attention,
-                    softmax_lse,
-                    startend_row_indices,
-                    None,
-                    local_grad,
-                    scale,
-                    causal,
-                )
-            else:
-                q_grad, k_grad, v_grad = _C_ops.flashmask_attention_v2_grad(
-                    q.detach(),
-                    k.detach(),
-                    v.detach(),
-                    result_attention,
-                    softmax_lse,
-                    startend_row_indices,
-                    local_grad,
-                    scale,
-                    causal,
-                )
         else:
             if startend_row_indices is not None:
                 flashmask_info = FlashMaskInfoPaddle(
@@ -1287,51 +1068,6 @@ def ulysses_local_flashmask_first_fwd(
             "result_softmax": result_softmax,
             "dropout": 0.0,
             "causal": causal,
-        }
-    elif not uses_cutedsl_backend(fa_version):
-        sig_params = inspect.signature(flashmask_attention).parameters
-        scale = (
-            query_states.shape[-1] ** (-0.5)
-            if softmax_scale is None
-            else softmax_scale
-        )
-        if "group" in sig_params:
-            result_attention, softmax_lse = _C_ops.flashmask_attention_v2(
-                query_states,
-                key_states,
-                value_states,
-                startend_row_indices,
-                None,
-                None,
-                scale,
-                causal,
-                0,
-                1,
-            )
-        elif "block_mask" in sig_params:
-            result_attention, softmax_lse = _C_ops.flashmask_attention_v2(
-                query_states,
-                key_states,
-                value_states,
-                startend_row_indices,
-                None,
-                scale,
-                causal,
-            )
-        else:
-            result_attention, softmax_lse = _C_ops.flashmask_attention_v2(
-                query_states,
-                key_states,
-                value_states,
-                startend_row_indices,
-                scale,
-                causal,
-            )
-        hold_tensors = {
-            "result_attention": result_attention,
-            "softmax_lse": softmax_lse,
-            "causal": causal,
-            "softmax_scale": softmax_scale,
         }
     else:
         result_attention, softmax_lse = _flash_attn_fwd(

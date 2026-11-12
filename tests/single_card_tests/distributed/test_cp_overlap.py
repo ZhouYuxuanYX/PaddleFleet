@@ -14,36 +14,33 @@
 
 """Behavior tests for ``paddlefleet.overlap_context_parallel``.
 
-The overlapped FlashMask context-parallel layer builds the gathered-KV mask
-order and enforces the topology restrictions that the FA-4 in-kernel all-gather
-assumes. Those pieces are ordinary CPU logic and are what these tests exercise
-with independently hand-derived expectations:
+The overlapped FlashMask context-parallel layer rebases the mask rows onto the
+local queries and lays the mask key axis out in group-rank shard order, which
+FlashMask then maps onto its own communication order. Those pieces are ordinary
+CPU logic and are what these tests exercise with independently derived
+expectations:
 
-  - ``traversal_rank``: the owner rank visited at each traversal position, for
-    both the circular (single-node) and the hierarchical (multi-node) schedule;
-  - ``block_order``: the natural-block permutation that folds the balance layout
-    and the traversal into one index, checked against a from-scratch oracle
-    built out of the documented block pairing;
+  - ``block_order``: the DualChunkSwap block permutation into shard order;
   - ``gathered_kv_order``: the mask permutation itself, against a slice-and-
-    concat oracle over per-block distinguishable content;
+    concat oracle, and with ``localize_mask`` against dense visibility;
   - ``localize_mask``: mode routing, the exact chunk ids it derives, and its
     rejection of unsupported modes;
-  - ``_require_contiguous_cp_ranks`` / ``_require_eight_gpu_node``: the topology
-    guards;
   - ``overlap_flashmask_attention_cp``: the feature-rejection guards that run
     before the kernel is ever reached.
 
 The FA-4 kernel and the CP process group are NOT exercised here; their real
-numerics need an SM100 device plus a paddlefleet_ops build with the overlap
-interface, and are out of scope for a CPU single-card test. Importing the module
-still requires paddle, so every test honestly skips when paddle is absent rather
-than reporting a false pass.
+numerics need an SM100 device plus a FlashMask-built paddlefleet_ops and are
+covered by ``multi_card_tests/transformer/test_flash_mask_cp_overlap.py``.
+Importing the module still requires paddle, so every test honestly skips when
+paddle is absent rather than reporting a false pass.
 """
 
 import os
 import sys
 import unittest
 from unittest import mock
+
+import numpy as np
 
 # Test the in-tree dev version: src/ ahead of any installed package.
 _PROJECT_ROOT = os.path.dirname(
@@ -78,60 +75,39 @@ CONTIGUOUS = "contiguous_allgather_overlap"
 class _Group:
     """Minimal CP-group stand-in; the layer reads only these attributes."""
 
-    def __init__(self, rank=0, world_size=1, ranks=None):
+    def __init__(self, rank=0, world_size=1):
         self.rank = rank
         self.world_size = world_size
-        if ranks is not None:
-            self.ranks = ranks
 
 
-def independent_traversal(rank, cp_size, gpus_per_node):
-    """Owner rank visited at each traversal position, derived from the docstring.
-
-    This is a from-scratch reconstruction, deliberately NOT the module's divmod
-    arithmetic: circular is "start local, step forward one rank at a time"; the
-    hierarchical schedule walks the local congruence group first (same intra-node
-    slot, successive nodes), then each further intra-node slot the same way.
-    """
-    if gpus_per_node == 0:
-        return [(rank + pos) % cp_size for pos in range(cp_size)]
-    num_nodes = cp_size // gpus_per_node
-    my_slot = rank % gpus_per_node
-    my_node = rank // gpus_per_node
+def independent_block_order(cp_size):
+    """Natural blocks in group-rank shard order: rank r owns ``(r, 2*cp-1-r)``."""
     order = []
-    for slot_step in range(gpus_per_node):
-        slot = (my_slot + slot_step) % gpus_per_node
-        for node_step in range(num_nodes):
-            node = (my_node + node_step) % num_nodes
-            order.append(slot + node * gpus_per_node)
+    for owner in range(cp_size):
+        order += [owner, 2 * cp_size - 1 - owner]
     return order
 
 
-def independent_block_order(cp_size, rank, backward, mode):
-    """Expected natural-block permutation, built independently of the module.
+def owned_rows(rank, cp_size, s_total, mode):
+    """Global sequence positions rank ``rank`` holds, in its local order."""
+    if mode == CONTIGUOUS:
+        s_local = s_total // cp_size
+        return np.arange(rank * s_local, (rank + 1) * s_local)
+    block = s_total // (2 * cp_size)
+    mirror = 2 * cp_size - 1 - rank
+    return np.concatenate(
+        [
+            np.arange(rank * block, (rank + 1) * block),
+            np.arange(mirror * block, (mirror + 1) * block),
+        ]
+    )
 
-    Traversal direction: backward starts on the local chunk (position 0);
-    forward leaves the local chunk last (circular rotated by one, hierarchical
-    reversed). Block pairing per owner comes from the documented balance layout:
-    DualChunkSwap owns the mirrored pair ``(r, 2*cp-1-r)``, contiguous owns the
-    adjacent pair ``(2r, 2r+1)``.
-    """
-    gpus_per_node = 8 if cp_size > 8 else 0
-    traversal = independent_traversal(rank, cp_size, gpus_per_node)
-    if backward:
-        positions = list(range(cp_size))
-    elif gpus_per_node:
-        positions = list(range(cp_size - 1, -1, -1))
-    else:
-        positions = [*list(range(1, cp_size)), 0]
-    order = []
-    for pos in positions:
-        owner = traversal[pos]
-        if mode == CONTIGUOUS:
-            order += [2 * owner, 2 * owner + 1]
-        else:
-            order += [owner, 2 * cp_size - 1 - owner]
-    return order
+
+def visible(lt_start, ut_end, rows):
+    """2-col non-causal FlashMask: row i sees key j iff ut_end[j] <= i < lt_start[j]."""
+    return (rows[:, None] >= ut_end[None, :]) & (
+        rows[:, None] < lt_start[None, :]
+    )
 
 
 def make_block_labeled_mask(cp_size, block_len=3, num_vecs=2):
@@ -160,180 +136,99 @@ def slice_concat_oracle(mask, order, block_len):
 
 
 @unittest.skipUnless(_HAS_DEPS, _SKIP_REASON)
-class TestTraversalRankCircular(unittest.TestCase):
-    """Single-node schedule: visit the local rank, then step forward circularly."""
-
-    def test_hand_enumerated_orders(self):
-        # Fully hand-listed expected sequences, no formula reuse.
-        cases = {
-            (4, 0): [0, 1, 2, 3],
-            (4, 1): [1, 2, 3, 0],
-            (4, 3): [3, 0, 1, 2],
-            (8, 5): [5, 6, 7, 0, 1, 2, 3, 4],
-        }
-        for (cp_size, rank), expected in cases.items():
-            got = [
-                ocp.traversal_rank(pos, rank, cp_size, 0)
-                for pos in range(cp_size)
-            ]
-            self.assertEqual(got, expected, f"cp_size={cp_size} rank={rank}")
-
-    def test_is_a_permutation_starting_at_local(self):
-        for cp_size in (1, 2, 4, 8):
-            for rank in range(cp_size):
-                visited = [
-                    ocp.traversal_rank(pos, rank, cp_size, 0)
-                    for pos in range(cp_size)
-                ]
-                self.assertEqual(visited[0], rank)
-                self.assertEqual(sorted(visited), list(range(cp_size)))
-
-
-@unittest.skipUnless(_HAS_DEPS, _SKIP_REASON)
-class TestTraversalRankHierarchical(unittest.TestCase):
-    """Multi-node schedule fixed to 8-GPU nodes (engages when cp_size > 8)."""
-
-    CP_SIZE = 16
-    GPN = 8
-
-    def test_hand_enumerated_orders(self):
-        # Worked out by hand from the documented schedule, not the module math.
-        expected_by_rank = {
-            0: [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15],
-            3: [3, 11, 4, 12, 5, 13, 6, 14, 7, 15, 0, 8, 1, 9, 2, 10],
-        }
-        for rank, expected in expected_by_rank.items():
-            got = [
-                ocp.traversal_rank(pos, rank, self.CP_SIZE, self.GPN)
-                for pos in range(self.CP_SIZE)
-            ]
-            self.assertEqual(got, expected, f"rank={rank}")
-
-    def test_matches_independent_schedule_for_every_rank(self):
-        for rank in range(self.CP_SIZE):
-            got = [
-                ocp.traversal_rank(pos, rank, self.CP_SIZE, self.GPN)
-                for pos in range(self.CP_SIZE)
-            ]
-            self.assertEqual(
-                got, independent_traversal(rank, self.CP_SIZE, self.GPN)
-            )
-
-    def test_congruence_group_visited_first(self):
-        num_nodes = self.CP_SIZE // self.GPN
-        for rank in range(self.CP_SIZE):
-            head = [
-                ocp.traversal_rank(pos, rank, self.CP_SIZE, self.GPN)
-                for pos in range(num_nodes)
-            ]
-            # Same intra-node slot, one distinct peer per node.
-            self.assertEqual(
-                {peer % self.GPN for peer in head}, {rank % self.GPN}
-            )
-            self.assertEqual(len(set(head)), num_nodes)
-
-
-@unittest.skipUnless(_HAS_DEPS, _SKIP_REASON)
 class TestBlockOrder(unittest.TestCase):
-    """The natural-block permutation folding balance layout and traversal."""
+    """The DualChunkSwap natural-block permutation into shard order."""
 
     def setUp(self):
-        # block_order caches per key in a module global; isolate every test.
+        # block_order caches per cp_size in a module global; isolate every test.
         ocp.BLOCK_ORDER_CACHE.clear()
         self.addCleanup(ocp.BLOCK_ORDER_CACHE.clear)
 
     def test_hand_enumerated_small_cases(self):
-        # Derived by hand from the pairing + traversal, listed explicitly.
         cases = {
-            (2, 0, True, DUALCHUNK): [0, 3, 1, 2],
-            (2, 0, False, DUALCHUNK): [1, 2, 0, 3],
-            (2, 0, True, CONTIGUOUS): [0, 1, 2, 3],
-            (2, 0, False, CONTIGUOUS): [2, 3, 0, 1],
+            1: [0, 1],
+            2: [0, 3, 1, 2],
+            4: [0, 7, 1, 6, 2, 5, 3, 4],
         }
-        for (cp_size, rank, backward, mode), expected in cases.items():
-            got = ocp.block_order(cp_size, rank, backward, mode).tolist()
-            self.assertEqual(
-                got, expected, f"{cp_size} {rank} {backward} {mode}"
-            )
+        for cp_size, expected in cases.items():
+            self.assertEqual(ocp.block_order(cp_size).tolist(), expected)
 
     def test_matches_independent_oracle(self):
-        for mode in (DUALCHUNK, CONTIGUOUS):
-            for cp_size in (1, 2, 4, 8, 16):
-                for rank in range(cp_size):
-                    for backward in (False, True):
-                        got = ocp.block_order(
-                            cp_size, rank, backward, mode
-                        ).tolist()
-                        self.assertEqual(
-                            got,
-                            independent_block_order(
-                                cp_size, rank, backward, mode
-                            ),
-                            f"{mode} cp={cp_size} rank={rank} bwd={backward}",
-                        )
+        for cp_size in (1, 2, 4, 8, 16, 64):
+            self.assertEqual(
+                ocp.block_order(cp_size).tolist(),
+                independent_block_order(cp_size),
+            )
 
-    def test_backward_starts_local_forward_ends_local(self):
-        cp_size, rank = 4, 1
-        local_pair = [rank, 2 * cp_size - 1 - rank]  # DualChunk local blocks
-        backward = ocp.block_order(cp_size, rank, True, DUALCHUNK).tolist()
-        forward = ocp.block_order(cp_size, rank, False, DUALCHUNK).tolist()
-        self.assertEqual(backward[:2], local_pair)
-        self.assertEqual(forward[-2:], local_pair)
-        self.assertNotEqual(backward, forward)
-
-    def test_cached_per_key(self):
-        first = ocp.block_order(4, 1, False, DUALCHUNK)
-        self.assertIs(first, ocp.block_order(4, 1, False, DUALCHUNK))
-        for key in (
-            (4, 2, False, DUALCHUNK),
-            (4, 1, True, DUALCHUNK),
-            (4, 1, False, CONTIGUOUS),
-        ):
-            self.assertIsNot(first, ocp.block_order(*key))
+    def test_cached_per_cp_size(self):
+        first = ocp.block_order(4)
+        self.assertIs(first, ocp.block_order(4))
+        self.assertIsNot(first, ocp.block_order(8))
 
 
 @unittest.skipUnless(_HAS_DEPS, _SKIP_REASON)
 class TestGatheredKvOrder(unittest.TestCase):
-    """The mask key-axis permutation, against a slice-and-concat oracle."""
+    """The mask key-axis permutation, against slice-and-concat and dense oracles."""
 
     def setUp(self):
         ocp.BLOCK_ORDER_CACHE.clear()
         self.addCleanup(ocp.BLOCK_ORDER_CACHE.clear)
 
-    def _check(self, cp_size, rank, backward, mode):
-        mask, block_len = make_block_labeled_mask(cp_size)
-        group = _Group(rank=rank, world_size=cp_size)
-        got = ocp.gathered_kv_order(mask, group, backward, mode)
-        order = independent_block_order(cp_size, rank, backward, mode)
-        expected = slice_concat_oracle(mask, order, block_len)
-        self.assertEqual(list(got.shape), list(mask.shape))
-        self.assertTrue(
-            bool((got == expected).all()),
-            f"{mode} cp={cp_size} rank={rank} bwd={backward}\n"
-            f"got={got.numpy()[0, 0, :, 0].tolist()}\n"
-            f"exp={expected.numpy()[0, 0, :, 0].tolist()}",
-        )
-
     def test_dualchunk_matches_oracle(self):
         for cp_size in (1, 2, 4):
+            mask, block_len = make_block_labeled_mask(cp_size)
             for rank in range(cp_size):
-                for backward in (False, True):
-                    self._check(cp_size, rank, backward, DUALCHUNK)
+                got = ocp.gathered_kv_order(
+                    mask, _Group(rank=rank, world_size=cp_size), DUALCHUNK
+                )
+                expected = slice_concat_oracle(
+                    mask, independent_block_order(cp_size), block_len
+                )
+                self.assertTrue(
+                    bool((got == expected).all()), f"cp={cp_size} rank={rank}"
+                )
 
-    def test_contiguous_matches_oracle(self):
-        for cp_size in (1, 2, 4):
-            for rank in range(cp_size):
-                for backward in (False, True):
-                    self._check(cp_size, rank, backward, CONTIGUOUS)
+    def test_contiguous_is_already_in_shard_order(self):
+        mask, _ = make_block_labeled_mask(4)
+        self.assertIs(
+            ocp.gathered_kv_order(
+                mask, _Group(rank=1, world_size=4), CONTIGUOUS
+            ),
+            mask,
+        )
 
-    def test_second_vector_channel_travels_with_its_block(self):
-        # vec 1 carries block+1000; a vec-axis scramble would break this.
-        mask, block_len = make_block_labeled_mask(2)
-        group = _Group(rank=0, world_size=2)
-        got = ocp.gathered_kv_order(mask, group, True, DUALCHUNK)
-        first_block = got[0, 0, :block_len, :].numpy()
-        # Backward local block for rank 0 is natural block 0 -> values [0, 1000].
-        self.assertEqual(first_block[0].tolist(), [0, 1000])
+    def test_local_rows_see_the_global_keys(self):
+        # localize_mask + gathered_kv_order end to end: local row i sees mask key
+        # j exactly when its global row sees the key held at shard position j.
+        rng = np.random.default_rng(0)
+        s_local = 12
+        for mode in (DUALCHUNK, CONTIGUOUS):
+            for cp_size in (2, 4, 8):
+                s_total = s_local * cp_size
+                ut_end = rng.integers(0, s_total + 1, size=s_total)
+                lt_start = np.minimum(
+                    ut_end + rng.integers(0, s_total + 1, size=s_total), s_total
+                )
+                glob = paddle.to_tensor(
+                    np.stack([lt_start, ut_end], -1)[None, None].astype("int32")
+                )
+                owned = [
+                    owned_rows(r, cp_size, s_total, mode)
+                    for r in range(cp_size)
+                ]
+                keys = np.concatenate(owned)
+                for rank in range(cp_size):
+                    group = _Group(rank=rank, world_size=cp_size)
+                    local = ocp.gathered_kv_order(
+                        ocp.localize_mask(glob, s_local, group, mode),
+                        group,
+                        mode,
+                    ).numpy()[0, 0]
+                    np.testing.assert_array_equal(
+                        visible(local[:, 0], local[:, 1], np.arange(s_local)),
+                        visible(lt_start[keys], ut_end[keys], owned[rank]),
+                        err_msg=f"{mode} cp={cp_size} rank={rank}",
+                    )
 
 
 @unittest.skipUnless(_HAS_DEPS, _SKIP_REASON)
@@ -384,50 +279,6 @@ class TestLocalizeMask(unittest.TestCase):
 
 
 @unittest.skipUnless(_HAS_DEPS, _SKIP_REASON)
-class TestTopologyGuards(unittest.TestCase):
-    """The contiguous-rank and 8-GPU-node restrictions the backend assumes."""
-
-    def test_single_node_skips_contiguity_check(self):
-        # cp_size <= 8 is circular, so strided ranks are irrelevant and allowed.
-        ocp._require_contiguous_cp_ranks(
-            _Group(world_size=8, ranks=list(range(0, 16, 2)))
-        )
-
-    def test_contiguous_multinode_ranks_pass(self):
-        ocp._require_contiguous_cp_ranks(
-            _Group(world_size=16, ranks=list(range(16)))
-        )
-        ocp._require_contiguous_cp_ranks(
-            _Group(world_size=16, ranks=list(range(8, 24)))
-        )
-
-    def test_strided_multinode_ranks_rejected(self):
-        with self.assertRaises(ValueError):
-            ocp._require_contiguous_cp_ranks(
-                _Group(world_size=16, ranks=list(range(0, 32, 2)))
-            )
-
-    def _run_node_guard(self, cp_size, env):
-        with mock.patch.dict(os.environ, env, clear=True):
-            ocp._require_eight_gpu_node(cp_size)
-
-    def test_eight_gpu_node_always_passes(self):
-        self._run_node_guard(16, {"PADDLE_LOCAL_SIZE": "8"})
-
-    def test_single_node_passes_on_any_size(self):
-        self._run_node_guard(4, {"PADDLE_LOCAL_SIZE": "4"})
-
-    def test_no_topology_signal_is_not_rejected(self):
-        self._run_node_guard(16, {})
-
-    def test_multinode_non_eight_is_rejected(self):
-        with self.assertRaises(ValueError):
-            self._run_node_guard(8, {"PADDLE_LOCAL_SIZE": "4"})
-        with self.assertRaises(ValueError):
-            self._run_node_guard(16, {"PADDLE_LOCAL_SIZE": "4"})
-
-
-@unittest.skipUnless(_HAS_DEPS, _SKIP_REASON)
 class TestOverlapEntryGuards(unittest.TestCase):
     """Feature-rejection guards that run before the FA-4 kernel is reached.
 
@@ -447,7 +298,7 @@ class TestOverlapEntryGuards(unittest.TestCase):
 
     def test_requires_capable_build(self):
         with mock.patch.object(ocp, "OVERLAP_SUPPORTED", False):  # noqa: SIM117
-            with self.assertRaises(AssertionError):
+            with self.assertRaises(RuntimeError):
                 self._call()
 
     def test_dropout_not_implemented(self):

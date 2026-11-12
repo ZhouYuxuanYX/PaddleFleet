@@ -61,10 +61,10 @@ try:
         paddle.cuda.is_available()
         and paddle.cuda.get_device_capability()[0] == 10
     ):
-        from paddlefleet_ops.flash_mask.cute.interface import (
+        from paddlefleet_ops.flashmask.cute.interface import (
             _flash_attn_bwd as _flash_attn_v4_bwd,
         )
-        from paddlefleet_ops.flash_mask.cute.interface import (
+        from paddlefleet_ops.flashmask.cute.interface import (
             _flash_attn_fwd as _flash_attn_v4_fwd,
         )
 

@@ -793,30 +793,6 @@ def _fa4_can_serve():
 
 
 @contextlib.contextmanager
-def cpp_flashmask_backend():
-    """Route FA3 FlashMask to Paddle's cpp kernel for the duration of the block.
-
-    ``FLASHMASK_FA3_USE_CUTEDSL`` is the routing flag, set from
-    ``TransformerConfig.flash_attn_fa3_backend="cpp"`` in production.
-    ``uses_cutedsl_backend`` reads
-    it on every call and ``PyLayer.backward`` reads it independently of the
-    forward, so a forward and its backward must both run inside this context --
-    leaving the block before ``.backward()`` would pair a cpp forward with a
-    cutedsl backward.
-
-    Patching the module global is the only reliable handle: several call sites do
-    ``from ... import uses_cutedsl_backend``, so patching that function on the
-    facade would not reach their already-bound references.
-    """
-    from unittest.mock import patch
-
-    from paddlefleet_ops import flash_mask_facade
-
-    with patch.object(flash_mask_facade, "FLASHMASK_FA3_USE_CUTEDSL", False):
-        yield
-
-
-@contextlib.contextmanager
 def _fa4_pin():
     """FA4's *whole* flag pair where FA4 can serve, a no-op where it cannot.
 

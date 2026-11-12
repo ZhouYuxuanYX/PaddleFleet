@@ -825,10 +825,10 @@ class TestMQAEquivalence(unittest.TestCase):
         seqlen, layout = 256, [40, 88, 128]
         sink = np.linspace(1.0, 3.0, H)
         module = _build_module(_create_mqa_config("mqa"), bf16=True, sink=sink)
-        # The dense FA4 backend takes the sink as ``learnable_sink`` and asserts
-        # bf16 on it (``flash_mask/cute/interface.py:598``), which is what
-        # ``build_softmax_offset``'s ``params_dtype`` gives in production. An
-        # fp32 sink here would be testing a configuration the phase cannot run.
+        # The dense FA4 backend takes the sink as ``learnable_sink`` (dtype
+        # checked in ``_flash_attn_fwd``, ``flashmask/cute/ops/fwd.py``). bf16
+        # is what ``build_softmax_offset``'s ``params_dtype`` gives in
+        # production, so that is the configuration tested here.
         self.assertEqual(module.softmax_offset.dtype, paddle.bfloat16)
         self.assertEqual(list(module.softmax_offset.shape), [H])
         query, key, w_v = _make_inputs(seqlen)

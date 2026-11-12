@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import logging
 import math
-from functools import partial
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -441,15 +440,8 @@ class DotProductAttention(FleetLayer):
 
         if attn_mask_startend_row_indices is not None:
             # flashmask path — matches EC's scaled_dot_product_attention
-            if self.config.flashmask_use_varlen:
-                flashmask_attention_func = partial(
-                    flashmask_attention, use_varlen=True
-                )
-            else:
-                flashmask_attention_func = flashmask_attention
-
             assert attn_mask_startend_row_indices.shape[-1] == 2
-            attn_output = flashmask_attention_func(
+            attn_output = flashmask_attention(
                 query.astype(value.dtype),
                 key.astype(value.dtype),
                 value,
@@ -554,9 +546,6 @@ class DotProductAttention(FleetLayer):
         assert attention_bias is None, (
             "Attention bias is not supported for DotProductAttention."
         )
-        assert not (
-            use_rr_flash_attention and self.config.flashmask_use_varlen
-        ), "flashmask_use_varlen does not support refined recompute now."
 
         use_eager = self.config._attn_implementation == "eager"
 
@@ -571,9 +560,6 @@ class DotProductAttention(FleetLayer):
         if self.context_parallel_size > 1:
             assert packed_seq_params is None, (
                 "Packed sequence is not supported by context_parallel_size > 1 now."
-            )
-            assert not self.config.flashmask_use_varlen, (
-                "flashmask_use_varlen does not support context parallel now."
             )
             if cp_balance_mode != "contiguous_a2a" or (self.is_swa and use_mla):
                 attn_mask_startend_row_indices = (
@@ -645,10 +631,6 @@ class DotProductAttention(FleetLayer):
                         "RefinedRcomputeFlashMaskAttention does not support custom softmax_scale. "
                         "Disable refined_recompute or use default softmax_scale."
                     )
-            elif self.config.flashmask_use_varlen:
-                flashmask_attention_func = partial(
-                    flashmask_attention, use_varlen=True
-                )
             else:
                 flashmask_attention_func = flashmask_attention
 
@@ -819,10 +801,6 @@ class DotProductAttention(FleetLayer):
                         "RefinedRcomputeFlashMaskAttention does not support custom softmax_scale. "
                         "Disable refined_recompute or use default softmax_scale."
                     )
-            elif self.config.flashmask_use_varlen:
-                flashmask_attention_func = partial(
-                    flashmask_attention, use_varlen=True
-                )
             else:
                 flashmask_attention_func = flashmask_attention
 

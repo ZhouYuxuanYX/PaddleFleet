@@ -98,7 +98,6 @@ def _make_config(**overrides):
         "apply_query_key_layer_scaling": False,
         "sliding_window": None,
         "softmax_type": "vanilla",
-        "flashmask_use_varlen": False,
         "params_dtype": "float32",
         "perform_initialization": True,
         "init_method": paddle.nn.initializer.Normal(0.02),

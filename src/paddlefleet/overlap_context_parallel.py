@@ -18,14 +18,12 @@ Selected by the ``_overlap`` suffix of ``cp_balance_mode`` and dispatched from
 ``flashmask_attention_cp``. K/V are handed to the FA-4 kernel LOCAL together with
 the CP group: the kernel all-gathers them on an internal stream and folds the
 dK/dV reduce-scatter back to the local length, so this layer performs no explicit
-communication and only has to express the mask in the gathered KV order.
+communication and only has to express the mask with its key axis in group-rank
+order; FlashMask maps that onto its own communication order.
 
 Kept in a separate module so that the overlap path adds no import cost, and no
 merge surface, to the non-overlap one.
 """
-
-import inspect
-import os
 
 import paddle
 from paddle.autograd.py_layer import PyLayer
@@ -42,18 +40,18 @@ try:
         paddle.device.cuda.device_count() > 0
         and paddle.device.cuda.get_device_capability(0)[0] == 10
     ):
-        from paddlefleet_ops.flash_mask.cute.flashmask_utils import (
+        from paddlefleet_ops.flashmask.cute.flashmask_utils import (
             FlashMaskInfoPaddle,
         )
-        from paddlefleet_ops.flash_mask.cute.interface import (
+        from paddlefleet_ops.flashmask.cute.interface import (
             _flash_attn_bwd,
             _flash_attn_fwd,
         )
+        from paddlefleet_ops.flashmask.overlap import overlap_runtime
 
-        # ``group`` is the entry point of the in-kernel overlap.
-        OVERLAP_SUPPORTED = (
-            "group" in inspect.signature(_flash_attn_fwd).parameters
-        )
+        # Only a FlashMask that reorders the group-rank mask itself may be fed
+        # one; older builds expect it pre-ordered and would mis-mask silently.
+        OVERLAP_SUPPORTED = hasattr(overlap_runtime, "sr_order_mask")
 except (ImportError, AttributeError):
     OVERLAP_SUPPORTED = False
 
@@ -61,61 +59,17 @@ except (ImportError, AttributeError):
 BLOCK_ORDER_CACHE = {}
 
 
-def traversal_rank(logical_pos, rank, cp_size, gpus_per_node):
-    """Owner of the chunk at ``logical_pos`` of the gather traversal.
+def block_order(cp_size):
+    """DualChunkSwap natural blocks in group-rank order, as a cached index tensor.
 
-    Circular for ``gpus_per_node == 0``, otherwise the kernel's
-    ``hier::hier_target_rank``: our own congruence group (same intra-node slot,
-    successive nodes) first, then the groups of the other slots of our node.
+    Rank r holds the mirrored pair ``(r, 2*cp_size-1-r)``. Cached: rebuilding the
+    index would cost a blocking host-to-device copy on every call.
     """
-    if gpus_per_node == 0:
-        return (rank + logical_pos) % cp_size
-    num_nodes = cp_size // gpus_per_node
-    slot, node = rank % gpus_per_node, rank // gpus_per_node
-    if logical_pos < num_nodes:
-        return slot + ((node + logical_pos) % num_nodes) * gpus_per_node
-    adjusted = logical_pos - num_nodes
-    slot += adjusted // num_nodes + 1
-    node += adjusted % num_nodes
-    return slot % gpus_per_node + (node % num_nodes) * gpus_per_node
-
-
-def block_order(cp_size, rank, backward, mode):
-    """Natural block order of the gathered KV, as a cached index tensor.
-
-    The buffer concatenates whole local chunks along the traversal, whose position
-    0 is the local chunk: backward starts there, forward leaves it last by
-    rotating the circular traversal by one and by reversing the hierarchical one
-    (the kernel's ``hier_seqlen_id``). The balance mode only decides which of the
-    ``2 * cp_size`` natural blocks a rank holds -- the mirrored pair
-    ``(r, 2*cp_size-1-r)`` under DualChunkSwap, the adjacent pair
-    ``(2*r, 2*r+1)`` under contiguous -- so one permutation expresses the balance
-    layout and the traversal at once, for both traversal shapes.
-
-    Everything here is per-process constant, hence cached: rebuilding the index
-    would cost a blocking host-to-device copy on every call, and reading the
-    environment once matches the kernel, which also samples it once.
-    """
-    key = (cp_size, rank, backward, mode)
-    index = BLOCK_ORDER_CACHE.get(key)
+    index = BLOCK_ORDER_CACHE.get(cp_size)
     if index is None:
-        gpus_per_node = 8 if cp_size > 8 else 0
-        contiguous = mode == "contiguous_allgather_overlap"
-        if backward:
-            positions = range(cp_size)
-        elif gpus_per_node:
-            positions = range(cp_size - 1, -1, -1)
-        else:
-            positions = [*range(1, cp_size), 0]
-        order = []
-        for logical_pos in positions:
-            owner = traversal_rank(logical_pos, rank, cp_size, gpus_per_node)
-            if contiguous:
-                order += [2 * owner, 2 * owner + 1]
-            else:
-                order += [owner, 2 * cp_size - 1 - owner]
+        order = [b for r in range(cp_size) for b in (r, 2 * cp_size - 1 - r)]
         index = paddle.to_tensor(order, dtype="int64")
-        BLOCK_ORDER_CACHE[key] = index
+        BLOCK_ORDER_CACHE[cp_size] = index
     return index
 
 
@@ -148,48 +102,18 @@ def localize_mask(startend_row_indices, seqlen_local, group, mode):
     )
 
 
-def gathered_kv_order(mask, group, backward, mode):
-    """Permute the mask key axis into the order the in-kernel all-gather lands."""
+def gathered_kv_order(mask, group, mode):
+    """Permute the mask key axis into the ranks' local KV shards in group-rank order."""
+    if mode == "contiguous_allgather_overlap":
+        return mask  # rank r holds keys [r*S_local, (r+1)*S_local): already in order
     cp_size = group.world_size
     batch_size, _, seqlen, num_vecs = mask.shape
     n_blocks = 2 * cp_size
     return (
         mask.reshape([batch_size, -1, n_blocks, seqlen // n_blocks, num_vecs])
-        .index_select(block_order(cp_size, group.rank, backward, mode), axis=2)
+        .index_select(block_order(cp_size), axis=2)
         .reshape([batch_size, -1, seqlen, num_vecs])
     )
-
-
-def _require_contiguous_cp_ranks(group):
-    """Reject a multi-node (cp_size > 8) CP group whose ranks are not one
-    contiguous block: hierarchical traversal maps 8 consecutive ranks
-    """
-    if group.world_size <= 8:
-        return
-    ranks = group.ranks
-    # ``ranks`` is ascending and unique, so contiguity is just its span.
-    if ranks[-1] - ranks[0] != len(ranks) - 1:
-        raise ValueError(
-            "Hierarchical FlashMask context parallel assumes contiguous 8-GPU "
-            f"nodes, but the context-parallel group has strided ranks {ranks}."
-        )
-
-
-def _require_eight_gpu_node(cp_size):
-    """Overlap hardcodes 8 GPUs per node to match the backend's hierarchical
-    gather (its ``num_lsa_ranks``); reject topologies where that assumption
-    would desync the gathered-KV order and silently corrupt attention.
-    """
-    local = os.getenv("PADDLE_LOCAL_SIZE")
-    if local is None:
-        return  # No per-node signal: honor the documented 8-GPU node.
-    gpus_per_node = int(local)
-    if gpus_per_node != 8 and cp_size > min(8, gpus_per_node):
-        raise ValueError(
-            "Overlapped FlashMask context parallel supports 8 GPUs per node "
-            f"only, but PADDLE_LOCAL_SIZE={gpus_per_node}; its mask order "
-            "would diverge from the backend's num_lsa_ranks-based gather."
-        )
 
 
 class OverlappedFlashMaskContextParallel(PyLayer):
@@ -214,15 +138,19 @@ class OverlappedFlashMaskContextParallel(PyLayer):
     ):
         hcg = fleet.get_hybrid_communicate_group()
         group = hcg.get_context_parallel_group()
-        _require_contiguous_cp_ranks(group)
-        _require_eight_gpu_node(group.world_size)
-        mask = localize_mask(startend_row_indices, query.shape[1], group, mode)
+        mask = gathered_kv_order(
+            localize_mask(startend_row_indices, query.shape[1], group, mode),
+            group,
+            mode,
+        )
+        # The in-kernel all-gather copies the raw [B, S_local, H, D] storage.
+        key, value = key.contiguous(), value.contiguous()
 
         output, log_sum_exp = _flash_attn_fwd(
             query,
             key,
             value,
-            startend_row_indices=gathered_kv_order(mask, group, False, mode),
+            startend_row_indices=mask,
             learnable_sink=learnable_sink,
             causal=False,
             return_lse=True,
@@ -234,7 +162,6 @@ class OverlappedFlashMaskContextParallel(PyLayer):
         ctx.save_for_backward(query, key, value, output, log_sum_exp, mask)
         ctx.group = group
         ctx.softmax_scale = softmax_scale
-        ctx.mode = mode
         ctx.learnable_sink = learnable_sink
         ctx.sink_requires_grad = (
             learnable_sink is not None and not learnable_sink.stop_gradient
@@ -247,7 +174,7 @@ class OverlappedFlashMaskContextParallel(PyLayer):
         group = ctx.group
 
         flashmask_info = FlashMaskInfoPaddle(
-            startend_row_indices=gathered_kv_order(mask, group, True, ctx.mode),
+            startend_row_indices=mask,
             is_causal=False,
         )
         # dK/dV are reduce-scattered inside the kernel, hence already local.
@@ -293,10 +220,12 @@ def overlap_flashmask_attention_cp(
     Everything the overlapped kernel does not implement is rejected here, so the
     layer itself can assume a plain non-causal FlashMask.
     """
-    assert OVERLAP_SUPPORTED, (
-        "Overlapped FlashMask context parallel requires an SM100 device and a "
-        "paddlefleet_ops build whose flash_mask cute interface accepts `group`."
-    )
+    if not OVERLAP_SUPPORTED:
+        raise RuntimeError(
+            "Overlapped FlashMask context parallel requires an SM100 device and a "
+            "paddlefleet_ops build that includes the FlashMask overlap bridge "
+            "(paddlefleet_ops.flashmask.overlap)."
+        )
     if dropout > 0.0:
         raise NotImplementedError(
             "Dropout is not supported in overlapped FlashMask context parallel."

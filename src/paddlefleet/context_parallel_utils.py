@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
-
 import paddle
 from paddle import distributed as dist
 from paddle.autograd.py_layer import PyLayer
@@ -43,14 +41,14 @@ except ImportError:
 
 if is_flash_mask_available():
     try:
-        from paddlefleet_ops.flash_mask.cute.flashmask_utils import (
+        from paddlefleet_ops.flashmask.cute.flashmask_utils import (
             FlashMaskInfoPaddle,
         )
-        from paddlefleet_ops.flash_mask.cute.interface import (
+        from paddlefleet_ops.flashmask.cute.interface import (
             _flash_attn_bwd,
             _flash_attn_fwd,
         )
-        from paddlefleet_ops.flash_mask.utils import bshd_slice_contiguous_kv
+        from paddlefleet_ops.flashmask.utils import bshd_slice_contiguous_kv
     except (ImportError, AttributeError) as exc:
         # Capability is high enough but the build is unusable (mismatched
         # paddlefleet_ops, broken cute import). ``is_flash_mask_available()`` is
@@ -60,7 +58,7 @@ if is_flash_mask_available():
         raise ImportError(
             "paddlefleet_ops reports FlashMask as available on this device, but "
             "its cute kernels cannot be imported -- reinstall paddlefleet_ops "
-            "so that paddlefleet_ops.flash_mask.cute matches it."
+            "so that paddlefleet_ops.flashmask.cute matches it."
         ) from exc
 
 
@@ -887,64 +885,6 @@ def cp_flashmask_allgatherkv_balance_backward(
                 causal,
             )
         )
-    elif not uses_cutedsl_backend(fa_version):
-        if learnable_sink is not None:
-            raise NotImplementedError(
-                "learnable_sink is only supported on the cute backend"
-            )
-        sig_params = inspect.signature(flashmask_attention).parameters
-        if "group" in sig_params:
-            query_grad, key_grad_gathered, value_grad_gathered = (
-                paddle._C_ops.flashmask_attention_v2_grad(
-                    query,
-                    key_gathered,
-                    value_gathered,
-                    output,
-                    log_sum_exp,
-                    startend_row_indices,
-                    None,  # block_mask
-                    output_grad,
-                    query.shape[-1] ** (-0.5)
-                    if softmax_scale is None
-                    else softmax_scale,
-                    False,
-                    0,  # rank
-                    1,  # nranks
-                )
-            )
-        elif "block_mask" in sig_params:
-            query_grad, key_grad_gathered, value_grad_gathered = (
-                paddle._C_ops.flashmask_attention_v2_grad(
-                    query,
-                    key_gathered,
-                    value_gathered,
-                    output,
-                    log_sum_exp,
-                    startend_row_indices,
-                    None,  # block_mask
-                    output_grad,
-                    query.shape[-1] ** (-0.5)
-                    if softmax_scale is None
-                    else softmax_scale,
-                    False,
-                )
-            )
-        else:
-            query_grad, key_grad_gathered, value_grad_gathered = (
-                paddle._C_ops.flashmask_attention_v2_grad(
-                    query,
-                    key_gathered,
-                    value_gathered,
-                    output,
-                    log_sum_exp,
-                    startend_row_indices,
-                    output_grad,
-                    query.shape[-1] ** (-0.5)
-                    if softmax_scale is None
-                    else softmax_scale,
-                    False,
-                )
-            )
     else:
         if startend_row_indices is not None:
             flashmask_info = FlashMaskInfoPaddle(

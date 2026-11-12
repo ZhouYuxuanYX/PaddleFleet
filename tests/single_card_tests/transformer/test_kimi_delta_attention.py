@@ -1827,7 +1827,7 @@ class TestImportWithoutFlaExtension(unittest.TestCase):
 
         def _is_hidden(name):
             # Note the dot: a bare startswith() would also match
-            # paddlefleet_ops.flash_mask and evict a half-initialised module.
+            # paddlefleet_ops.flashmask and evict a half-initialised module.
             return name == _HIDDEN or name.startswith(_HIDDEN + ".")
 
 

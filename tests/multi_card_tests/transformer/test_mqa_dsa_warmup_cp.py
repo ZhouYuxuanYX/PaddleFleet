@@ -150,7 +150,8 @@ def _bounds_column_sets(bounds, rows):
     """Per-local-row visible column set implied by a ``[LTS, UTE]`` pair.
 
     With ``causal=False`` and two bounds the kernel masks ``row >= LTS`` or
-    ``row < UTE`` (``mask.py:513-518``), i.e. column ``j`` is visible exactly on
+    ``row < UTE`` (the ``[LTS, LTE, UTS, UTE]`` band handling in
+    ``flashmask/cute/mask.py``), i.e. column ``j`` is visible exactly on
     rows ``[UTE_j, LTS_j)``. Inverting that per row is a decoding of the flashmask
     semantics, independent of how ``_cp_row_bounds`` computed the numbers, which
     is what makes it usable as the expectation's counterpart.
