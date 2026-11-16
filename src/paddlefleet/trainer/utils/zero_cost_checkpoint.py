@@ -26,6 +26,7 @@ import sys
 import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from enum import Enum
 
@@ -145,6 +146,38 @@ class ZCCWorkerStatus(Enum):
     OFFLOADING = 1
     DUMPING = 2
     ERROR = 3
+
+
+# Large data-progress arrays in trial_params, see ZeroCostCheckpointCallback._state_for_worker
+_ZCC_DATA_STATUS_KEYS = (
+    "data_status",
+    "saved_data_status",
+    "last_start_data_status",
+)
+# Protocol of the trainer_state sent to the ZCC worker. Encoded by ZeroCostCheckpointCallback._state_for_worker /
+# _slim_for_single_worker, decoded by ZeroCostCheckpointWorker._restore_trainer_state / _resolve_cached.
+# Placeholders: same object as last sent, restored from the worker cache (a str compares by value across processes)
+_LAST_START_UNCHANGED = "__zcc_last_start_data_status_unchanged__"
+_SAVED_BASE_UNCHANGED = "__zcc_saved_data_status_base_unchanged__"
+# saved_data_status sent as (tag, base or _SAVED_BASE_UNCHANGED, diff_ids, diff_cnts); the worker rebuilds base + diff
+_SAVED_BASE_PLUS_DIFF = "__zcc_saved_data_status_base_plus_diff__"
+
+
+def _zcc_already_sent(owner, attr, value):
+    """True when `value` is the numpy array last recorded under `owner.<attr>`; otherwise record it.
+
+    The check is by identity, which is only sound if the producer never updates the array in place.
+    A recorded array is made read-only, so an in-place update raises at the producer instead of
+    leaving the worker with a stale cached copy. Values of other types are never treated as sent.
+    """
+    if not isinstance(value, np.ndarray):
+        setattr(owner, attr, None)
+        return False
+    if value is getattr(owner, attr, None):
+        return True
+    value.setflags(write=False)
+    setattr(owner, attr, value)
+    return False
 
 
 def showmem(msg):
@@ -483,14 +516,37 @@ def get_fused_param_mappings(
     return param_mappings, ipc_meta_mappings
 
 
-def pin2cpu_zero_copy_fp32(t):
-    lt = t.get_tensor()
-    arr = np.ctypeslib.as_array(
-        ctypes.cast(lt._ptr(), ctypes.POINTER(ctypes.c_float)),
-        shape=(t._numel(),),
+# numpy dtype whose zero-copy CPU tensor has the same paddle dtype (paddle maps uint16 to bfloat16)
+_PIN2CPU_NP_DTYPES = {
+    paddle.float32: np.float32,
+    paddle.bfloat16: np.uint16,
+    paddle.float16: np.float16,
+}
+
+
+def pin2cpu_zero_copy(t):
+    """CPUPlace alias of pinned tensor `t` without copying.
+
+    Ops that see a pinned input pick the GPU backend: slicing it copies to the GPU or to
+    new pageable memory, and an in-place op such as `lerp_` moves its CPU output to the GPU.
+    Returns `t` unchanged when it is not a contiguous pinned tensor of a supported dtype.
+    """
+    np_dtype = _PIN2CPU_NP_DTYPES.get(t.dtype)
+    if (
+        np_dtype is None
+        or not t.place.is_cuda_pinned_place()
+        or not t.is_contiguous()
+        or t._numel() == 0
+    ):
+        return t
+    numel = t._numel()
+    raw = np.ctypeslib.as_array(
+        ctypes.cast(t.get_tensor()._ptr(), ctypes.POINTER(ctypes.c_uint8)),
+        shape=(numel * t.element_size(),),
     )
+    arr = raw.view(np_dtype)
     alias = core.eager.Tensor(value=arr, place=core.CPUPlace(), zero_copy=True)
-    alias._keep_alive = (t, arr)
+    alias._keep_alive = (t, raw, arr)
     return alias
 
 
@@ -540,8 +596,9 @@ class ZeroCostCheckpointEMAProcessor:
                 dtype="float32",
             )
             # ema model params, only works on float32 model weights (aka, moe gates)
+            # cpu_buf may be pinned and zeros_like would allocate on GPU, so allocate on CPU explicitly
             ema_buffer_model_params = {
-                k: paddle.zeros_like(cpu_buf)
+                k: paddle.zeros(cpu_buf.shape, dtype=cpu_buf.dtype)
                 for k, (
                     cuda_buf,
                     cpu_buf,
@@ -576,12 +633,9 @@ class ZeroCostCheckpointEMAProcessor:
         )
         with device_guard("cpu"):
             cpu_buffer = self.optimizer_fusion_storage_helper.cpu_buffer
-            if (
-                cpu_buffer.place.is_cuda_pinned_place()
-                and cpu_buffer.dtype == paddle.float32
-                and cpu_buffer.is_contiguous()
-            ):
-                cpu_master_weights = pin2cpu_zero_copy_fp32(cpu_buffer)._slice(
+            cpu_alias = pin2cpu_zero_copy(cpu_buffer)
+            if cpu_alias is not cpu_buffer:
+                cpu_master_weights = cpu_alias._slice(
                     self.master_min_offset, self.master_max_offset
                 )
             else:
@@ -594,6 +648,8 @@ class ZeroCostCheckpointEMAProcessor:
                     _, cpu_buf = (
                         self.param_fusion_storage_helper.inited_buffers[index]
                     )
+                    # A pinned input would put the result on the GPU
+                    cpu_buf = pin2cpu_zero_copy(cpu_buf)
                     updated_ema = (
                         self.ema_coef * ema_buf + (1 - self.ema_coef) * cpu_buf
                     )
@@ -710,14 +766,7 @@ class OptFusionStorageHelper(FusionStorageHelper):
         name = tensor_meta["name"]
         start = tensor_meta["start"]
         end = tensor_meta["end"]
-        if (
-            self.cpu_buffer.place.is_cuda_pinned_place()
-            and self.cpu_buffer.dtype == paddle.float32
-            and self.cpu_buffer.is_contiguous()
-        ):
-            tensor = pin2cpu_zero_copy_fp32(self.cpu_buffer)._slice(start, end)
-        else:
-            tensor = self.cpu_buffer._slice(start, end)
+        tensor = pin2cpu_zero_copy(self.cpu_buffer)._slice(start, end)
         tensor.get_tensor()._set_dims(shape)
         tensor.name = name
         return tensor
@@ -781,7 +830,11 @@ class ParamFusionStorageHelper:
             cuda_buffer = paddle.to_tensor(
                 paddle.base.core.LoDTensor._new_shared_cuda(meta)
             )
-        cpu_buffer = cuda_buffer.cpu()
+        if flatten and not paddle.is_compiled_with_xpu():
+            # Pinned memory: D2H skips the driver's pageable staging copy
+            cpu_buffer = cuda_buffer.pin_memory()
+        else:
+            cpu_buffer = cuda_buffer.cpu()
         if flatten and len(cuda_buffer.shape) > 1:
             # Every consumer below addresses this buffer by *element* offset --
             # async_offload_with_offset() only accepts 1-D and _slice() counts
@@ -894,7 +947,8 @@ class ParamFusionStorageHelper:
         else:
             start = tensor_meta["start"]
             end = tensor_meta["end"]
-            cpu_buffer = self.inited_buffers[buffer_index][1]
+            # Flat buffers are pinned: slice a CPU alias so the slice stays a view
+            cpu_buffer = pin2cpu_zero_copy(self.inited_buffers[buffer_index][1])
             tensor = cpu_buffer._slice(start, end)
         tensor.get_tensor()._set_dims(shape)
         tensor.name = name
@@ -955,6 +1009,68 @@ class ZeroCostCheckpointCallback(TrainerCallback):
             self.manager.sync_offload_status()
             logger.info("[ZCC manager] Synced checkpoints.")
 
+    def _state_for_worker(self, state, dumping=True):
+        """TrainerState snapshot for the worker with the large trial_params arrays dropped or compressed,
+        to cut the pickling cost of the PREPARE task.
+
+        - data_status is never sent (already merged into saved_data_status, rebuilt on resume);
+        - ranks that do not write trainer_state (device_id != 0) and EMA-only steps get none of the arrays;
+        - single worker: last_start_data_status is replaced by a placeholder when unchanged; saved_data_status
+          is sent as "base (placeholder when unchanged) + accumulated diff" when the data side provides
+          _zcc_saved_base / _zcc_saved_diff, and rebuilt by the worker;
+        - multiple workers: their caches may differ, so full arrays are always sent; a saved_data_status that is
+          updated in place is copied so the asynchronous feeder-thread pickle never sees a partial update.
+
+        "Unchanged" means "the same object as last sent", so producers must assign a new array instead of
+        updating last_start_data_status or _zcc_saved_base in place. See _zcc_already_sent.
+        """
+        tp = getattr(state, "trial_params", None)
+        if not isinstance(tp, dict) or not any(
+            k in tp for k in _ZCC_DATA_STATUS_KEYS
+        ):
+            return state
+        snap = copy.copy(state)
+        tp = dict(tp)
+        tp.pop("data_status", None)
+        base = tp.pop("_zcc_saved_base", None)
+        diff = tp.pop("_zcc_saved_diff", None)
+        if not dumping or self.manager.device_id != 0:
+            tp.pop("saved_data_status", None)
+            tp.pop("last_start_data_status", None)
+        elif len(self.manager.workers) == 1:
+            self._slim_for_single_worker(tp, base, diff)
+        elif "saved_data_status" in tp and base is not None:
+            tp["saved_data_status"] = np.array(
+                tp["saved_data_status"], copy=True
+            )
+        snap.trial_params = tp
+        return snap
+
+    def _slim_for_single_worker(self, tp, base, diff):
+        """Replace unchanged arrays in `tp` with placeholders and send saved_data_status as base + diff."""
+        if "last_start_data_status" in tp and _zcc_already_sent(
+            self, "_zcc_last_start_sent", tp["last_start_data_status"]
+        ):
+            tp["last_start_data_status"] = _LAST_START_UNCHANGED
+        if "saved_data_status" not in tp or base is None:
+            return
+        if diff is None:
+            tp["saved_data_status"] = np.array(
+                tp["saved_data_status"], copy=True
+            )
+            return
+        base_payload = (
+            _SAVED_BASE_UNCHANGED
+            if _zcc_already_sent(self, "_zcc_saved_base_sent", base)
+            else base
+        )
+        tp["saved_data_status"] = (
+            _SAVED_BASE_PLUS_DIFF,
+            base_payload,
+            diff[0],
+            diff[1],
+        )
+
     def on_step_end(
         self, args, state, control, model, lr_scheduler, optimizer, **kwargs
     ):
@@ -972,9 +1088,17 @@ class ZeroCostCheckpointCallback(TrainerCallback):
                 # Refresh it here so `sync_offload_status` compares against the step that is
                 # actually being offloaded instead of a permanently frozen value.
                 self.manager.global_step = state.global_step
+                # prepare for dumping
                 self.manager.get_idle_worker_for_saving(
-                    ((None, None), (None, state, None))
-                )  # prepare for dumping
+                    (
+                        (None, None),
+                        (
+                            None,
+                            self._state_for_worker(state, dumping=False),
+                            None,
+                        ),
+                    )
+                )
         else:
             self.runtime_timer.start("checkpoint saving time")
             self.maybe_update_zcc_worker(
@@ -987,7 +1111,7 @@ class ZeroCostCheckpointCallback(TrainerCallback):
             )
             non_cached_objects = (
                 lr_scheduler.state_dict(),
-                state,
+                self._state_for_worker(state, dumping=True),
                 self.get_rng_states(args),
             )
             self.manager.get_idle_worker_for_saving(
@@ -998,6 +1122,10 @@ class ZeroCostCheckpointCallback(TrainerCallback):
             args.pipeline_model_parallel_size > 1
             and isinstance(model, PipelineLayer)
         ):
+            # The manager defers this first OFFLOAD to flush_deferred_offload,
+            # issued after step-tail logging so D2H does not compete for PCIe
+            # with the small collectives there
+            self.manager.defer_next_offload = True
             self.manager.zcc_pipeline_hook(0)
 
     def get_rng_states(self, args):
@@ -1230,6 +1358,10 @@ class ZeroCostCheckpointManager:
             f"ema coefficient: {ema_coef} "
         )
         self.current_pipeline_hook_step = 0
+        # Set by ZeroCostCheckpointCallback.on_step_end to hold back the first OFFLOAD of a save;
+        # offload_deferred marks that one is held until flush_deferred_offload
+        self.defer_next_offload = False
+        self.offload_deferred = False
         ctx = multiprocessing.get_context("spawn")
         assert hasattr(fleet, "_hcg"), (
             "ZeroCostCheckpoint Only support `use_hybrid_parallel`"
@@ -1422,6 +1554,7 @@ class ZeroCostCheckpointManager:
         """
         if self.current_worker is None:
             return
+        self.flush_deferred_offload()
         if self.current_pipeline_hook_step != self.pipeline_hooks_steps:
             # The offload is still being sliced across pipeline hooks (PP > 1, or
             # gradient_accumulation_steps > 1). The remaining chunks are only dispatched
@@ -1433,12 +1566,16 @@ class ZeroCostCheckpointManager:
         logger.info("[ZCC manager] Synced checkpoints (step begin).")
 
     def sync_offload_status(self):
+        # Issue a still-deferred OFFLOAD first, otherwise this would wait forever
+        self.flush_deferred_offload()
         self.report_error_worker()
         assert self.current_worker is not None, (
             "[ZCC manager] current_worker must not be None"
         )
         while True:
             if self.current_worker.global_step.value != self.global_step:
+                # A worker that fails mid-offload never publishes the step
+                self.report_error_worker()
                 logger.info(
                     f"[ZCC manager] Waiting current worker offloading done., "
                     f"worker_state:{self.current_worker.status.value}, "
@@ -1462,12 +1599,24 @@ class ZeroCostCheckpointManager:
                 )
                 raise RuntimeError(f"{PC_DUMP_ERROR}")
 
+    def flush_deferred_offload(self):
+        """Issue the OFFLOAD deferred by the save step; no-op if nothing is pending."""
+        if not self.offload_deferred:
+            return
+        self.offload_deferred = False
+        self.zcc_pipeline_hook(0)
+
     def zcc_pipeline_hook(self, hook_id):
+        defer = self.defer_next_offload
+        self.defer_next_offload = False
         if self.current_worker is None:
             return
         if self.current_pipeline_hook_step == self.pipeline_hooks_steps:
             return
         if not self.ready_to_save:
+            return
+        if defer and self.current_pipeline_hook_step == 0:
+            self.offload_deferred = True
             return
         task = (ZCCTaskType.OFFLOAD, self.global_step)
         self.current_worker.task_queue.put(task)
@@ -1478,6 +1627,7 @@ class ZeroCostCheckpointManager:
         if self.current_worker is not None:
             logger.info("[ZCC manager] clean up last step saving")
             # trigger offload
+            self.flush_deferred_offload()
             for i in range(self.pipeline_hooks_steps):
                 self.zcc_pipeline_hook(i)
             self.sync_offload_status()
@@ -1495,6 +1645,11 @@ class ZeroCostCheckpointManager:
 
 def worker_loop(worker):
     worker.run()
+
+
+def _zcc_is_flash_dir(output_dir):
+    """Whether output_dir is on the flash (tmpfs) device."""
+    return str(output_dir).startswith(FLASH_DEVICE)
 
 
 class ZeroCostCheckpointWorker:
@@ -1598,6 +1753,107 @@ class ZeroCostCheckpointWorker:
         self.lr_scheduler, self.trainer_state, self.rng_state = (
             non_cached_objects
         )
+        self._restore_trainer_state()
+
+    def _restore_trainer_state(self):
+        """Undo _state_for_worker: fill placeholders from the cache and rebuild saved_data_status as base + diff."""
+        tp = getattr(self.trainer_state, "trial_params", None)
+        if not isinstance(tp, dict):
+            return
+        tp.pop("_zcc_saved_base", None)
+        tp.pop("_zcc_saved_diff", None)
+        saved = tp.get("saved_data_status")
+        if (
+            isinstance(saved, tuple)
+            and len(saved) == 4
+            and isinstance(saved[0], str)
+            and saved[0] == _SAVED_BASE_PLUS_DIFF
+        ):
+            _, base, ids, cnts = saved
+            base = self._resolve_cached(
+                base,
+                _SAVED_BASE_UNCHANGED,
+                "_cached_saved_base",
+                "saved_data_status base",
+            )
+            dense = np.array(base, dtype=np.int64, copy=True)
+            np.add.at(
+                dense,
+                np.asarray(ids, dtype=np.int64),
+                np.asarray(cnts, dtype=np.int64),
+            )
+            tp["saved_data_status"] = dense
+        if "last_start_data_status" in tp:
+            tp["last_start_data_status"] = self._resolve_cached(
+                tp["last_start_data_status"],
+                _LAST_START_UNCHANGED,
+                "_cached_last_start_data_status",
+                "last_start_data_status",
+            )
+
+    def _resolve_cached(self, value, placeholder, attr, what):
+        """Replace `placeholder` with the value cached in `self.<attr>`; cache any other value."""
+        if not (isinstance(value, str) and value == placeholder):
+            setattr(self, attr, value)
+            return value
+        cached = getattr(self, attr, None)
+        if cached is None:
+            raise RuntimeError(
+                f"[ZCC worker] got {what} placeholder but no cached value; "
+                "main process and worker are out of sync"
+            )
+        return cached
+
+    def _issue_offload_range(self, start, size):
+        """Issue D2H for logical range [start, start+size): optimizer fused states first, then model weights."""
+        opt_len = self.optimizer_fusion_storage_helper.buffer_length
+        end = start + size
+        if start < opt_len:
+            self.optimizer_fusion_storage_helper.sync_partial_param(
+                start=start, end=min(end, opt_len)
+            )
+        if end > opt_len:
+            self.param_fusion_storage_helper.sync_partial_param(
+                numel_to_sync=end - max(start, opt_len)
+            )
+
+    def _drain_offload_tasks(self):
+        """Wait for issued copies; the final bookkeeping is left to wait_all."""
+        for helper in (
+            self.optimizer_fusion_storage_helper,
+            self.param_fusion_storage_helper,
+        ):
+            while helper.tasks:
+                helper.tasks.pop(0).cpu_wait()
+
+    def _chunked_offload(self, size, chunk_mb):
+        """Issue D2H chunk by chunk, leaving PCIe gaps for cross-node communication on the same link."""
+        chunk_bytes = chunk_mb * 1024 * 1024
+        opt = self.optimizer_fusion_storage_helper
+        param = self.param_fusion_storage_helper
+        opt_block = max(1, int(chunk_bytes / opt.buffer.element_size()))
+        # Parameter buffers mix dtypes (bf16 weights, fp32 gates), so size their chunks by the mean element size
+        param_bytes = sum(
+            (m["end"] - m["start"])
+            * param.inited_buffers[m["buffer_index"]][0].element_size()
+            for m in param.model_weights_metas.values()
+            if not m["buffer_index"].startswith("unshard_")
+        )
+        param_block = (
+            max(1, int(chunk_bytes * param.all_param_numel / param_bytes))
+            if param_bytes
+            else 1
+        )
+        start, end = self.offloaded_numels, self.offloaded_numels + size
+        while start < end:
+            if start < opt.buffer_length:
+                n = min(opt_block, end - start, opt.buffer_length - start)
+            else:
+                n = min(param_block, end - start)
+            self._issue_offload_range(start, n)
+            start += n
+            if start < end:
+                self._drain_offload_tasks()
 
     def process_offload_task(self, dump, global_step):
         """
@@ -1609,38 +1865,15 @@ class ZeroCostCheckpointWorker:
             )
             - self.offloaded_numels
         )
-        # Scene1: offload optimizer only
-        if (
-            self.offloaded_numels + actual_offload_size
-            <= self.optimizer_fusion_storage_helper.buffer_length
-        ):
-            self.optimizer_fusion_storage_helper.sync_partial_param(
-                start=self.offloaded_numels,
-                end=self.offloaded_numels + actual_offload_size,
-            )
-        # Scene2: offload optimizer and param
-        elif (
-            self.offloaded_numels
-            < self.optimizer_fusion_storage_helper.buffer_length
-        ):
-            self.optimizer_fusion_storage_helper.sync_partial_param(
-                start=self.offloaded_numels,
-                end=self.optimizer_fusion_storage_helper.buffer_length,
-            )
-            self.param_fusion_storage_helper.sync_partial_param(
-                numel_to_sync=(
-                    actual_offload_size
-                    - (
-                        self.optimizer_fusion_storage_helper.buffer_length
-                        - self.offloaded_numels
-                    )
+        chunk_mb = float(self.training_args_content.zcc_d2h_chunk_mb)
+        if actual_offload_size > 0:
+            if chunk_mb > 0:
+                self._chunked_offload(actual_offload_size, chunk_mb)
+            else:
+                # optimizer only, optimizer and param, or param only
+                self._issue_offload_range(
+                    self.offloaded_numels, actual_offload_size
                 )
-            )
-        # Scene3: offload param only
-        else:
-            self.param_fusion_storage_helper.sync_partial_param(
-                numel_to_sync=actual_offload_size
-            )
         self.offloaded_numels += actual_offload_size
 
         # wait tasks done and change status to DUMPING at the last chunk
@@ -1949,6 +2182,8 @@ class ZeroCostCheckpointWorker:
             logger.info(
                 f"[ZCC Worker{self.worker_id}] failed!!, Exception:{e}\n Traceback:{traceback.format_exc()}\n"
             )
+            # Let the main process raise through report_error_worker instead of polling a dead worker
+            self.status.value = ZCCWorkerStatus.ERROR.value
             raise e
 
     def build_fusion_storage_helper(
@@ -3562,10 +3797,10 @@ class ZeroCostCheckpointWorkerFcBased(ZeroCostCheckpointWorker):
                 _zcc_check_shapes_match_meta(
                     state_dict, self.model_ckpt_meta, "model_state"
                 )
-                paddle.save(state_dict, self.model_states_path)
+                self._queue_write(state_dict, self.model_states_path)
 
                 if self.device_id == 0:
-                    paddle.save(
+                    self._queue_write(
                         self.model_ckpt_meta, self.model_states_meta_path
                     )
         logger.info("[ZCC worker] Finish model states saved.")
@@ -3704,11 +3939,11 @@ class ZeroCostCheckpointWorkerFcBased(ZeroCostCheckpointWorker):
                 "master_weight",
                 self.param_slice_info,
             )
-            paddle.save(opt_state_dict, self.opt_state_path)
-            paddle.save(master_weights, self.master_weight_path)
+            self._queue_write(opt_state_dict, self.opt_state_path)
+            self._queue_write(master_weights, self.master_weight_path)
             if self.device_id == 0:
-                paddle.save(self.opt_ckpt_meta, self.opt_state_meta_path)
-                paddle.save(
+                self._queue_write(self.opt_ckpt_meta, self.opt_state_meta_path)
+                self._queue_write(
                     self.master_weight_ckpt_meta, self.master_weight_meta_path
                 )
             logger.info(
@@ -3831,13 +4066,13 @@ class ZeroCostCheckpointWorkerFcBased(ZeroCostCheckpointWorker):
                 "ema_state",
                 self.param_slice_info,
             )
-            paddle.save(ema_save_dict, self.ema_name_path)
+            self._queue_write(ema_save_dict, self.ema_name_path)
 
             # Save metadata
             if self.device_id == 0:
                 ema_ckpt_meta = self._merge_ema_ckpt_meta()
                 if ema_ckpt_meta is not None:
-                    paddle.save(ema_ckpt_meta, self.ema_meta_path)
+                    self._queue_write(ema_ckpt_meta, self.ema_meta_path)
 
         logger.info("[ZCC worker] Finish ema states saved.")
 
@@ -3873,9 +4108,44 @@ class ZeroCostCheckpointWorkerFcBased(ZeroCostCheckpointWorker):
         return merged
 
     def _dump_states(self, output_dir):
-        self._save_model_state(output_dir)
-        self._save_opt_state(output_dir)
-        self._save_ema_state(output_dir)
+        flash = _zcc_is_flash_dir(output_dir)
+        self._pending_writes = []
+        try:
+            # _save_* only transform on CPU and queue writes; _flush_writes does the I/O
+            self._save_model_state(output_dir)
+            self._save_opt_state(output_dir)
+            self._save_ema_state(output_dir)
+            self._flush_writes(flash)
+        finally:
+            # A failed dump must not leave later _queue_write calls queuing silently
+            self._pending_writes = None
+
+    def _queue_write(self, obj, path):
+        """Queue a paddle.save for _flush_writes; save right away outside _dump_states."""
+        pending = getattr(self, "_pending_writes", None)
+        if pending is None:
+            paddle.save(obj, path)
+        else:
+            pending.append((obj, path))
+
+    def _flush_writes(self, flash):
+        """Write flash (tmpfs) files concurrently; keep persistent writes serial to preserve sequential I/O."""
+        jobs, self._pending_writes = self._pending_writes, None
+
+        def run(job):
+            obj, path = job
+            paddle.save(obj, path)
+
+        if flash and len(jobs) > 1:
+            # Only paddle.save runs in threads: device_guard changes the global device, so CPU transforms stay here
+            with ThreadPoolExecutor(
+                max_workers=min(4, len(jobs)), thread_name_prefix="zcc-dump"
+            ) as ex:
+                for fut in [ex.submit(run, j) for j in jobs]:
+                    fut.result()
+        else:
+            for job in jobs:
+                run(job)
 
     def _load_ema_from_shared_memory(self, ema_shared_metas):
         """Load EMA state from shared memory after reshard in main process."""

@@ -25,7 +25,7 @@ import os
 import random
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import paddle
@@ -150,7 +150,9 @@ class TrainerState:
     is_local_process_zero: bool = True
     is_world_process_zero: bool = True
     trial_name: str = None
-    trial_params: Dict[str, Union[str, float, int, bool]] = None
+    # Besides scalars, data-progress callbacks store numpy arrays here (data_status, saved_data_status,
+    # last_start_data_status) and the ZCC-private _zcc_saved_base / _zcc_saved_diff, which never reach disk
+    trial_params: Dict[str, Any] = None
 
     def __post_init__(self):
         if self.log_history is None:
@@ -161,8 +163,24 @@ class TrainerState:
 
     def save_to_json(self, json_path: str):
         """Save the content of this instance in JSON format inside `json_path`."""
+
+        # trial_params may contain numpy arrays
+        def _np_default(o):
+            if isinstance(o, np.ndarray):
+                return o.tolist()
+            if isinstance(o, np.generic):
+                return o.item()
+            raise TypeError(
+                f"Object of type {type(o).__name__} is not JSON serializable"
+            )
+
         json_string = (
-            json.dumps(dataclasses.asdict(self), indent=2, sort_keys=True)
+            json.dumps(
+                dataclasses.asdict(self),
+                indent=2,
+                sort_keys=True,
+                default=_np_default,
+            )
             + "\n"
         )
         with open(json_path, "w", encoding="utf-8") as f:

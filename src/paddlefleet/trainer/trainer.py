@@ -3921,6 +3921,7 @@ class Trainer:
                             ignore_keys_for_eval,
                             inputs=inputs,
                         )
+                        self._flush_zcc_deferred_offload()
                         # Log data loading time for this global_step
                         logger.info(
                             f"[DataLoad global_step: {self.state.global_step}] "
@@ -4169,6 +4170,14 @@ class Trainer:
     def _set_state_dict_in_model(self, state_dict):
         # TODO  @ZHUI paddle need return the results of set_state_dict.
         logger.info(f"set state-dict :{self.model.set_state_dict(state_dict)}")
+
+    def _flush_zcc_deferred_offload(self):
+        """Issue the ZCC D2H that was deferred until after step-tail logging."""
+        if (
+            self.args.enable_zero_cost_checkpoint
+            and self.zcc_manager is not None
+        ):
+            self.zcc_manager.flush_deferred_offload()
 
     def _print_timer(self):
         """print timer and clear states"""

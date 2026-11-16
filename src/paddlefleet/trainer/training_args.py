@@ -1442,6 +1442,13 @@ class TrainingArguments:
             "help": "If set not None, only do EMA when the training loss is smaller than the threshold value"
         },
     )
+    zcc_d2h_chunk_mb: float = field(
+        default=64,
+        metadata={
+            "help": "Chunk size (MB) of the ZCC GPU->CPU offload; chunks are copied one after another to leave "
+            "PCIe gaps for cross-node communication. 0 copies everything at once."
+        },
+    )
     save_tokenizer: Optional[bool] = field(
         default=True,
         metadata={"help": "Save tokenizer to output_dir."},
@@ -3370,15 +3377,7 @@ class TrainingArguments:
             )
 
         if self.enable_zero_cost_checkpoint:
-            assert self.fuse_optimizer_states, (
-                "zero cost checkpoint must be used when fuse_optimizer_states is enabled in sharding parallel config"
-            )
-            assert self.flash_device_save_steps % self.zcc_ema_interval == 0, (
-                f"flash_device_save_steps[{self.flash_device_save_steps}] must be divisible by zcc_ema_interval[{self.zcc_ema_interval}]"
-            )
-            assert self.save_steps % self.zcc_ema_interval == 0, (
-                f"save_steps[{self.save_steps}] must be divisible by zcc_ema_interval[{self.zcc_ema_interval}]"
-            )
+            self._post_init_zero_cost_checkpoint()
         if (
             self.enable_zero_cost_checkpoint
             and self.zcc_save_ema_coef is not None
@@ -3569,6 +3568,21 @@ class TrainingArguments:
 
         if self.use_hybrid_parallel and self.enable_auto_parallel:
             self.use_hybrid_parallel = False
+
+    def _post_init_zero_cost_checkpoint(self):
+        assert self.fuse_optimizer_states, (
+            "zero cost checkpoint must be used when fuse_optimizer_states is enabled in sharding parallel config"
+        )
+        assert self.flash_device_save_steps % self.zcc_ema_interval == 0, (
+            f"flash_device_save_steps[{self.flash_device_save_steps}] must be divisible by zcc_ema_interval[{self.zcc_ema_interval}]"
+        )
+        assert self.save_steps % self.zcc_ema_interval == 0, (
+            f"save_steps[{self.save_steps}] must be divisible by zcc_ema_interval[{self.zcc_ema_interval}]"
+        )
+        if self.zcc_d2h_chunk_mb < 0:
+            raise ValueError(
+                f"zcc_d2h_chunk_mb[{self.zcc_d2h_chunk_mb}] must be >= 0 (0 copies everything at once)"
+            )
 
     def _post_init_save_checkpoint_format(self):
         if self.save_checkpoint_format:

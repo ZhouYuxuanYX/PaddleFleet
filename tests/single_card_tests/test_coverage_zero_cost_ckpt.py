@@ -61,6 +61,8 @@ def _bare_manager(**overrides):
         "current_pipeline_hook_step", 1
     )
     m.ready_to_save = overrides.get("ready_to_save", True)
+    m.defer_next_offload = False
+    m.offload_deferred = False
     return m
 
 

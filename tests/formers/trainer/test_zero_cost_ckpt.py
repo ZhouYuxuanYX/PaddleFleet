@@ -111,6 +111,8 @@ def _make_manager(**attrs):
     m.pipeline_hooks_steps = attrs.get("pipeline_hooks_steps", 1)
     m.current_pipeline_hook_step = attrs.get("current_pipeline_hook_step", 1)
     m.ready_to_save = attrs.get("ready_to_save", True)
+    m.defer_next_offload = False
+    m.offload_deferred = False
     return m
 
 
