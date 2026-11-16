@@ -204,6 +204,40 @@ class TestMergeMultimodal(unittest.TestCase):
         np.testing.assert_allclose(joint[:2], np.full([2, self.hidden], 11.0))
         np.testing.assert_allclose(joint[2:], np.full([2, self.hidden], 13.0))
 
+    def test_merge_keeps_bf16_under_amp_o2(self):
+        # AMP O2 keeps ``scatter`` on its fp32 black list, so without the
+        # cast-back a bf16 decoder_input comes out fp32 and the whole residual
+        # stream of a visual micro-batch runs in fp32.
+        emb = _make_embedding()
+        decoder_input = self.decoder_input.astype("bfloat16")
+        image_embeds = paddle.full([2, self.hidden], 7.0, dtype="bfloat16")
+        video_embeds = paddle.full([2, self.hidden], 3.0, dtype="bfloat16")
+        for embeds in (
+            {"image_embeds": image_embeds},
+            {"video_embeds": video_embeds},
+            {"image_embeds": image_embeds, "video_embeds": video_embeds},
+        ):
+            with self.subTest(keys=sorted(embeds)):
+                with paddle.amp.auto_cast(level="O2", dtype="bfloat16"):
+                    out, _, _ = emb._merge_multimodal(
+                        embeds, self.input_ids, decoder_input, [], []
+                    )
+                self.assertEqual(out.dtype, paddle.bfloat16)
+                if "image_embeds" in embeds:
+                    np.testing.assert_allclose(
+                        out[0, :2].astype("float32").numpy(),
+                        np.full([2, self.hidden], 7.0),
+                    )
+                if "video_embeds" in embeds:
+                    np.testing.assert_allclose(
+                        out[0, 2:4].astype("float32").numpy(),
+                        np.full([2, self.hidden], 3.0),
+                    )
+                np.testing.assert_allclose(
+                    out[0, 4:].astype("float32").numpy(),
+                    np.ones([2, self.hidden], dtype="float32"),
+                )
+
 
 class TestForwardMultimodalOrdering(unittest.TestCase):
     """Multimodal merge happens before the MTP split; SP scatter happens once."""

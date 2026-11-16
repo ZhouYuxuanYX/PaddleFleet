@@ -274,7 +274,14 @@ class GPTEmbedding(FleetLayer):
                 flat_indices,
                 image_embeds.astype(decoder_input.dtype).reshape([-1]),
             )  # scatter bwd is a simple gather — no sparse atomics
-            decoder_input = image_src_flat.reshape(decoder_input.shape)
+            # AMP O2 keeps ``scatter`` on its fp32 black list, so the blend comes
+            # back fp32 even with bf16 operands. Cast it back (lossless, scatter
+            # only copies); otherwise the residual stream stays fp32 for this
+            # micro-batch and the fused LM-head CE sees fp32 hidden states
+            # against bf16 weights.
+            decoder_input = image_src_flat.reshape(decoder_input.shape).astype(
+                decoder_input.dtype
+            )
             visual_pos_masks = image_mask[..., 0]
             deepstack_visual_embeds = deepstack_image_embeds
         if video_embeds is not None:
@@ -291,7 +298,10 @@ class GPTEmbedding(FleetLayer):
                 flat_indices,
                 video_embeds.astype(decoder_input.dtype).reshape([-1]),
             )
-            decoder_input = video_src_flat.reshape(decoder_input.shape)
+            # Same fp32 black-list cast-back as the image branch above.
+            decoder_input = video_src_flat.reshape(decoder_input.shape).astype(
+                decoder_input.dtype
+            )
             visual_pos_masks = video_mask[..., 0]
             deepstack_visual_embeds = deepstack_video_embeds
         if image_embeds is not None and video_embeds is not None:
