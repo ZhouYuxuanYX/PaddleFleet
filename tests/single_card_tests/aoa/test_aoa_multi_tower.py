@@ -289,6 +289,57 @@ class TestFannedOutCopyPath(unittest.TestCase):
             already,
         )
 
+    def test_in_place_self_write_of_a_shared_source_is_deferred(self):
+        """A transform loading a shared source onto its own name (``S^T -> S``)
+        must run after the fan-out readers of ``S``.
+
+        The engine applies load statements in order and a later read sees the
+        already-written intermediate, so an in-place self-write emitted before
+        its readers double-transposes them -- the fanned MTP depths' ``e_proj``
+        / ``h_proj`` lost their transpose. Deferring the self-write to the end
+        keeps the readers reading the raw checkpoint value.
+        """
+        prefixes = mt._shared_checkpoint_prefixes(_fanout_towers(shared=True))
+        rewritten = mt._defer_shared_source_self_writes(
+            [
+                "shared.e_proj^T -> shared.e_proj",
+                "shared.e_proj^T -> model.e_proj",
+            ],
+            prefixes,
+        )
+        self.assertEqual(
+            rewritten,
+            [
+                "shared.e_proj^T -> model.e_proj",
+                "shared.e_proj^T -> shared.e_proj",
+            ],
+        )
+
+    def test_self_write_defers_behind_readers_across_pipeline_blocks(self):
+        """``globalize_statements`` concatenates the pipeline stages in rank
+        order, so a self-write on an earlier stage would precede its readers on
+        a later stage. The deferral runs on the gathered program and keeps the
+        self-write behind every reader while leaving unrelated statements put.
+        """
+        prefixes = mt._shared_checkpoint_prefixes(_fanout_towers(shared=True))
+        # Rank 0's stage block (an unrelated rename then the source depth's
+        # self-write) followed by rank 1's block (the fan-out readers).
+        gathered = [
+            "model.0.q -> model.0.q_proj",
+            "shared.e_proj^T -> shared.e_proj",
+            "shared.e_proj^T -> model.44.e_proj",
+            "shared.e_proj^T -> model.45.e_proj",
+        ]
+        self.assertEqual(
+            mt._defer_shared_source_self_writes(gathered, prefixes),
+            [
+                "model.0.q -> model.0.q_proj",
+                "shared.e_proj^T -> model.44.e_proj",
+                "shared.e_proj^T -> model.45.e_proj",
+                "shared.e_proj^T -> shared.e_proj",
+            ],
+        )
+
     def test_no_shared_tower_leaves_every_statement_alone(self):
         statements = ["shared.a -> model.a"]
         self.assertIs(
@@ -379,7 +430,12 @@ class TestFannedOutLoadReachesBothEnds(unittest.TestCase):
             else:
                 os.environ[key] = value
 
-    def _load_two_ends(self, statements):
+    def _load(self, saved, targets, statements):
+        """Save ``saved``, load it into ``targets`` under ``statements``.
+
+        Returns the loaded ``targets`` as name -> numpy. The checkpoint lives in
+        a ``TemporaryDirectory`` that is removed when the load completes.
+        """
         import tempfile
 
         import paddle.distributed as dist
@@ -387,39 +443,33 @@ class TestFannedOutLoadReachesBothEnds(unittest.TestCase):
             build_sharded_state_dict,
         )
 
-        want = np.arange(6, dtype="float32").reshape(2, 3)
-        path = tempfile.mkdtemp()
-        dist.save_state_dict(
-            build_sharded_state_dict(
-                {"shared.a.weight": paddle.to_tensor(want.copy())}
-            ),
-            path,
-        )
-        # 'encoder.a.weight' sorts before 'shared.a.weight', so the passthrough
-        # end wins the shared slot unless its self-copy routes it through a temp.
-        sharded = build_sharded_state_dict(
-            {
-                "shared.a.weight": paddle.full([2, 3], -7.0, dtype="float32"),
-                "encoder.a.weight": paddle.full([2, 3], -7.0, dtype="float32"),
-            }
-        )
-        dist.load_state_dict(
-            sharded, path, aoa_config={"aoa_statements": statements}
-        )
-        got = {
+        with tempfile.TemporaryDirectory() as path:
+            dist.save_state_dict(build_sharded_state_dict(saved), path)
+            sharded = build_sharded_state_dict(targets)
+            dist.load_state_dict(
+                sharded, path, aoa_config={"aoa_statements": statements}
+            )
+        return {
             name: shard.local_tensor.numpy() for name, shard in sharded.items()
         }
-        return want, got
 
     def test_self_copy_feeds_the_passthrough_and_the_rewritten_end(self):
         suffix = mt._SHARED_SOURCE_TEMP_SUFFIX
-        want, got = self._load_two_ends(
+        want = np.arange(6, dtype="float32").reshape(2, 3)
+        # 'encoder.a.weight' sorts before 'shared.a.weight', so the passthrough
+        # end wins the shared slot unless its self-copy routes it through a temp.
+        got = self._load(
+            {"shared.a.weight": paddle.to_tensor(want.copy())},
+            {
+                "shared.a.weight": paddle.full([2, 3], -7.0, dtype="float32"),
+                "encoder.a.weight": paddle.full([2, 3], -7.0, dtype="float32"),
+            },
             [
                 f"shared.a.weight^T -> shared.a.weight{suffix}",
                 f"shared.a.weight{suffix}^T -> shared.a.weight",
                 f"shared.a.weight^T -> encoder.a.weight{suffix}",
                 f"encoder.a.weight{suffix}^T -> encoder.a.weight",
-            ]
+            ],
         )
         np.testing.assert_array_equal(got["shared.a.weight"], want)
         np.testing.assert_array_equal(got["encoder.a.weight"], want)
@@ -428,17 +478,53 @@ class TestFannedOutLoadReachesBothEnds(unittest.TestCase):
         """Pins the hazard: the rename rewrite alone lets the two ends collide,
         so the rewritten end does not receive the checkpoint value."""
         suffix = mt._SHARED_SOURCE_TEMP_SUFFIX
-        want, got = self._load_two_ends(
+        want = np.arange(6, dtype="float32").reshape(2, 3)
+        got = self._load(
+            {"shared.a.weight": paddle.to_tensor(want.copy())},
+            {
+                "shared.a.weight": paddle.full([2, 3], -7.0, dtype="float32"),
+                "encoder.a.weight": paddle.full([2, 3], -7.0, dtype="float32"),
+            },
             [
                 f"shared.a.weight^T -> encoder.a.weight{suffix}",
                 f"encoder.a.weight{suffix}^T -> encoder.a.weight",
-            ]
+            ],
         )
         np.testing.assert_array_equal(got["shared.a.weight"], want)
         self.assertFalse(
             np.array_equal(got["encoder.a.weight"], want),
             "rewritten end should miss the value without a self-copy",
         )
+
+    def test_deferred_in_place_write_lets_the_reader_load_the_transpose(self):
+        """Numerically: after the fix defers ``S^T -> S`` behind its reader, a
+        real load gives the fanned-out end the transposed source. Non-square
+        ``[2, 3] -> [3, 2]`` makes the transpose observable in the shape.
+        """
+        towers = _fanout_towers(shared=True)
+        want = np.arange(6, dtype="float32").reshape(2, 3)
+        statements = mt._copy_path_for_shared_checkpoint_roots(
+            [
+                "shared.e.weight^T -> shared.e.weight",  # in-place depth-0 load
+                "shared.e.weight^T -> model.e.weight",  # fan-out reader
+            ],
+            towers,
+            set(),
+        )
+        statements = mt._defer_shared_source_self_writes(
+            statements, mt._shared_checkpoint_prefixes(towers)
+        )
+        self.assertEqual(statements[-1], "shared.e.weight^T -> shared.e.weight")
+        got = self._load(
+            {"shared.e.weight": paddle.to_tensor(want.copy())},
+            {
+                "shared.e.weight": paddle.zeros([3, 2], dtype="float32"),
+                "model.e.weight": paddle.zeros([3, 2], dtype="float32"),
+            },
+            statements,
+        )
+        np.testing.assert_array_equal(got["model.e.weight"], want.T)
+        np.testing.assert_array_equal(got["shared.e.weight"], want.T)
 
 
 if __name__ == "__main__":

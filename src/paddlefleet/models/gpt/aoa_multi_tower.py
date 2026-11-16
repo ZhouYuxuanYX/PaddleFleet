@@ -71,6 +71,56 @@ class AOATower:
 _SHARED_SOURCE_TEMP_SUFFIX = ".__shared_source_copy"
 
 
+def _shared_checkpoint_prefixes(towers) -> tuple[str, ...]:
+    """Checkpoint roots a tower declares shared (fanned out to other dests)."""
+    return tuple(
+        f"{tower.checkpoint_name_prefix}."
+        for tower in towers
+        if tower.shares_checkpoint_root and tower.checkpoint_name_prefix
+    )
+
+
+def _route_statement(statement, prefixes):
+    """Split one statement into its copy-path parts.
+
+    Returns ``(emitted, fanned_source)``. A plain rename out of a shared root
+    (one source, one destination, no transform) is rewritten into an identity
+    double transpose through a temporary and reports its source as fanned out;
+    everything else (including a transform ``S^T -> S``) already goes through a
+    temporary and is kept as is.
+    """
+    source, separator, destination = statement.partition(" -> ")
+    source, destination = source.strip(), destination.strip()
+    # A space rules out trailing attributes, a comma multi-source and
+    # multi-destination, a caret an existing transform -- all three already go
+    # through a temporary.
+    plain_rename = separator and not any(
+        character in source + destination for character in ",^ "
+    )
+    if plain_rename and source.startswith(prefixes):
+        temp = f"{destination}{_SHARED_SOURCE_TEMP_SUFFIX}"
+        pair = [f"{source}^T -> {temp}", f"{temp}^T -> {destination}"]
+        return pair, source
+    return [statement], None
+
+
+def _self_copies_for_passthrough_readers(fanned_out_sources, model_names):
+    """Self-copy each fanned-out source that is also a live model name.
+
+    The passthrough reader of a fanned-out source is a model parameter named
+    exactly like the checkpoint key and so direct-loads; route it through a
+    temporary too. Guarded on model membership so a pure fan-out with no
+    passthrough reader does not synthesize a self-copy into a name no parameter
+    owns.
+    """
+    self_copies = []
+    for source in fanned_out_sources:
+        if source in model_names:
+            temp = f"{source}{_SHARED_SOURCE_TEMP_SUFFIX}"
+            self_copies += [f"{source}^T -> {temp}", f"{temp}^T -> {source}"]
+    return self_copies
+
+
 def _copy_path_for_shared_checkpoint_roots(
     statements: list[str], towers, model_names
 ) -> list[str]:
@@ -95,45 +145,58 @@ def _copy_path_for_shared_checkpoint_roots(
     passthrough end. Keyed off the declared root, not off how many statements
     consume the source, because the passthrough end contributes none.
     """
-    prefixes = tuple(
-        f"{tower.checkpoint_name_prefix}."
-        for tower in towers
-        if tower.shares_checkpoint_root and tower.checkpoint_name_prefix
-    )
+    prefixes = _shared_checkpoint_prefixes(towers)
     if not prefixes:
         return statements
     rewritten = []
-    fanned_out_sources = []
-    seen_sources = set()
+    fanned = []
+    for statement in statements:
+        emitted, fanned_source = _route_statement(statement, prefixes)
+        rewritten += emitted
+        if fanned_source is not None:
+            fanned.append(fanned_source)
+    # Self-copies lead, matching the hand-written order where the source layer's
+    # identity statement preceded its readers'. A shared source's in-place
+    # self-write (``S^T -> S``) stays here in walk order; it is pushed behind its
+    # readers only after the pipeline gather, by _defer_shared_source_self_writes.
+    self_copies = _self_copies_for_passthrough_readers(
+        list(dict.fromkeys(fanned)), model_names
+    )
+    return self_copies + rewritten
+
+
+def _defer_shared_source_self_writes(statements, prefixes):
+    """Move a shared source's in-place self-write to the end of the program.
+
+    A shared checkpoint root loaded in place by a transform (``S^T -> S``, e.g.
+    the mHC ``e_proj`` / ``h_proj`` the fanned-out MTP depth 0 reads) must run
+    *after* every fan-out reader of ``S``. ``dist.load_state_dict`` applies the
+    statements in order and a later read sees the already-written
+    ``intermediate_vars`` entry, so a self-write before its readers
+    double-transposes them (the fanned MTP depths' ``e_proj`` / ``h_proj`` came
+    out untransposed).
+
+    Partitioned over the *globally gathered* program, not per rank:
+    ``globalize_statements`` concatenates the pipeline stages in rank order, so
+    when PP splits the MTP depths across stages (``separate_mtp_headloss``) the
+    source layer's stage and its readers' stage land in different blocks and only
+    a global stable partition keeps the self-write behind all readers. A plain
+    string decision -- no name resolution -- so it is safe after the gather.
+    """
+    kept = []
+    deferred = []
     for statement in statements:
         source, separator, destination = statement.partition(" -> ")
         source, destination = source.strip(), destination.strip()
-        # A space rules out trailing attributes, a comma multi-source and
-        # multi-destination, a caret an existing transform -- all three already
-        # go through a temporary.
-        plain_rename = separator and not any(
-            character in source + destination for character in ",^ "
-        )
-        if plain_rename and source.startswith(prefixes):
-            temp = f"{destination}{_SHARED_SOURCE_TEMP_SUFFIX}"
-            rewritten += [f"{source}^T -> {temp}", f"{temp}^T -> {destination}"]
-            if source not in seen_sources:
-                seen_sources.add(source)
-                fanned_out_sources.append(source)
+        if (
+            separator
+            and source.removesuffix("^T") == destination
+            and destination.startswith(prefixes)
+        ):
+            deferred.append(statement)
         else:
-            rewritten.append(statement)
-    # The passthrough reader of a fanned-out source is a model parameter named
-    # exactly like the checkpoint key and so direct-loads; route it through a
-    # temporary too. Guarded on model membership so a pure fan-out with no
-    # passthrough reader does not synthesize a self-copy into a name no
-    # parameter owns. Emitted before the renames to match the hand-written
-    # order, where the source layer's identity statement preceded its readers'.
-    self_copies = []
-    for source in fanned_out_sources:
-        if source in model_names:
-            temp = f"{source}{_SHARED_SOURCE_TEMP_SUFFIX}"
-            self_copies += [f"{source}^T -> {temp}", f"{temp}^T -> {source}"]
-    return self_copies + rewritten
+            kept.append(statement)
+    return kept + deferred
 
 
 def _iter_tower_units(
@@ -191,7 +254,14 @@ def gen_multi_tower_aoa(model, towers) -> dict[str, list[str]]:
     # carry it (HyperBody builds its encoder view from an explicit field list),
     # which would turn the "declared pipeline without a group" error into a
     # silent rank-local config.
-    return {"aoa_statements": globalize_statements(model.config, statements)}
+    statements = globalize_statements(model.config, statements)
+    # A shared source's in-place self-write must trail its fan-out readers in the
+    # whole-model program, which PP may split across stages -- defer after the
+    # gather, not per rank.
+    statements = _defer_shared_source_self_writes(
+        statements, _shared_checkpoint_prefixes(towers)
+    )
+    return {"aoa_statements": statements}
 
 
 def gen_multi_tower_inv_aoa(model, towers) -> dict[str, list[str]]:
