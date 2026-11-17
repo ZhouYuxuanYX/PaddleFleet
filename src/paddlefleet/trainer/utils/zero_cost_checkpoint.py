@@ -161,6 +161,12 @@ _LAST_START_UNCHANGED = "__zcc_last_start_data_status_unchanged__"
 _SAVED_BASE_UNCHANGED = "__zcc_saved_data_status_base_unchanged__"
 # saved_data_status sent as (tag, base or _SAVED_BASE_UNCHANGED, diff_ids, diff_cnts); the worker rebuilds base + diff
 _SAVED_BASE_PLUS_DIFF = "__zcc_saved_data_status_base_plus_diff__"
+# Per-part mix_sample_packing positions; only the ranks that write trainer_state need them
+_ZCC_MIX_POS_KEY = "mix_sample_pos"
+_MIX_W_BASE_UNCHANGED = "__zcc_mix_sample_pos_w_base_unchanged__"
+# mix_sample_pos["W"] sent as (tag, base or _MIX_W_BASE_UNCHANGED, diff_ids, diff_vals); the worker rebuilds
+# the list with W[diff_ids] = diff_vals. diff_vals are absolute watermarks, not increments
+_MIX_W_BASE_PLUS_DIFF = "__zcc_mix_sample_pos_w_base_plus_diff__"
 
 
 def _zcc_already_sent(owner, attr, value):
@@ -1019,14 +1025,17 @@ class ZeroCostCheckpointCallback(TrainerCallback):
           is sent as "base (placeholder when unchanged) + accumulated diff" when the data side provides
           _zcc_saved_base / _zcc_saved_diff, and rebuilt by the worker;
         - multiple workers: their caches may differ, so full arrays are always sent; a saved_data_status that is
-          updated in place is copied so the asynchronous feeder-thread pickle never sees a partial update.
+          updated in place is copied so the asynchronous feeder-thread pickle never sees a partial update;
+        - mix_sample_pos follows the same rules: dropped for non-writing ranks and EMA-only steps; for a
+          single worker its W is sent as "base + changed entries" when the data side provides
+          _zcc_mix_w_base / _zcc_mix_w_diff.
 
         "Unchanged" means "the same object as last sent", so producers must assign a new array instead of
-        updating last_start_data_status or _zcc_saved_base in place. See _zcc_already_sent.
+        updating last_start_data_status, _zcc_saved_base or _zcc_mix_w_base in place. See _zcc_already_sent.
         """
         tp = getattr(state, "trial_params", None)
         if not isinstance(tp, dict) or not any(
-            k in tp for k in _ZCC_DATA_STATUS_KEYS
+            k in tp for k in _ZCC_DATA_STATUS_KEYS + (_ZCC_MIX_POS_KEY,)
         ):
             return state
         snap = copy.copy(state)
@@ -1034,17 +1043,41 @@ class ZeroCostCheckpointCallback(TrainerCallback):
         tp.pop("data_status", None)
         base = tp.pop("_zcc_saved_base", None)
         diff = tp.pop("_zcc_saved_diff", None)
+        w_base = tp.pop("_zcc_mix_w_base", None)
+        w_diff = tp.pop("_zcc_mix_w_diff", None)
         if not dumping or self.manager.device_id != 0:
             tp.pop("saved_data_status", None)
             tp.pop("last_start_data_status", None)
+            tp.pop(_ZCC_MIX_POS_KEY, None)
         elif len(self.manager.workers) == 1:
             self._slim_for_single_worker(tp, base, diff)
+            self._slim_mix_pos_for_single_worker(tp, w_base, w_diff)
         elif "saved_data_status" in tp and base is not None:
             tp["saved_data_status"] = np.array(
                 tp["saved_data_status"], copy=True
             )
         snap.trial_params = tp
         return snap
+
+    def _slim_mix_pos_for_single_worker(self, tp, w_base, w_diff):
+        """Send mix_sample_pos["W"] as base (placeholder when unchanged) + changed entries."""
+        pos = tp.get(_ZCC_MIX_POS_KEY)
+        if (
+            not isinstance(pos, dict)
+            or "W" not in pos
+            or w_base is None
+            or w_diff is None
+        ):
+            return
+        base_payload = (
+            _MIX_W_BASE_UNCHANGED
+            if _zcc_already_sent(self, "_zcc_mix_w_base_sent", w_base)
+            else w_base
+        )
+        # shallow copy: the main process keeps its own mix_sample_pos untouched
+        tp[_ZCC_MIX_POS_KEY] = dict(
+            pos, W=(_MIX_W_BASE_PLUS_DIFF, base_payload, w_diff[0], w_diff[1])
+        )
 
     def _slim_for_single_worker(self, tp, base, diff):
         """Replace unchanged arrays in `tp` with placeholders and send saved_data_status as base + diff."""
@@ -1790,6 +1823,33 @@ class ZeroCostCheckpointWorker:
                 "_cached_last_start_data_status",
                 "last_start_data_status",
             )
+        self._restore_mix_pos(tp)
+
+    def _restore_mix_pos(self, tp):
+        """Rebuild mix_sample_pos["W"] (a list, as on disk) from base + changed entries."""
+        tp.pop("_zcc_mix_w_base", None)
+        tp.pop("_zcc_mix_w_diff", None)
+        pos = tp.get(_ZCC_MIX_POS_KEY)
+        w = pos.get("W") if isinstance(pos, dict) else None
+        if not (
+            isinstance(w, tuple)
+            and len(w) == 4
+            and isinstance(w[0], str)
+            and w[0] == _MIX_W_BASE_PLUS_DIFF
+        ):
+            return
+        _, base, ids, vals = w
+        base = self._resolve_cached(
+            base,
+            _MIX_W_BASE_UNCHANGED,
+            "_cached_mix_w_base",
+            "mix_sample_pos W base",
+        )
+        dense = np.array(base, dtype=np.int64, copy=True)
+        dense[np.asarray(ids, dtype=np.int64)] = np.asarray(
+            vals, dtype=np.int64
+        )
+        pos["W"] = dense.tolist()
 
     def _resolve_cached(self, value, placeholder, attr, what):
         """Replace `placeholder` with the value cached in `self.<attr>`; cache any other value."""

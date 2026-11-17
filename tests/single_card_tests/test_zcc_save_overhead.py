@@ -385,6 +385,109 @@ class TestTrainerStateSlimming(unittest.TestCase):
         )
 
 
+def _mix_state(W, w_base=None, w_diff=None):
+    state = _state(np.ones(N, np.int64), np.zeros(N, np.int64))
+    tp = state.trial_params
+    tp["mix_sample_pos"] = {
+        "W": [int(x) for x in W],
+        "E": {"3": [7]},
+        "cursors": {"0": {"c": 0, "j": 5}},
+        "meta": {"seed": 1},
+    }
+    if w_base is not None:
+        tp["_zcc_mix_w_base"] = w_base
+        tp["_zcc_mix_w_diff"] = w_diff
+    return state
+
+
+class TestMixPosSlimming(unittest.TestCase):
+    def test_non_writing_rank_and_ema_step_send_no_mix_pos(self):
+        W = np.arange(N, dtype=np.int64)
+        base = W.copy()
+        diff = (np.zeros(0, np.int64), np.zeros(0, np.int64))
+        for cb, dumping in (
+            (_callback(device_id=1), True),
+            (_callback(), False),
+        ):
+            sent, got = _send(cb, _worker(), _mix_state(W, base, diff), dumping)
+            for key in ("mix_sample_pos", "_zcc_mix_w_base", "_zcc_mix_w_diff"):
+                self.assertNotIn(key, sent)
+                self.assertNotIn(key, got)
+
+    def test_mix_pos_alone_is_still_slimmed(self):
+        state = SimpleNamespace(
+            global_step=1, trial_params={"mix_sample_pos": {"W": [1]}}
+        )
+        snap = _callback(device_id=1)._state_for_worker(state)
+        self.assertNotIn("mix_sample_pos", snap.trial_params)
+
+    def test_single_worker_w_base_plus_diff(self):
+        rng = np.random.default_rng(0)
+        cb, worker = _callback(), _worker()
+        W = rng.integers(0, 5, N)
+        base = W.copy()
+        for rnd in range(3):
+            W = W.copy()
+            W[rng.integers(0, N, 4)] += 1
+            ids = np.flatnonzero(W != base).astype(np.int64)
+            state = _mix_state(W, base, (ids, W[ids]))
+            main_pos = state.trial_params["mix_sample_pos"]
+            sent, got = _send(cb, worker, state)
+            # the worker writes the same list the main process holds
+            self.assertEqual(got["mix_sample_pos"], main_pos)
+            self.assertIsInstance(got["mix_sample_pos"]["W"], list)
+            self.assertNotIn("_zcc_mix_w_base", got)
+            self.assertNotIn("_zcc_mix_w_diff", got)
+            # the main process's own mix_sample_pos is not replaced
+            self.assertIsInstance(main_pos["W"], list)
+            # the base travels only once
+            self.assertEqual(
+                isinstance(sent["mix_sample_pos"]["W"][1], np.ndarray), rnd == 0
+            )
+
+    def test_rebased_w_is_sent_again(self):
+        cb, worker = _callback(), _worker()
+        W = np.arange(N, dtype=np.int64)
+        empty = (np.zeros(0, np.int64), np.zeros(0, np.int64))
+        _send(cb, worker, _mix_state(W, W.copy(), empty))
+        W2 = W + 1
+        new_base = W2.copy()
+        sent, got = _send(cb, worker, _mix_state(W2, new_base, empty))
+        self.assertIs(sent["mix_sample_pos"]["W"][1], new_base)
+        self.assertEqual(got["mix_sample_pos"]["W"], W2.tolist())
+
+    def test_w_placeholder_without_cache_raises(self):
+        cb = _callback()
+        W = np.arange(N, dtype=np.int64)
+        base = W.copy()
+        empty = (np.zeros(0, np.int64), np.zeros(0, np.int64))
+        cb._state_for_worker(_mix_state(W, base, empty))
+        snap = cb._state_for_worker(_mix_state(W, base, empty))
+        self.assertEqual(
+            snap.trial_params["mix_sample_pos"]["W"][1],
+            zcc._MIX_W_BASE_UNCHANGED,
+        )
+        fresh = _worker()
+        fresh._cached_saved_base = None
+        fresh.trainer_state = pickle.loads(pickle.dumps(snap))
+        fresh._cached_last_start_data_status = np.zeros(N, np.int64)
+        with self.assertRaises(RuntimeError):
+            fresh._restore_trainer_state()
+
+    def test_without_w_diff_or_with_several_workers_w_is_sent_in_full(self):
+        W = np.arange(N, dtype=np.int64)
+        for cb, state in (
+            (_callback(), _mix_state(W)),
+            (
+                _callback(n_workers=2),
+                _mix_state(W, W.copy(), (np.zeros(0, np.int64),) * 2),
+            ),
+        ):
+            sent, got = _send(cb, _worker(), state)
+            self.assertEqual(sent["mix_sample_pos"]["W"], W.tolist())
+            self.assertEqual(got["mix_sample_pos"]["W"], W.tolist())
+
+
 class _Task:
     def __init__(self, log):
         self.log = log
