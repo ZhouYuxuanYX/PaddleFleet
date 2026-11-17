@@ -47,6 +47,7 @@ the default "forbidden":
 |---|---|---|
 | :func:`build_dense_mask`             | ``[1,1,T',T']`` bool | eager path (explicit score + mask_func) |
 | :func:`build_flashmask_row_indices`  | ``[1,1,T',2]`` int32 | ``flashmask_attention(causal=False)`` column-sparse path |
+| :func:`build_flashmask_row_indices` (``return_query_index``) | ``[sum(suffix_lens)]`` int32: the suffix rows' positions, segment by segment | packed encoder -> bridge gather |
 
 :func:`expand_row_indices_to_dense` is for unit tests only. It makes it
 possible to *assert* that both paths share the same mask source of truth,
@@ -70,7 +71,7 @@ are constant, so only the non-causal 2-column form ``[LTS, UTE]`` is emitted:
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, overload
 
 import paddle
 
@@ -186,12 +187,33 @@ def build_dense_mask(
     return mask
 
 
+@overload
 def build_flashmask_row_indices(
     prefix_lens: Sequence[int],
     suffix_lens: Sequence[int],
     pad_len: int = 0,
     place=None,
-) -> paddle.Tensor:
+    return_query_index: Literal[False] = False,
+) -> paddle.Tensor: ...
+
+
+@overload
+def build_flashmask_row_indices(
+    prefix_lens: Sequence[int],
+    suffix_lens: Sequence[int],
+    pad_len: int = 0,
+    place=None,
+    return_query_index: Literal[True] = ...,
+) -> tuple[paddle.Tensor, paddle.Tensor]: ...
+
+
+def build_flashmask_row_indices(
+    prefix_lens: Sequence[int],
+    suffix_lens: Sequence[int],
+    pad_len: int = 0,
+    place=None,
+    return_query_index: bool = False,
+) -> paddle.Tensor | tuple[paddle.Tensor, paddle.Tensor]:
     """Representation 2: FlashMask column-sparse indices ``[1, 1, T', 2]`` int32.
 
     The 2 columns are ``[LTS, UTE]`` for ``flashmask_attention(causal=False)``
@@ -201,6 +223,9 @@ def build_flashmask_row_indices(
     ``searchsorted`` instead of ``repeat_interleave`` (whose tensor ``repeats``
     forces a D2H read of the output size): all shapes are known on the host, so
     nothing is read back. The single small H2D is the only transfer.
+
+    ``return_query_index`` also returns the ``[sum(suffix_lens)]`` int32 row ids
+    of the suffix rows, segment by segment, computed from the same table.
     """
     _check_lens(prefix_lens, suffix_lens, pad_len)
     starts = prefix_lm_segment_starts(prefix_lens, suffix_lens)
@@ -237,7 +262,18 @@ def build_flashmask_row_indices(
     out = paddle.stack([lts, ute], axis=-1).reshape([1, 1, tp, 2])
     if place is not None:
         out = out.to(place)
-    return out
+    if not return_query_index:
+        return out
+
+    # Suffix position k of segment i sits at row end_i - q_end_i + k, with q_end
+    # the running count of suffix rows.
+    q_end = paddle.cumsum(seg_end - seg_prefix_end, dtype="int32")
+    k = paddle.arange(sum(int(q) for q in suffix_lens), dtype="int32")
+    seg_k = paddle.searchsorted(q_end, k, out_int32=True, right=True)
+    query_index = paddle.gather(seg_end - q_end, seg_k) + k
+    if place is not None:
+        query_index = query_index.to(place)
+    return out, query_index
 
 
 def expand_row_indices_to_dense(row_indices: paddle.Tensor) -> paddle.Tensor:

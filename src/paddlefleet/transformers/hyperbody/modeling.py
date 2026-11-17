@@ -781,7 +781,7 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
         ``[1, T, H]`` sequence. The prefix-LM mask goes to the trunk as FlashMask
         row indices ``[1, 1, T, 2]`` under ``attn_mask_startend_row_indices``
         (consumed with ``causal=False``); the segment layout is also carried
-        under ``_hb_packed`` for the bridge's per-segment slice.
+        under ``_hb_packed`` for the bridge's query-row gather.
         ``attention_mask`` / ``packed_seq_params`` are None: the mask semantics
         live entirely in the row indices.
 
@@ -842,8 +842,10 @@ class HyperBodyEncoderFrontEnd(FleetLayer):
             "n_contexts": tuple(n_contexts),
             "n_queries": tuple(nq_list),
         }
-        row_indices = build_flashmask_row_indices(
-            n_contexts, nq_list, pad, place=x.place
+        # query_index: [sum(Q_i)] int32 row ids of those query rows in ``x``, in
+        # segment order, on x.place -- what the bridge gathers.
+        row_indices, layout["query_index"] = build_flashmask_row_indices(
+            n_contexts, nq_list, pad, place=x.place, return_query_index=True
         )
 
         rope = self._packed_rope(max_seqlen, seg_lens)
@@ -897,7 +899,7 @@ class HyperBodyEncoderBridge(FleetLayer):
 
     Reapplies the encoder block's final ``HyperEncoderRMSNorm`` (lost when the
     ``HyperEncoderBlock`` is decomposed into per-layer specs), drops the pad,
-    slices the trailing ``Q`` rows, runs the per-batch ``out_projector``
+    gathers the trailing ``Q`` rows, runs the per-batch ``out_projector``
     (RowParallelLinear -> ``language_hidden_size``, adds bias by hand), and emits
     the *clean decoder* dict. It DROPS the encoder ``hidden_states`` so the
     downstream ``GPTEmbedding`` regenerates ``[B,S,H_dec]`` from ``input_ids``
@@ -1000,8 +1002,8 @@ class HyperBodyEncoderBridge(FleetLayer):
         return paddle.concat(outs, axis=0)  # [B*Q, H_dec]
 
     def _forward_packed(self, dict_args, layout):
-        # hidden_states is [1, ΣL_i(+pad), H_enc]; slice each segment's trailing
-        # query rows via the packed layout, out-project, concat -> [ΣQ_i, H_dec].
+        # hidden_states is [1, ΣL_i(+pad), H_enc]; gather each segment's trailing
+        # query rows via layout["query_index"], out-project, concat -> [ΣQ_i, H_dec].
         h = dict_args["hidden_states"]
         if getattr(
             self.config, "hyperencoder_cp_shard", False
@@ -1009,16 +1011,29 @@ class HyperBodyEncoderBridge(FleetLayer):
             h = ContextParallelGatherOp.apply(
                 h, axis=1, mode=self.config.cp_balance_mode
             )
-        h = self.final_norm(h)[0]  # [T, H_enc]
-        starts = layout["segment_starts"]
-        n_contexts = layout["n_contexts"]
         n_queries = layout["n_queries"]
 
-        outs = []
-        for s, nc, nq in zip(starts, n_contexts, n_queries):
-            latents = h[s + nc : s + nc + nq, :]  # [Q_i, H_enc]
-            outs.append(self._project(latents))
-        return paddle.concat(outs, axis=0)  # [ΣQ_i, H_dec]
+        # Normalize only the query rows the segments keep. RMSNorm is per row, so this is
+        # row-for-row identical to normalizing the whole packed sequence first -- but the
+        # discarded context rows never need a norm, and the fp32 upcast shrinks from T_enc
+        # rows to sum(Q_i) rows (at row16: 3.4M -> 0.61M, i.e. 24.8 GB -> 4.6 GB transient).
+        # Sensitivity: the forward is bit-identical. Backward differs only in
+        # ``final_norm.weight``, whose grad is a reduction over rows -- the reduction tree
+        # now sums sum(Q_i) rows instead of T_enc (the extra rows contributed exact zeros),
+        # so its last bits can differ. ``d(h)`` differs only in the sign of zero on the
+        # discarded rows. Do not use bitwise-equal loss as the acceptance test for this
+        # change; step-0 loss is equal, later steps may drift by ulps.
+        # One gather and one split: a per-segment slice's backward zero-fills a buffer
+        # the size of its source.
+        query_rows = paddle.gather(
+            h, layout["query_index"], axis=1
+        )  # [1, sum(Q_i), H_enc]
+        normed = self.final_norm(query_rows)[0]  # [sum(Q_i), H_enc]
+        outs = [
+            self._project(x)
+            for x in paddle.split(normed, list(n_queries), axis=0)
+        ]
+        return paddle.concat(outs, axis=0)  # [sum(Q_i), H_dec]
 
     # AOA: a stage-one warm start trains ``out_projector`` from its own init,
     # so its archive has no projector to read -- ``projector_cold_start`` says

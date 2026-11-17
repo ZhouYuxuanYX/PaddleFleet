@@ -208,5 +208,65 @@ class TestExplicitPlace(unittest.TestCase):
         self.assertEqual(gpu.numpy().tolist(), cpu.numpy().tolist())
 
 
+class TestQueryIndex(unittest.TestCase):
+    """``return_query_index``: the suffix rows of every segment, in segment order."""
+
+    def _expected(self, prefix_lens, suffix_lens):
+        rows = []
+        for start, p, q in zip(
+            prefix_lm_segment_starts(prefix_lens, suffix_lens),
+            prefix_lens,
+            suffix_lens,
+        ):
+            rows.extend(range(start + p, start + p + q))
+        return rows
+
+    def test_matches_segment_suffix_rows(self):
+        cases = [
+            ([3], [2], 0),
+            ([2, 3], [2, 1], 4),  # + pad
+            ([0, 2], [3, 2], 2),  # empty prefix in the first segment
+            ([2, 0], [1, 1], 0),  # empty prefix in the last segment
+            ([0], [1], 0),  # smallest legal pack
+            ([5, 1, 0, 7], [1, 3, 2, 1], 1),  # uneven suffixes + 1-token pad
+        ]
+        for prefix, suffix, pad in cases:
+            with self.subTest(prefix=prefix, suffix=suffix, pad=pad):
+                ri, qi = build_flashmask_row_indices(
+                    prefix, suffix, pad, return_query_index=True
+                )
+                rows = qi.numpy().tolist()
+                self.assertEqual(rows, self._expected(prefix, suffix))
+                # suffix rows never repeat, and the pad rows are never picked
+                self.assertEqual(len(set(rows)), len(rows))
+                self.assertEqual(
+                    ri.numpy().tolist(),
+                    build_flashmask_row_indices(prefix, suffix, pad)
+                    .numpy()
+                    .tolist(),
+                )
+
+    def test_random_packs(self):
+        rng = random.Random(20261117)
+        for _ in range(20):
+            n = rng.randint(1, 6)
+            prefix = [rng.randint(0, 9) for _ in range(n)]
+            suffix = [rng.randint(1, 9) for _ in range(n)]
+            pad = rng.choice([0, 0, 1, rng.randint(2, 7)])
+            with self.subTest(prefix=prefix, suffix=suffix, pad=pad):
+                _, qi = build_flashmask_row_indices(
+                    prefix, suffix, pad, return_query_index=True
+                )
+                self.assertEqual(
+                    qi.numpy().tolist(), self._expected(prefix, suffix)
+                )
+
+    def test_default_returns_row_indices_only(self):
+        # every other caller keeps the single-tensor return
+        self.assertIsInstance(
+            build_flashmask_row_indices([2], [2]), paddle.Tensor
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

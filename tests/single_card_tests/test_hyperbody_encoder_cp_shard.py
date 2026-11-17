@@ -325,7 +325,21 @@ class TestFrontEndCut(unittest.TestCase):
                             )
                         )
                     )
-                    self.assertEqual(o["_hb_packed"], full["_hb_packed"])
+                    self.assertEqual(
+                        set(o["_hb_packed"]), set(full["_hb_packed"])
+                    )
+                    for key, value in full["_hb_packed"].items():
+                        if isinstance(value, paddle.Tensor):
+                            self.assertTrue(
+                                bool(
+                                    paddle.equal_all(
+                                        o["_hb_packed"][key], value
+                                    )
+                                ),
+                                key,
+                            )
+                        else:
+                            self.assertEqual(o["_hb_packed"][key], value, key)
                 for key in ("hidden_states", "rotary_pos_emb"):
                     merged = _gather_all([o[key] for o in outs], cp, mode)
                     self.assertTrue(

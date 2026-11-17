@@ -215,11 +215,11 @@ class GPTEmbedding(FleetLayer):
     ):
         """Replace image/video placeholder tokens with encoded visual features.
 
-        Must run on a full-length ``decoder_input``: ``get_placeholder_mask``
-        expands the token mask with ``expand_as`` and checks element counts, so
-        it cannot operate on a sequence already truncated by
-        ``num_nextn_predict_layers``. This is why the caller invokes it *before*
-        the MTP split.
+        Must run on a full-length ``decoder_input``: the features are ordered by
+        placeholder position over the whole sequence and their count is checked
+        against the placeholder count, so it cannot operate on a sequence
+        already truncated by ``num_nextn_predict_layers``. This is why the caller
+        invokes it *before* the MTP split.
 
         The sequence-parallel scatter is deliberately not done here; the caller
         applies it once, after the MTP split, so the two paths cannot scatter
@@ -241,72 +241,40 @@ class GPTEmbedding(FleetLayer):
         video_embeds = dict_args.get("video_embeds", None)
         image_mask = None
         video_mask = None
+        # Row-level merge: placeholder positions come from a [B, S] token mask,
+        # and whole rows of decoder_input are overwritten with the features.
+        # Never expand the mask to [B, S, H]: at S=1M, H=4096 the element-level
+        # masks, (1 - mask) blends and the [N*H] int64 nonzero index cost ~60 GB
+        # of temporaries per rank, while the result is the same row copy.
+        # Backward of paddle.scatter: features get grad[pos] (gather), the base
+        # gets grad with the overwritten rows zeroed -- no sparse atomics.
         if image_embeds is not None:
-            image_mask, _ = self.get_placeholder_mask(
+            image_mask = self._placeholder_token_mask(
                 input_ids,
-                inputs_embeds=decoder_input,
-                image_features=image_embeds,
+                decoder_input,
+                self.config.image_token_id,
+                image_embeds,
+                "Image",
+            )  # [B, S] bool
+            decoder_input = self._scatter_rows(
+                decoder_input, image_mask, image_embeds
             )
-            # Replace masked_scatter with arithmetic blend to avoid
-            # IndexingBackwardKernel (sparse scatter) in the backward pass.
-            #   image_mask : [B, S, H] bool
-            #   image_embeds: [N_img, H]  (N_img = number of image tokens)
-            # Expand image_embeds into the full [B, S, H] space by:
-            #   1. flatten decoder_input and image_mask to 1-D
-            #   2. use paddle.scatter (dense backward = gather) to place
-            #      image_embeds values at the True positions
-            #   3. blend with original decoder_input via mask arithmetic
-            #
-            # Optimization: reuse decoder_input's flattened buffer as the
-            # scatter base (scaled by (1-mask)) to avoid a separate
-            # paddle.zeros([n_total]) allocation (~192 MB bf16 tensor).
-            image_mask_f = image_mask.astype(
-                decoder_input.dtype
-            )  # [B,S,H] float
-            flat_indices = paddle.nonzero(image_mask.reshape([-1])).squeeze(
-                -1
-            )  # [N_img*H] int64 — dense nonzero, no scatter bwd
-            # Scale the base tensor by (1 - mask) in-place before scatter
-            # so that visual positions are zero — no extra zeros allocation.
-            base_flat = (decoder_input * (1.0 - image_mask_f)).reshape([-1])
-            image_src_flat = paddle.scatter(
-                base_flat,
-                flat_indices,
-                image_embeds.astype(decoder_input.dtype).reshape([-1]),
-            )  # scatter bwd is a simple gather — no sparse atomics
-            # AMP O2 keeps ``scatter`` on its fp32 black list, so the blend comes
-            # back fp32 even with bf16 operands. Cast it back (lossless, scatter
-            # only copies); otherwise the residual stream stays fp32 for this
-            # micro-batch and the fused LM-head CE sees fp32 hidden states
-            # against bf16 weights.
-            decoder_input = image_src_flat.reshape(decoder_input.shape).astype(
-                decoder_input.dtype
-            )
-            visual_pos_masks = image_mask[..., 0]
+            visual_pos_masks = image_mask
             deepstack_visual_embeds = deepstack_image_embeds
         if video_embeds is not None:
-            _, video_mask = self.get_placeholder_mask(
+            video_mask = self._placeholder_token_mask(
                 input_ids,
-                inputs_embeds=decoder_input,
-                video_features=video_embeds,
+                decoder_input,
+                self.config.video_token_id,
+                video_embeds,
+                "Video",
+            )  # [B, S] bool
+            decoder_input = self._scatter_rows(
+                decoder_input, video_mask, video_embeds
             )
-            video_mask_f = video_mask.astype(decoder_input.dtype)
-            flat_indices = paddle.nonzero(video_mask.reshape([-1])).squeeze(-1)
-            base_flat = (decoder_input * (1.0 - video_mask_f)).reshape([-1])
-            video_src_flat = paddle.scatter(
-                base_flat,
-                flat_indices,
-                video_embeds.astype(decoder_input.dtype).reshape([-1]),
-            )
-            # Same fp32 black-list cast-back as the image branch above.
-            decoder_input = video_src_flat.reshape(decoder_input.shape).astype(
-                decoder_input.dtype
-            )
-            visual_pos_masks = video_mask[..., 0]
+            visual_pos_masks = video_mask
             deepstack_visual_embeds = deepstack_video_embeds
         if image_embeds is not None and video_embeds is not None:
-            image_mask = image_mask[..., 0]  # [B, S] bool
-            video_mask = video_mask[..., 0]  # [B, S] bool
             visual_pos_masks = image_mask | video_mask
             deepstack_visual_embeds = []
             for img_embed, vid_embed in zip(
@@ -343,6 +311,46 @@ class GPTEmbedding(FleetLayer):
                 )
                 deepstack_visual_embeds.append(embed_joint)
         return decoder_input, visual_pos_masks, deepstack_visual_embeds
+
+    def _placeholder_token_mask(
+        self, input_ids, decoder_input, token_id, features, kind
+    ):
+        """``[B, S]`` bool mask of ``token_id`` placeholders.
+
+        Token-level counterpart of :meth:`get_placeholder_mask` (same detection
+        and count check, without expanding to ``[B, S, H]``).
+        """
+        if input_ids is None:
+            mask = (
+                decoder_input
+                == self.embedding(paddle.to_tensor(token_id, dtype="int64"))
+            ).all(-1)
+        else:
+            mask = input_ids == token_id
+        n_tokens = int(mask.sum())
+        if n_tokens * decoder_input.shape[-1] != features.numel():
+            raise ValueError(
+                f"{kind} features and {kind.lower()} tokens do not match: "
+                f"tokens: {n_tokens}, features {features.shape[0]}"
+            )
+        return mask
+
+    @staticmethod
+    def _scatter_rows(decoder_input, mask, features):
+        """Overwrite the rows of ``decoder_input`` where ``mask`` is True with
+        the rows of ``features``, in placeholder order."""
+        b, s, h = decoder_input.shape
+        pos = paddle.nonzero(mask.reshape([-1])).squeeze(-1)  # [N] int64
+        out = paddle.scatter(
+            decoder_input.reshape([b * s, h]),
+            pos,
+            features.astype(decoder_input.dtype).reshape([-1, h]),
+            overwrite=True,
+        )
+        # AMP O2 keeps ``scatter`` on its fp32 black list, so the result comes
+        # back fp32 even with bf16 operands. Cast back, or the residual stream
+        # stays fp32 for this micro-batch.
+        return out.reshape([b, s, h]).astype(decoder_input.dtype)
 
     def forward(
         self,

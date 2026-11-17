@@ -291,6 +291,17 @@ class TestFrontEndForwardPacked(unittest.TestCase):
                     self.assertTrue(
                         bool(paddle.equal_all(h[0, s + c : s + c + q], table))
                     )
+                # ... and query_index is exactly those rows, for the bridge's gather
+                self.assertEqual(
+                    layout["query_index"].numpy().tolist(),
+                    [
+                        r
+                        for s, c, q in zip(
+                            layout["segment_starts"], ctx_lens, nq
+                        )
+                        for r in range(s + c, s + c + q)
+                    ],
+                )
                 if pad:
                     self.assertEqual(float(h[0, seq_len:].abs().max()), 0.0)
                 self.assertEqual(out["seq_len"], seq_len)
