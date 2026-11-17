@@ -28,6 +28,7 @@ import paddle
 # Patch CUTLASS DSL scalar types to cache __c_pointers__ results.
 # Prevents pymalloc arena fragmentation from short-lived ctypes objects
 # created on every kernel launch. Must run before any CUTLASS kernel is called.
+# NOTE:remove this patch in the future.
 # ---------------------------------------------------------------------------
 def _patch_cutlass_cptr_cache(maxsize=4096):
     try:
