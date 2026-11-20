@@ -49,10 +49,6 @@ from paddlefleet.tensor_parallel import (
     finalize_mhc_recompute_block,
     get_mhc_recompute_manager,
 )
-from paddlefleet.train_infer_consistent_ops.inspect_util import (
-    inspect_tensor,
-    inspect_tensor_set_current_layer,
-)
 from paddlefleet.transformer.dsv4_hybrid_attention import DSv4HybridAttention
 from paddlefleet.transformer.hyper_connection import MhcAggregateRecompute
 from paddlefleet.transformer.identity_op import IdentityFuncOp, IdentityOp
@@ -444,8 +440,6 @@ class TransformerLayer(nn.Layer):
                     "TP process group is required for MLP in TransformerLayer"
                 )
                 additional_mlp_kwargs["tp_group"] = pg_collection.tp
-
-                additional_mlp_kwargs["inspect_name"] = "dense_mlp"
             else:
                 log_single_rank(
                     logger,
@@ -1413,9 +1407,6 @@ class TransformerLayer(nn.Layer):
             output = partial_block + mlp_out
         else:
             self._log_md5(hidden_states, "input", self.layer_number)
-            hidden_states = inspect_tensor(
-                "layer_input", self.layer_number, hidden_states
-            )
             with profile("attn"):
                 if need_do_attention():
                     hidden_states, context, indexcache_state = (
@@ -1453,7 +1444,6 @@ class TransformerLayer(nn.Layer):
                     origin_input_ids=origin_input_ids,
                 )
             self._log_md5(output, "layer_output", self.layer_number)
-            output = inspect_tensor("layer_output", self.layer_number, output)
         if indexcache_state is not None:
             return output, context, indexcache_state
         if context is not None:
@@ -2252,9 +2242,6 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         )
         aggregated = aggregated.to(ori_dtype)
 
-        h_post = inspect_tensor("mhc_attn_post", self.layer_number, h_post)
-        h_res = inspect_tensor("mhc_attn_comb", self.layer_number, h_res)
-
         # LayerNorm on aggregated single stream
         input_layernorm_output = self._mhc_layernorm(
             self.input_layernorm,
@@ -2264,18 +2251,8 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             self.recompute_input_layernorm,
         )
 
-        # Observation only: "Attn_input" below owns this tensor's injection.
-        inspect_tensor(
-            "mhc_attn_pre",
-            self.layer_number,
-            input_layernorm_output,
-            load=False,
-        )
         self._log_md5(
             input_layernorm_output, "input_layernorm_out", self.layer_number
-        )
-        input_layernorm_output = inspect_tensor(
-            "Attn_input", self.layer_number, input_layernorm_output
         )
 
         # Self-attention
@@ -2367,12 +2344,6 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             indexcache_state_updated = True
 
         # mHC: fused H_res + H_post + bias-dropout-add
-        attention_output_with_bias = inspect_tensor(
-            "Attn_output",
-            self.layer_number,
-            attention_output_with_bias,
-            index=0,
-        )
         hidden_states, bda_recompute = self._fused_h_res_h_post_bda(
             self.self_attention_hyper_connection,
             h_res,
@@ -2391,9 +2362,6 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             self._attn_mhc_recompute = None
         hidden_states = self._cast_and_discard_fused_bda(
             hidden_states, ori_dtype, bda_recompute
-        )
-        hidden_states = inspect_tensor(
-            "mhc_attn_residual_output", self.layer_number, hidden_states
         )
 
         # Cross attention (unchanged)
@@ -2456,9 +2424,6 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         )
         aggregated = aggregated.to(ori_dtype)
 
-        h_post = inspect_tensor("mhc_mlp_post", self.layer_number, h_post)
-        h_res = inspect_tensor("mhc_mlp_comb", self.layer_number, h_res)
-
         # LayerNorm on aggregated single stream
         post_attention_layernorm_output = self._mhc_layernorm(
             self.post_attention_layernorm,
@@ -2468,13 +2433,6 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             self.recompute_post_attention_layernorm,
         )
 
-        # Observation only: "moe_or_dense_input" below owns the injection.
-        inspect_tensor(
-            "mhc_mlp_pre",
-            self.layer_number,
-            post_attention_layernorm_output,
-            load=False,
-        )
         self._log_md5(
             post_attention_layernorm_output,
             "post_attn_layernorm_out",
@@ -2482,12 +2440,6 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         )
 
         # MLP
-        inspect_tensor_set_current_layer(self.layer_number)
-        post_attention_layernorm_output = inspect_tensor(
-            "moe_or_dense_input",
-            self.layer_number,
-            post_attention_layernorm_output,
-        )
         if self.recompute_mlp:
             _mlp_input_ids = (
                 input_ids if isinstance(self.mlp, MoELayer) else None
@@ -2523,12 +2475,6 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 mlp_output_with_bias = self.mlp(post_attention_layernorm_output)
 
         # mHC: fused H_res + H_post + bias-dropout-add
-        mlp_output_with_bias = inspect_tensor(
-            "moe_or_dense_output",
-            self.layer_number,
-            mlp_output_with_bias,
-            index=0,
-        )
         # The block's final BDA output is the boundary tensor, so it stays live
         # and is not recomputed; its own hook would fire before the manager's.
         is_block_boundary = mhc_manager is not None and self._mhc_is_block_end
@@ -2550,9 +2496,6 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             self._mlp_mhc_recompute = None
         hidden_states = self._cast_and_discard_fused_bda(
             hidden_states, ori_dtype, bda_recompute
-        )
-        hidden_states = inspect_tensor(
-            "mhc_mlp_residual_output", self.layer_number, hidden_states
         )
 
         if is_first_fwd:

@@ -35,7 +35,6 @@ from paddlefleet.tensor_parallel.random import (
     RecomputeWithoutOutput,
     get_cuda_rng_tracker,
 )
-from paddlefleet.train_infer_consistent_ops.inspect_util import inspect_tensor
 from paddlefleet.transformer.layer import FleetLayer
 from paddlefleet.utils import use_dsv4_accuracy_compatible
 
@@ -1146,14 +1145,8 @@ class HyperConnectionExpandLayer(FleetLayer):
         self.n = config.num_residual_streams
 
     def forward(self, dict_args: dict) -> dict:
-        dict_args["hidden_states"] = inspect_tensor(
-            "mhc_expand_input", -1, dict_args["hidden_states"]
-        )
         dict_args["hidden_states"] = HyperConnectionModule.input_expand(
             dict_args["hidden_states"], self.n
-        )
-        dict_args["hidden_states"] = inspect_tensor(
-            "mhc_expand_output", -1, dict_args["hidden_states"]
         )
         return dict_args
 

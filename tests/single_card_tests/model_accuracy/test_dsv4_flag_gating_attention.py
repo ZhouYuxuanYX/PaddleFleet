@@ -244,11 +244,6 @@ class TestOGroupProjectionGating(unittest.TestCase):
             _dsv4_flag(dsv4_hybrid_attention, enabled),
             patch.object(
                 dsv4_hybrid_attention,
-                "inspect_tensor",
-                side_effect=lambda name, layer, tensor: tensor,
-            ),
-            patch.object(
-                dsv4_hybrid_attention,
                 "deferred_grouped_dw_accumulator",
                 return_value=None,
             ),

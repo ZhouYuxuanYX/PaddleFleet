@@ -14,19 +14,19 @@
 
 """Dump-layout canonicalizers used to align train vs inference top-k dumps.
 
-Two ``pre_save_func`` helpers rewrite the training-side index layout so it
-lines up slot-by-slot with what inference emits, so the two ``.npy`` dumps can
-be compared directly:
+These ``pre_save_func`` helpers in ``train_infer_consistent_ops.attn`` rewrite
+the training-side index layout so it lines up slot-by-slot with what inference
+emits, so the two ``.npy`` dumps can be compared directly:
 
-* ``_sort_topk_indices_pad_last`` (``mqa_latent_attention``) -- tag
+* ``_sort_topk_indices_pad_last`` -- tag
   ``mla_indexer_topk_indices``: sort each row ascending (inference emits
   increasing key order) while pinning ``-1`` padding to the row tail.
-* ``_fold_window_into_topk_pad`` (``mqa_latent_attention``) -- tag
+* ``_fold_window_into_topk_pad`` -- tag
   ``mla_indexer_token_indices``: training lays slots out as ``[top-k |
   window]`` with the top-k block's ``-1`` padding sitting between the two runs;
   inference emits ``[valid top-k | window]`` with the padding trailing, so
   splice the window block into the top-k gap and push the padding to the tail.
-* ``_reverse_window_and_topk`` (``csa_attention``) -- tag
+* ``_reverse_window_and_topk`` -- tag
   ``attn_compressor_topk_idxs``: training lays slots out as ``[window,
   compress]``; inference concatenates ``[compress, window]``, so re-lay to the
   inference order.
@@ -46,9 +46,9 @@ import unittest
 import paddle
 
 import paddlefleet.train_infer_consistent_ops.inspect_util as iu
-from paddlefleet.transformer.csa_attention import _reverse_window_and_topk
-from paddlefleet.transformer.mqa_latent_attention import (
+from paddlefleet.train_infer_consistent_ops.attn import (
     _fold_window_into_topk_pad,
+    _reverse_window_and_topk,
     _sort_topk_indices_pad_last,
 )
 

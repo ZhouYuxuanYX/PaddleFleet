@@ -496,11 +496,6 @@ def _unpack_dsv4_logical_batch(
     return output.reshape([batch_size, seqlen, -1])
 
 
-from paddlefleet.train_infer_consistent_ops.inspect_util import (
-    get_current_layer,
-    inspect_tensor,
-    inspect_tensor_set_current_layer,
-)
 from paddlefleet.transformer.utils import (
     get_doc_lens,
 )
@@ -1081,8 +1076,6 @@ class DSv4HybridAttention(Attention):
                     dense_mode=self.config.csa_dense_mode,
                 )
 
-        inspect_tensor_set_current_layer(self.layer_number)
-
         # Full attention recompute: wrap qkv + core_attn + inv_rope + o_group_proj + gated_attn
         # into one RecomputeWithoutOutput block. All intermediates (query, key, value, etc.)
         # are freed after forward (no_grad), and the output is discarded after o_proj.
@@ -1168,13 +1161,6 @@ class DSv4HybridAttention(Attention):
                     output
                 )
                 self._gate_recompute = None
-
-        # o_proj output boundary: both branches converge here before the
-        # original batch is unpacked, so a single probe covers everything that
-        # flows out of self.o_proj(...).
-        output = inspect_tensor(
-            "attn_o_proj_output", get_current_layer(), output
-        )
 
         if original_b > 1:
             output = _unpack_dsv4_logical_batch(output, original_b, original_sq)
@@ -1302,13 +1288,6 @@ class DSv4HybridAttention(Attention):
             else:
                 core_attn_out = self._gate(gate_source, core_attn_out)
 
-        # o_proj input boundary: same tensor as attn_gate_output when gating is
-        # on, the raw grouped-projection output otherwise. Probed here (once,
-        # at the producer) instead of at the two self.o_proj(core_attn_out)
-        # call sites in forward().
-        core_attn_out = inspect_tensor(
-            "attn_o_proj_input", get_current_layer(), core_attn_out
-        )
         if indexcache_state is not None or core_attn_returns_indexcache_state:
             return core_attn_out, indexcache_state
         return core_attn_out
@@ -1349,14 +1328,6 @@ class DSv4HybridAttention(Attention):
         pos_dim = self.qk_pos_emb_head_dim
         nope_dim = self.v_head_dim - pos_dim
         postmix_done = False
-
-        # Inverse-RoPE boundary: attention-core output entering the inv-RoPE
-        # step (fused_apply_mla_rope_inplace in the fused branch) and the value
-        # leaving it. Wrapping the whole pos_dim block keeps the same tags
-        # valid for both the fused and the non-fused fallback branch.
-        core_attn_out = inspect_tensor(
-            "attn_inv_rope_input", get_current_layer(), core_attn_out
-        )
 
         if pos_dim > 0:
             core_attn_out = core_attn_out.reshape(
@@ -1411,10 +1382,6 @@ class DSv4HybridAttention(Attention):
                 core_attn_out = paddle.concat([content_part, rot_part], axis=-1)
                 core_attn_out = core_attn_out.reshape([b, sq, -1])
 
-        core_attn_out = inspect_tensor(
-            "attn_inv_rope_output", get_current_layer(), core_attn_out
-        )
-
         # VHA postmix: low-rank cross-head mixing while still in head space
         # ([b, sq, nh, v_head_dim]), after inverse RoPE and before the grouped
         # output projection. Skipped when an outer wrapper already replays this,
@@ -1438,12 +1405,6 @@ class DSv4HybridAttention(Attention):
         ``core_attn_out`` may arrive 3D or 4D depending on which inverse-RoPE
         branch ran, so b/sq are read by index rather than unpacked.
         """
-        # Probe the postmix value entering it and the projected value leaving
-        # it; the upstream postmix has no probe, so an input-side probe is
-        # needed here too.
-        core_attn_out = inspect_tensor(
-            "attn_o_group_proj_input", get_current_layer(), core_attn_out
-        )
         b, sq = core_attn_out.shape[0], core_attn_out.shape[1]
         core_attn_out = core_attn_out.reshape([b, sq, self.o_local_groups, -1])
         if use_dsv4_accuracy_compatible():
@@ -1500,9 +1461,7 @@ class DSv4HybridAttention(Attention):
                     group_shape=group_shape,
                 )
         core_attn_out = core_attn_out.reshape([b, sq, -1])
-        return inspect_tensor(
-            "attn_o_group_proj_output", get_current_layer(), core_attn_out
-        )
+        return core_attn_out
 
     def _qkv_forward(self, hidden_states, position_offset, docmask_meta):
         """The qkv segment, for the ``dsv4_hybrid_attn_qkv`` recompute switch."""
@@ -1882,26 +1841,11 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         """
         b, sq, _ = hidden_states.shape
 
-        # Every op boundary is probed once, on the *output* side: op N's output
-        # tensor is exactly op N+1's input, so a single probe covers both the
-        # dump (save pass) and the load-injection (override pass) for the
-        # downstream op. The only additional probe is the function's own input
-        # below, which has no upstream op to dump from.
-        hidden_states = inspect_tensor(
-            "attn_hidden_states_input", get_current_layer(), hidden_states
-        )
-
         # Q path
         q_compressed, _ = deferrable_linear(
             self.config, "attn_q_proj", self.linear_q_down_proj, hidden_states
         )  # [b, sq, q_lora_rank]
-        q_compressed = inspect_tensor(
-            "attn_q_down_proj_output", get_current_layer(), q_compressed
-        )
         q_compressed = self.q_layernorm(q_compressed)
-        q_compressed = inspect_tensor(
-            "attn_q_norm_output", get_current_layer(), q_compressed
-        )
 
         if self.use_vha_premix:
             # Structured premix (Variant A / shared): reshape compressed Q into
@@ -1919,20 +1863,17 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 self.config, "attn_q_proj", self.linear_q_up_proj, q_compressed
             )  # [b, sq, n * v_head_dim]
             q = q.reshape([b, sq, self.num_attention_heads, self.v_head_dim])
-        q = inspect_tensor("attn_q_up_proj_output", get_current_layer(), q)
         q = _q_rms_norm(
             q,
             getattr(self.config, "rms_norm_eps", 1e-5),
             high_precision_norm=self.config.swa_high_precision_norm,
             use_fusion=getattr(self.config, "dsv4_q_rms_norm_fusion", False),
         )
-        q = inspect_tensor("attn_q_rms_norm_output", get_current_layer(), q)
 
         # KV path
         kv, _ = deferrable_linear(
             self.config, "attn_kv_proj", self.linear_kv_proj, hidden_states
         )  # [b, sq, v_head_dim]
-        kv = inspect_tensor("attn_kv_proj_output", get_current_layer(), kv)
 
         if self.config.swa_high_precision_norm:
             kv = self.kv_layernorm(
@@ -1942,7 +1883,6 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             )
         else:
             kv = self.kv_layernorm(kv)
-        kv = inspect_tensor("attn_kv_norm_output", get_current_layer(), kv)
 
         # Apply RoPE to both Q and KV
         pos_dim = self.qk_pos_emb_head_dim
@@ -1958,8 +1898,6 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             )
             # DSv4 reference uses pure norm-preserving RoPE; YaRN's mscale is not applied.
             mscale = 1.0
-
-            freqs = inspect_tensor("attn_freqs", get_current_layer(), freqs)
 
             # Q RoPE: split nope/pe, apply RoPE to pe part
             if (
@@ -1982,9 +1920,6 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     high_precision_rope=self.config.high_precision_rope,
                 )
                 query = paddle.concat([q_nope, q_pe], axis=-1)
-            query = inspect_tensor(
-                "attn_query_after_rope", get_current_layer(), query
-            )
 
             # KV RoPE: split nope/pe, apply RoPE to pe part
             if (
@@ -2021,7 +1956,6 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
 
         if self.config.swa_high_precision_norm:
             kv = kv.astype(hidden_states.dtype)
-        kv = inspect_tensor("attn_key_after_rope", get_current_layer(), kv)
 
         # Single head: key = value = [b, sq, 1, v_head_dim]
         key = kv.unsqueeze(2)

@@ -33,6 +33,8 @@ Covered (device-independent, no collectives, no fp8 kernels):
     and its concat inverse.
   * ``ffn_act.inspect_tensor_force_unit_probs`` -- all-ones weights only when the
     tag is live, and the ``scale=None`` branch of ``dequant_dispatched_hidden_bf16``.
+  * ``attn`` -- the top-k/window index canonicalizers (sort/fold and their
+    inverses) and the RoPE half-split <-> interleaved channel permutation.
 
 All expected values are hand-derived or computed with an independent numpy /
 pure-python reference; nothing is read back from the code under test.
@@ -57,6 +59,7 @@ try:
     import paddle
 
     from paddlefleet.train_infer_consistent_ops import (
+        attn,
         ffn_act,
         inspect_util,
         permute,
@@ -66,7 +69,7 @@ try:
     _IMPORT_ERROR = None
 except (ImportError, ModuleNotFoundError) as exc:  # honest dependency probe
     paddle = None
-    ffn_act = inspect_util = permute = slice_util = None
+    attn = ffn_act = inspect_util = permute = slice_util = None
     _IMPORT_ERROR = exc
 
 _HAS_DEPS = _IMPORT_ERROR is None
@@ -700,6 +703,162 @@ class TestInspectTensorGateAndIO(_AblationEnvMixin, unittest.TestCase):
         np.testing.assert_array_equal(out[0].numpy(), dumped)
         # The non-probed slot (the bias) is carried through untouched.
         self.assertIs(out[1], live_bias)
+
+
+@unittest.skipUnless(_HAS_DEPS, _SKIP_REASON)
+class TestAttentionLayouts(unittest.TestCase):
+    """``attn`` top-k/window index layouts and RoPE channel layouts."""
+
+    def setUp(self):
+        paddle.set_device("cpu")
+
+    @staticmethod
+    def tensor(values):
+        return paddle.to_tensor(values, dtype="int64")
+
+    def assert_tensor_equal(self, actual, expected):
+        np.testing.assert_array_equal(actual.numpy(), np.asarray(expected))
+
+    def test_reverse_window_and_topk(self):
+        origin = self.tensor([[1, 2, 3]])
+        topk = self.tensor([[4, 5]])
+        window = self.tensor([[6, 7]])
+
+        actual = attn._reverse_window_and_topk(origin, topk, window)
+        self.assert_tensor_equal(actual, [[4, 5, 6, 7]])
+        self.assertIs(
+            attn._reverse_window_and_topk(origin, None, window), origin
+        )
+
+    def test_sort_order_and_unsort_with_padding(self):
+        live = self.tensor([[5, 1, -1, 3], [-1, -1, -1, -1], [8, 2, 0, -1]])
+
+        self.assert_tensor_equal(
+            attn._sort_topk_indices_pad_last(live),
+            [[1, 3, 5, -1], [-1, -1, -1, -1], [0, 2, 8, -1]],
+        )
+        self.assert_tensor_equal(
+            attn._sort_order_pad_last(live),
+            [[1, 3, 0, 2], [0, 1, 2, 3], [2, 1, 0, 3]],
+        )
+
+        canon = self.tensor(
+            [[10, 11, 12, 13], [20, 21, 22, 23], [30, 31, 32, 33]]
+        )
+        self.assert_tensor_equal(
+            attn._unsort_like(canon, live),
+            [[12, 10, 13, 11], [20, 21, 22, 23], [32, 31, 30, 33]],
+        )
+
+    def test_sort_order_matches_sorted_indices(self):
+        indices = self.tensor([[9, -1, 4, 1, -1], [3, 2, -1, 0, -1]])
+        sorted_indices = attn._sort_topk_indices_pad_last(indices)
+        order = attn._sort_order_pad_last(indices)
+        self.assert_tensor_equal(
+            paddle.take_along_axis(indices, order, axis=-1), sorted_indices
+        )
+
+    def test_fold_order_and_fold_window(self):
+        live = self.tensor([[10, -1, 30, -1, 40, -2], [10, 20, 30, 40, 50, 60]])
+
+        self.assert_tensor_equal(
+            attn._fold_order(live, topk_width=4, window_width=2),
+            [[0, 2, 4, 5, 1, 3], [0, 1, 2, 3, 4, 5]],
+        )
+        self.assert_tensor_equal(
+            attn._fold_window_into_topk_pad(live, 4, 2),
+            [[10, 30, 40, -2, -1, -1], [10, 20, 30, 40, 50, 60]],
+        )
+
+        one_pad = self.tensor([[7, 2, -1, 9, 70, -4]])
+        self.assert_tensor_equal(
+            attn._fold_window_into_topk_pad(one_pad, 4, 2),
+            [[7, 2, 9, 70, -4, -1]],
+        )
+
+    def test_unfold_like_restores_padding_positions(self):
+        live = self.tensor([[10, -1, 30, -1, 40, -2], [10, 20, 30, 40, 50, 60]])
+        canon = self.tensor(
+            [[10, 30, 40, -2, -1, -1], [10, 20, 30, 40, 50, 60]]
+        )
+        self.assert_tensor_equal(
+            attn._unfold_like(canon, live, 4, 2), live.tolist()
+        )
+
+    def test_canon_and_uncanon_preserve_sorted_topk_and_live_padding(self):
+        live = self.tensor(
+            [
+                [30, -1, 10, -1, 50, -2],
+                [7, 2, -1, 9, 70, -4],
+                [8, 3, 1, 2, 60, -3],
+            ]
+        )
+        canon = attn._canon_token_indices(live, 4, 2)
+        self.assert_tensor_equal(
+            canon,
+            [
+                [10, 30, 50, -2, -1, -1],
+                [2, 7, 9, 70, -4, -1],
+                [1, 2, 3, 8, 60, -3],
+            ],
+        )
+        self.assert_tensor_equal(
+            attn._uncanon_token_indices(canon, live, 4, 2),
+            [
+                [10, 30, -1, -1, 50, -2],
+                [2, 7, 9, -1, 70, -4],
+                [1, 2, 3, 8, 60, -3],
+            ],
+        )
+
+    def test_to_interleave_rope_layout_whole_head_tail_and_fresh(self):
+        whole = self.tensor([[0, 1, 2, 3, 4, 5, 6, 7]])
+        original = whole.numpy().copy()
+        actual = attn.to_interleave_rope_layout_(whole)
+        self.assert_tensor_equal(actual, [[0, 4, 1, 5, 2, 6, 3, 7]])
+        np.testing.assert_array_equal(whole.numpy(), original)
+        self.assertIsNot(actual, whole)
+
+        segmented = self.tensor([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]])
+        self.assert_tensor_equal(
+            attn.to_interleave_rope_layout_(segmented, 2, 6),
+            [[0, 1, 2, 4, 3, 5, 6, 7, 8, 9]],
+        )
+        self.assert_tensor_equal(
+            attn.to_interleave_rope_layout_(whole, 2),
+            [[0, 1, 2, 5, 3, 6, 4, 7]],
+        )
+
+        with self.assertRaisesRegex(ValueError, "even-length"):
+            attn.to_interleave_rope_layout_(segmented, 1, 6)
+
+    def test_rope_segment_wrappers_and_round_trip(self):
+        # Rope width 6: width 4 is self-inverse under interleaving, so a
+        # deinterleave that just re-interleaves would still pass there.
+        full = self.tensor([[10, 11, 0, 1, 2, 3, 4, 5]])
+        full_copy = full.numpy().copy()
+
+        self.assert_tensor_equal(
+            attn.interleave_rope_segment(full, 2), [[0, 3, 1, 4, 2, 5]]
+        )
+        interleaved = attn.interleave_rope_segment_inplace(full, 2)
+        self.assert_tensor_equal(interleaved, [[10, 11, 0, 3, 1, 4, 2, 5]])
+        np.testing.assert_array_equal(full.numpy(), full_copy)
+        self.assert_tensor_equal(
+            attn.deinterleave_rope_segment(interleaved, 2), full_copy
+        )
+
+        rope_only = self.tensor([[0, 1, 2, 3, 4, 5]])
+        rope_only_copy = rope_only.numpy().copy()
+        interleaved_rope = attn.interleave_rope_segment_inplace(rope_only, 0)
+        self.assert_tensor_equal(interleaved_rope, [[0, 3, 1, 4, 2, 5]])
+        self.assert_tensor_equal(
+            attn.deinterleave_rope_segment(interleaved_rope, 0),
+            rope_only_copy,
+        )
+
+        with self.assertRaisesRegex(ValueError, "even-length"):
+            attn.deinterleave_rope_segment(full, 3)
 
 
 if __name__ == "__main__":

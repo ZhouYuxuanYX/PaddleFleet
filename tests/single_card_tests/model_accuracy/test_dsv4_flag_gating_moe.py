@@ -382,10 +382,6 @@ class TestMoeForwardSequenceFirstInputTranspose(unittest.TestCase):
         with (
             _dsv4_flag(moe_layer, enabled),
             patch.object(moe_layer, "targets_hf", return_value=False),
-            patch.object(
-                moe_layer, "inspect_tensor", side_effect=lambda *a, **k: a[2]
-            ),
-            patch.object(moe_layer, "inspect_tensor_set_current_layer"),
         ):
             try:
                 moe_layer.MoELayer.forward(
@@ -468,10 +464,6 @@ class TestMoeForwardSequenceFirstOutputTranspose(unittest.TestCase):
         with (
             _dsv4_flag(moe_layer, enabled),
             patch.object(moe_layer, "targets_hf", return_value=False),
-            patch.object(
-                moe_layer, "inspect_tensor", side_effect=lambda *a, **k: a[2]
-            ),
-            patch.object(moe_layer, "inspect_tensor_set_current_layer"),
             patch.object(moe_layer, "log_moe_losses"),
         ):
             output, bias = moe_layer.MoELayer.forward(fake_self, hidden_states)

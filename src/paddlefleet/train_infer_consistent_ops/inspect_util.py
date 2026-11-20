@@ -23,9 +23,9 @@ module-level bool, and whatever massaging a probe needs (fp8 dequant, row
 permutation) is handed over as `pre_save_func` / `post_load_func` so it is not
 evaluated either.
 
-The layout helpers live next door, one module per operator family: `permute.py`
-for the expert-contiguous row order, `ffn_act.py` for the fused SwiGLU+fp8-quant
-activation, `gate.py` for the fused two-view router logits.
+The layout helpers live next door, one module per operator family: `attn.py`
+for attention indices and RoPE channels, `permute.py` for the expert-contiguous
+row order, and `ffn_act.py` for the fused SwiGLU+fp8-quant activation.
 
 Every probe entry point the network is expected to call is named
 `inspect_tensor_*`, so grepping that prefix lists the whole surface.
@@ -40,9 +40,12 @@ import os
 
 import paddle
 
-from paddlefleet.train_infer_consistent_ops.slice_util import (
-    last_dim_segment,
-    scatter_last_dim_segment,
+# Preserve the RoPE import paths used by existing inspection call sites.
+from paddlefleet.train_infer_consistent_ops.attn import (
+    deinterleave_rope_segment as deinterleave_rope_segment,
+    interleave_rope_segment as interleave_rope_segment,
+    interleave_rope_segment_inplace as interleave_rope_segment_inplace,
+    to_interleave_rope_layout_ as to_interleave_rope_layout_,
 )
 
 _MODULE_PREFIX = "[ABLATION_train]"
@@ -521,67 +524,6 @@ def _load_shape_ok(dump_shape, live_shape):
 def _as_f32_numpy(tensor):
     """Host float32 numpy copy -- the single conversion stages 4/5/6 share."""
     return tensor.astype("float32").numpy()
-
-
-def interleave_rope_segment(t, nope_dim):
-    t_rope = last_dim_segment(t, nope_dim)
-    return to_interleave_rope_layout_(t_rope)
-
-
-def interleave_rope_segment_inplace(t, nope_dim):
-    t_rope = last_dim_segment(t, nope_dim)
-    t_rope_interleave = to_interleave_rope_layout_(t_rope)
-    return scatter_last_dim_segment(t, t_rope_interleave, nope_dim)
-
-
-def to_interleave_rope_layout_(x, start=0, end=None):
-    """Rewrite post-RoPE tensors from half-split to interleaved channel layout.
-
-    The training-side fused kernel reads channel pairs ``(2j, 2j+1)`` but writes
-    the two results to ``j`` and ``j + rope_dim // 2`` (a **half-split** layout),
-    whereas sglang's RoPE writes each result back to the channel it came from (an
-    **interleaved** layout). The two layouts differ by a channel permutation
-    only::
-
-        interleaved[2j]     == half[j]                    j = 0 .. rope_dim // 2 - 1
-        interleaved[2j + 1] == half[j + rope_dim // 2]
-
-    This helper takes the half-split tensor and rebuilds the interleaved one, so
-    the training side can be compared against sglang in sglang's own layout.
-    Applying it to q_pe and k_pe together leaves ``q . k`` -- and hence the
-    attention output -- unchanged, so this is purely a comparison aid.
-
-    ``start`` / ``end`` restrict the permutation to the ``[..., start:end]``
-    segment of the last dim, leaving the head ``[..., :start]`` and tail
-    ``[..., end:]`` verbatim. This is the ``[nope | rope]`` case: the rope block
-    is half-split while the nope block, which RoPE never touches, is passed
-    through. The default spans the whole last dim.
-
-    Returns a fresh tensor via ``concat`` rather than writing into ``x``:
-    the live buffer is usually still held by the autograd graph, and an
-    in-place write bumps its dygraph inplace version and breaks
-    backward / recompute.
-    """
-    width = x.shape[-1]
-    stop = width if end is None else end
-    seg = x[..., start:stop]
-    seg_width = seg.shape[-1]
-    if seg_width % 2 != 0:
-        raise ValueError(
-            "to_interleave_rope_layout_ needs an even-length segment to pair "
-            f"channels (2j, 2j+1); got width {seg_width} for [{start}:{stop}]."
-        )
-    half = seg_width // 2
-    seg = paddle.stack([seg[..., :half], seg[..., half:]], axis=-1).reshape(
-        seg.shape
-    )
-    parts = []
-    if start > 0:
-        parts.append(x[..., :start])
-    parts.append(seg)
-    if stop < width:
-        parts.append(x[..., stop:])
-    return paddle.concat(parts, axis=-1) if len(parts) > 1 else parts[0]
 
 
 def inspect_tensor(
