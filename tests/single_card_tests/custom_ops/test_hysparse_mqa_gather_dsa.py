@@ -453,10 +453,10 @@ class TestBlockSparseDSAPackedMultiDoc(unittest.TestCase):
         # RMSE 0.06364) while forward / sinkless grads / dKV / d_sink all matched.
         # Root cause: the cuDNN DSA backward's Dk!=Dv (absorbed-MQA 576/512)
         # branch consumes the passed LSE verbatim, and the forward returns a
-        # KV-only LSE, so every p_k was overestimated for a finite sink. The
-        # wrapper now feeds a sink-inclusive LSE (logaddexp(lse_kv, sink)) and
-        # neutralizes the passed sink on that branch; the analytic d_sink still
-        # uses the original KV-only LSE. This assertion is STRICT (min_cos=0.99)
+        # KV-only LSE, so every p_k was overestimated for a finite sink. Since
+        # cudnn-frontend 1.32.3 that branch folds the passed sink into the LSE
+        # and returns d_sink itself; the wrapper passes the KV-only LSE and the
+        # real sink. This assertion is STRICT (min_cos=0.99)
         # and must now PASS. The TileLang oracle equivalent already passed,
         # isolating the original defect to the DSA backend.
         _skip_if_no_dsa(self)

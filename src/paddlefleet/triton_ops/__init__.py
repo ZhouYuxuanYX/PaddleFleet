@@ -16,7 +16,6 @@ from .fused_mla_yarn_rope_apply import (
     fused_apply_mla_rope_for_kv,
     fused_apply_mla_rope_for_q,
 )
-from .fused_sink_grad import fused_sink_grad
 from .fused_yarn_rope_freqs import fused_yarn_rope_freqs
 from .grouped_matmul_fusion import GroupedMatmulTriton, fused_grouped_matmul
 from .inv_rope_vha_postmix_fusion import (
@@ -44,7 +43,6 @@ from .ulysses_alltoall_fused import (
 
 __all__ = [
     "fused_q_rms_norm",
-    "fused_sink_grad",
     "fused_yarn_rope_freqs",
     "GroupedMatmulTriton",
     "fused_grouped_matmul",

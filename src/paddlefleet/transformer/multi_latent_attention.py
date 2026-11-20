@@ -3072,8 +3072,8 @@ class MQASelfAttention(MLASelfAttention):
             if not is_dsa_available():
                 raise RuntimeError(
                     "HySparse block-sparse attention requires the DSA backend "
-                    "(FlashMLA sparse fwd + cuDNN DSA bwd), unavailable here: "
-                    "it needs SM100 + FlashMLA + the cuDNN frontend."
+                    "(cuDNN DSA sparse fwd + bwd), unavailable here: it needs "
+                    "SM100 + the vendored cuDNN frontend (Python >= 3.12)."
                 )
             sparse_core_attn_out, _ = block_sparse_mqa_attention_dsa(
                 query,

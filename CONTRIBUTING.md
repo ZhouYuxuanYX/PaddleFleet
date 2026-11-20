@@ -43,7 +43,9 @@ PaddleFleet 现在使用 uv workspace 方式管理项目，请在 PaddleFleet �
 uv build --wheel -vv
 
 # 只编子包 paddlefleet_ops，产出 C++ wheel 包
-# 需要先在当前环境中准备好 paddlepaddle-gpu 等依赖包
+# 需要先在当前环境中准备好 paddlepaddle-gpu 等依赖包；--no-build-isolation 不会安装 build-system.requires，
+# 需手动装好其中的构建依赖，例如 cudnn-frontend >= 1.32 需要的 nanobind：
+# uv pip install "nanobind>=3.0.1,<4"
 uv build --package paddlefleet-ops --wheel -vv --no-build-isolation
 ```
 
@@ -78,12 +80,13 @@ source ci/setup_ops_toolchain.sh
 ###### 系统环境
 
 ```bash
+# --no-build-isolation 需先装好构建依赖，例如 nanobind>=3.0.1,<4（cudnn-frontend >= 1.32）
 uv pip install -e packages/paddlefleet_ops -vv --no-build-isolation --system
 ```
 
 ###### 虚拟环境
 
 ```bash
-# 需要先安装 paddlepaddle-gpu
+# 需要先安装 paddlepaddle-gpu，以及构建依赖 nanobind>=3.0.1,<4（cudnn-frontend >= 1.32）
 uv pip install -e packages/paddlefleet_ops -vv --no-build-isolation
 ```

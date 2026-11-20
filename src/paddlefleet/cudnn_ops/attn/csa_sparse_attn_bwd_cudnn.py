@@ -15,6 +15,15 @@
 
 from paddlefleet_ops import CUDNN_FRONTEND_HINT, is_cudnn_frontend_available
 
+from paddlefleet.cudnn_ops.deterministic import (
+    cudnn_deterministic_kwargs,
+    sort_topk_ascending_pad_last,
+)
+from paddlefleet.cudnn_ops.frontend_version import (
+    cudnn_frontend_version,
+    require_recent_cudnn_frontend,
+)
+
 
 def _require_cudnn_frontend():
     if not is_cudnn_frontend_available():
@@ -157,11 +166,23 @@ def csa_sparse_attn_bwd_cudnn(
     topk_length=None,
 ):
     _require_cudnn_frontend()
+    if q.shape[-1] != out.shape[-1]:
+        # d_qk != d_v (absorbed MQA): d_sink is taken from the kernel, and an
+        # older cudnn-frontend returns all zeros there without any error.
+        require_recent_cudnn_frontend(
+            cudnn_frontend_version(),
+            "The cuDNN DSA backward with d_qk != d_v (kernel d_sink)",
+        )
     from paddlefleet_ops.cudnn.deepseek_sparse_attention.sparse_attention_backward.api import (
         sparse_attention_backward_wrapper,
     )
 
-    # print(f"get here.....")
+    det_kwargs = cudnn_deterministic_kwargs(sparse_attention_backward_wrapper)
+    # The deterministic backward always sees ascending topk rows: dKV / d_sink
+    # are bitwise unchanged by the order, only dq's summation order moves, and
+    # the relay is faster on sorted rows (64k stage3: -5.4% step time).
+    if det_kwargs:
+        topk_idxs = sort_topk_ascending_pad_last(topk_idxs)
     result = sparse_attention_backward_wrapper(
         q,
         kv,
@@ -172,5 +193,6 @@ def csa_sparse_attn_bwd_cudnn(
         topk_idxs,
         softmax_scale=softmax_scale,
         topk_length=topk_length,
+        **det_kwargs,
     )
     return result["dq"], result["dkv"], result["d_sink"]

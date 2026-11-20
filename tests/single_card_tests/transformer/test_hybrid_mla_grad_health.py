@@ -754,7 +754,7 @@ class TestItem2AbsoluteMagnitudeSanity(unittest.TestCase):
 class TestItem3SinkGradient(unittest.TestCase):
     """Item 3: analytic attention-sink gradient.
 
-    Kernel computes d_sink analytically (cuDNN returns zeros):
+    The backward kernel's d_sink must match the analytic gradient:
         Delta[b,s,h] = sum_dv(out * dO)
         p_sink[b,s,h] = exp(sink[h] - lse_full[b,s,h])
         d_sink[h]     = -sum_{b,s}(p_sink * Delta)

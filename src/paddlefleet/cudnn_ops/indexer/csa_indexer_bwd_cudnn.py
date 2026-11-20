@@ -32,6 +32,8 @@ import logging
 import paddle
 from paddlefleet_ops import CUDNN_FRONTEND_HINT, is_cudnn_frontend_available
 
+from paddlefleet.cudnn_ops.deterministic import cudnn_deterministic_kwargs
+
 logger = logging.getLogger(__name__)
 
 # cuDNN 1.28 added a second GEMM stage for this kernel, selected by
@@ -273,6 +275,7 @@ def csa_indexer_bwd(
             # on this sparse path nothing else zeroes the buffer. Same reason as
             # the dense KL path (``dense_indexer_kl_cudnn.py``).
             d_index_k=paddle.zeros(index_k_bf.shape, dtype=paddle.float32),
+            **cudnn_deterministic_kwargs(indexer_backward_wrapper),
             **extra,
         )
 

@@ -532,12 +532,11 @@ class TestSinkSpecifics(_Base):
         self.assertEqual(agree, 1.0)
 
     def test_finite_sink_lse_fix_matters(self):
-        """dk(576) != d_v(512): the finite-sink LSE handling is load-bearing.
+        """dk(576) != d_v(512): the sink must reach the backward exactly once.
 
-        The layer folds the sink into the LSE it passes the backward (and
-        neutralises the sink argument so a folding kernel cannot count it
-        twice). Driving the same kernels with a backward that never sees the
-        sink at all must be far worse -- see
+        The layer passes the KV-only LSE and the real sink, which the kernel
+        folds into the softmax denominator. Driving the same kernels with a
+        backward that never sees the sink at all must be far worse -- see
         :func:`_kernel_dq_with_sinkless_bwd` for why that, and not the plain
         KV-only LSE, is the version-independent control.
         """
@@ -640,13 +639,14 @@ class TestIndexEdgeCases(_Base):
 @_GPU
 class TestDtypeBehaviour(_Base):
     def test_fp32_query_is_rejected_by_forward_kernel(self):
-        # The FlashMLA sparse forward is bf16-only; fp32 q must fail loudly
-        # rather than silently mis-cast. (This is why the FD floors are bf16.)
+        # The sparse forward (cuDNN on SM100: ValueError, FlashMLA elsewhere:
+        # RuntimeError) is fp16/bf16-only; fp32 q must fail loudly rather than
+        # silently mis-cast. (This is why the FD floors are bf16.)
         H, s = 8, 16
         q = paddle.to_tensor(_rand([1, s, H, DK], 0.3, 1))  # fp32
         kv = paddle.to_tensor(_rand([1, s, DK], 0.3, 2))
         ti = paddle.to_tensor(_causal_indices(s, 128))
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises((RuntimeError, ValueError)):
             mqa_sparse_attn(q, kv, ti, float(SM), DV, None)
 
     def test_sink_grad_dtype_follows_parameter(self):

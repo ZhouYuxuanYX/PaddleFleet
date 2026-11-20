@@ -16,5 +16,7 @@ from .csa_sparse_attn_bwd_cudnn import (
     csa_sparse_attn_bwd_cudnn as csa_sparse_attn_bwd_cudnn,
 )
 from .csa_sparse_attn_fwd_cudnn import (
+    cudnn_sparse_attn as cudnn_sparse_attn,
     flash_mla_sparse_attn as flash_mla_sparse_attn,
+    sparse_attn_fwd as sparse_attn_fwd,
 )

@@ -15,8 +15,8 @@
 """Deterministic TileLang backward for the absorbed-MQA latent (``Dk != Dv``).
 
 Drop-in replacement for the ``csa_sparse_attn_bwd_cudnn`` half of
-:mod:`paddlefleet.fusions.mqa_sparse_attn`. The FlashMLA sparse forward is left
-alone; only the backward changes, because the cuDNN DSA backward accumulates
+:mod:`paddlefleet.fusions.mqa_sparse_attn`. The sparse forward (``sparse_attn_fwd``) is
+left alone; only the backward changes, because the cuDNN DSA backward accumulates
 ``dkv`` with atomics and is therefore not run-to-run reproducible (bounded by
 ``test_block_sparse_dsa_gradcheck.py::TestDeterminism``), which is the one
 remaining source of step-to-step aadiff in the non-absorbed MQA layers once the
@@ -224,7 +224,7 @@ def mqa_latent_sparse_bwd(
         out:           ``[B, S, H, Dv]`` bf16 normalized forward output.
         grad_out:      ``[B, S, H, Dv]`` bf16 cotangent.
         lse:           ``[B, S, H]`` natural-log, **sink-exclusive** LSE, i.e.
-                       exactly what ``flash_mla_sparse_attn`` returns.
+                       exactly what ``sparse_attn_fwd`` returns.
         attn_sink:     ``[H]`` fp32 pre-scaled sink logit in natural-log space.
                        Sinkless callers pass ``-1e30``.
         token_indices: ``[B, S, L]`` int32 per-batch-local key columns, ``-1``

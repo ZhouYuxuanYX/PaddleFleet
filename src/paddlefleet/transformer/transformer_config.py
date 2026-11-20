@@ -1067,31 +1067,6 @@ class TransformerConfig(ModelParallelConfig):
     """If True, use the Triton weight-free fused kernel for query RMS norm in the
     DSV4 hybrid attention path. Only takes effect when swa_high_precision_norm=False."""
 
-    dsa_sink_grad_fusion: bool = False
-    """Whether to use the fused Triton attention-sink gradient epilogue.
-
-    Scope: ``MQALatentAttention`` (``non_absorbed_mqa``) only. It is read in
-    ``MQALatentAttention.__init__`` and forwarded from ``_sparse_attn``. HySparse's
-    DSA gather (``paddlefleet.cudnn_ops.block_sparse_mqa_attention_dsa``) shares
-    the same ``mqa_sparse_attn`` entry and can also carry a learnable sink, but it
-    deliberately does not forward this flag: it stays on the eager epilogue no
-    matter how this field is set.
-
-    The sparse-attention backward computes ``d_sink`` analytically because the
-    SM100 cuDNN DSA backward returns an all-zero ``d_sink``. The eager
-    implementation materialises three ``[b, s, h, d_v]`` fp32 temporaries to
-    produce ``[h]`` numbers; the kernel reads ``out``/``do`` once in their native
-    dtype. Measured at b=1/s=8192/h=64/d_v=512: 2.664 ms -> 0.423 ms, transient
-    3.0 GiB -> ~0.
-
-    No effect on layers without a learnable sink (``add_full_attention_sink_bias``
-    off), which have no sink gradient to compute.
-
-    Not bitwise identical to the eager path: 1.9e-7 relative to the gradient
-    vector's own scale (~1.6 fp32 ulp), entirely from the fp32 summation order of
-    ``Delta = sum_dv(out * do)``. Both paths are deterministic run-to-run.
-    """
-
     dsv4_yarn_rope_fusion: bool = False
     """If True, use the Triton fused kernel to build the YaRN RoPE frequency table
     in the DSV4 hybrid attention path. Only the DSV4 hybrid attention path reads this
@@ -2197,8 +2172,8 @@ class TransformerConfig(ModelParallelConfig):
       * "unfused": pure-Paddle einsum forward + Paddle autograd backward
         (non-fused reference path).
       * "tilelang" (default): TileLang sparse MQA kernel forward + backward.
-      * "cudnn": FlashMLA sparse forward kernel + cuDNN DSA backward
-        kernel.
+      * "cudnn": ``sparse_attn_fwd`` (cuDNN on SM100 with cudnn-frontend,
+        FlashMLA otherwise) + cuDNN DSA backward kernel.
     """
 
     mqa_sparse_attn_backward_backend: str = "cudnn"
@@ -2213,7 +2188,8 @@ class TransformerConfig(ModelParallelConfig):
         bitwise stable for identical inputs, independent of
         ``FLAGS_cudnn_deterministic`` -- it always runs the atomic-free kernel
         rather than selecting one from that flag.
-    The forward is always FlashMLA regardless of this switch; the tilelang
+    The forward ignores this switch: cuDNN where ``cudnn_dsa_supported()``
+    (SM100 + the vendored cudnn-frontend), FlashMLA otherwise; the tilelang
     forward kernel cannot accept ``d_qk=576`` (not a power of two).
     """
 
@@ -2261,9 +2237,9 @@ class TransformerConfig(ModelParallelConfig):
     ``1 < ratio < 128`` layers) and ``MQALatentAttention``. No effect on the
     ``"tilelang"`` / ``"unfused"`` backends, which never build the flat global
     index table, nor on ``block_sparse_mqa_attention_dsa``, which leaves it at
-    the default. ``MQALatentAttention``'s forward is always FlashMLA, so it
-    remaps regardless of ``mqa_sparse_attn_backward_backend``; only its
-    backward follows that switch.
+    the default. ``MQALatentAttention``'s forward (cuDNN or FlashMLA) does not
+    depend on ``mqa_sparse_attn_backward_backend``, so it remaps regardless of
+    that switch; only its backward follows it.
     """
 
     stage1_overlap: bool = False
@@ -2442,6 +2418,15 @@ class TransformerConfig(ModelParallelConfig):
             "forward's hidden_states split, LanguageLoss's per-depth labels). "
             "Set num_nextn_predict_layers to the value mtp_num_layers used to "
             "carry, and drop mtp_num_layers."
+        ),
+        # Removed together with the eager / Triton d_sink recompute it selected.
+        # ``false`` (the old default) is absorbed so configs that spell it out
+        # keep parsing; ``true`` asked for a fusion that no longer exists.
+        "dsa_sink_grad_fusion": (
+            "It was removed: the cuDNN DSA sparse attention backward "
+            "(cudnn-frontend 1.32.3) returns d_sink directly, so there is no "
+            "separate d_sink computation left to fuse. Drop "
+            "dsa_sink_grad_fusion from the config."
         ),
     }
 

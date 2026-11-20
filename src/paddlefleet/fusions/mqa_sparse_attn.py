@@ -14,7 +14,8 @@
 
 """Sparse attention over the **absorbed** MQA latent (``d_qk=576`` / ``d_v=512``).
 
-Always uses FlashMLA sparse forward.  The backward is selected by
+The forward is ``sparse_attn_fwd`` (cuDNN on SM100 with cudnn-frontend, FlashMLA
+otherwise) whatever the backward is. The backward is selected by
 ``mqa_sparse_attn_backward_backend``:
 
   - ``"cudnn"`` (default): ``paddlefleet.cudnn_ops.csa_sparse_attn_bwd_cudnn``
@@ -38,9 +39,8 @@ production CSA/HCA layers never do, none of which may leak onto that path:
 2. **Optional sink** -- ``attn_sink=None`` means plain sinkless softmax,
    emulated with a per-head ``-1e30``; CSA always carries a learnable sink and
    ``csa_sparse_attn_utils.prepare_inputs`` unconditionally casts it.
-3. **Query-head padding up to the DSA-fixed ``h_q == 64``**, plus (only on the
-   ``d_qk != d_v`` kernel branch) a finite-sink LSE correction and an analytic
-   ``d_sink``, because the SM100 backward returns an all-zero ``d_sink`` there.
+3. **Query-head padding up to the DSA-fixed ``h_q == 64``**; padded heads carry
+   a ``-1e30`` sink, so they get zero output, zero gradient and zero ``d_sink``.
 
 Consumers: the hybrid-MLA non-absorbed MQA layers
 (``paddlefleet.transformer.mqa_latent_attention``) and the HySparse block-sparse
@@ -57,7 +57,7 @@ _NEG_SINK = -1e30
 
 
 class _MQASparseAttention(paddle.autograd.PyLayer):
-    """FlashMLA sparse forward + selectable backward for absorbed MQA.
+    """Sparse forward (cuDNN on SM100, FlashMLA elsewhere) + selectable backward for absorbed MQA.
 
     forward inputs:
         query:            ``[b, s, h, d_qk]`` (``d_qk`` = 576), ``h <= 64``.
@@ -91,12 +91,11 @@ class _MQASparseAttention(paddle.autograd.PyLayer):
         d_v,
         attn_sink=None,
         indexer_topk=0,
-        sink_grad_fusion=False,
         global_kv_idx_remap_fusion=False,
         backward_backend="cudnn",
     ):
         from paddlefleet.cudnn_ops.attn.csa_sparse_attn_fwd_cudnn import (
-            flash_mla_sparse_attn,
+            sparse_attn_fwd,
         )
         from paddlefleet.fusions.csa_sparse_attn import _csa_compute_topk_length
 
@@ -138,7 +137,6 @@ class _MQASparseAttention(paddle.autograd.PyLayer):
         # real heads and the padded heads keep ``-1e30`` (they contribute no
         # output / gradient). The sink gradient is routed back to the parameter.
         ctx.learnable_sink = attn_sink is not None
-        ctx.sink_grad_fusion = sink_grad_fusion
         ctx.global_kv_idx_remap_fusion = global_kv_idx_remap_fusion
         if attn_sink is None:
             sink = paddle.full([_DSA_HEADS], _NEG_SINK, dtype="float32")
@@ -172,7 +170,7 @@ class _MQASparseAttention(paddle.autograd.PyLayer):
             token_indices.reshape([b * s, -1])
         )
 
-        out, lse, lse_indexer = flash_mla_sparse_attn(
+        out, lse, lse_indexer = sparse_attn_fwd(
             q_pad,
             kv,
             sink,
@@ -278,38 +276,12 @@ class _MQASparseAttention(paddle.autograd.PyLayer):
                 token_indices, skv, fused=ctx.global_kv_idx_remap_fusion
             )
 
-            # dq/dkv softmax normalization for the finite-sink absorbed-MQA path.
-            #
-            # The forward output was formed with the sink competing in the softmax
-            # denominator: p_k = exp(l_k - lse_full), lse_full = logaddexp(lse_kv,
-            # sink), while the forward kernel returns a KV-only ``lse``. The sink
-            # therefore has to reach the backward exactly once: pass a
-            # sink-inclusive LSE *and* neutralize the sink argument, because the
-            # vendored cuDNN DSA backward folds ``attn_sink`` into the LSE itself
-            # (``_interface_sm100.py``) and would otherwise count it twice.
-            # Measured on SM100, dq rel-err vs an fp32 autograd reference at
-            # sink=3.0: this pairing 3.7e-3, double-counted 0.30, sink missing
-            # from the backward entirely 1.96.
-            #
-            # Sinkless keeps the KV-only ``lse`` and the -1e30 ``sink`` untouched
-            # (logaddexp(lse, -1e30) == lse), so that path is bit-for-bit unchanged.
-            # The analytic d_sink below intentionally keeps using the original
-            # KV-only ``lse`` (it re-derives lse_full from it).
-            lse_bwd = lse
-            sink_bwd = sink
-            # Load-bearing and silent: getting the sink count wrong here leaves the
-            # forward output bit-identical (this only touches the backward). Do not
-            # use forward agreement to conclude the backward is fine. See
-            # ``tests/.../test_block_sparse_dsa_gradcheck.py::
-            # test_finite_sink_lse_fix_matters``, which re-drives the raw kernels
-            # with a sink-free backward to pin the gap.
-            if ctx.learnable_sink and dk != d_v:
-                lse_bwd = paddle.logaddexp(
-                    lse.astype("float32"),
-                    sink.astype("float32").reshape([1, 1, hpad]),
-                ).astype(lse.dtype)
-                sink_bwd = paddle.full([hpad], _NEG_SINK, dtype="float32")
-            lse_flat = lse_bwd.reshape([b * s, hpad])
+            # The forward ``lse`` is KV-only; the backward takes it together with
+            # the real sink and folds the sink into the softmax denominator itself
+            # (cuDNN >= 1.32.3, both the d_qk=576 and the d_qk=512 kernels), and
+            # returns ``d_sink`` from the same pass. Sinkless layers pass -1e30,
+            # which gives d_sink == 0.
+            lse_flat = lse.reshape([b * s, hpad])
 
             # DSA passes topk_length=None (the guarded, full-width backward path)
             # rather than compacting. Its ``[top-k | window]`` layout carries
@@ -321,13 +293,13 @@ class _MQASparseAttention(paddle.autograd.PyLayer):
             # sort would be pure overhead. (HCA *does* compact -- it has real
             # leading holes and a much shorter valid count; see
             # ``_csa_compact_topk_idxs`` in csa_sparse_attn.)
-            dq_flat, dkv_flat, _d_sink_unused = csa_sparse_attn_bwd_cudnn(
+            dq_flat, dkv_flat, d_sink_flat = csa_sparse_attn_bwd_cudnn(
                 q_flat,
                 kv_flat,
                 o_flat,
                 do_flat,
                 lse_flat,
-                sink_bwd,
+                sink,
                 gidx_flat,
                 softmax_scale=ctx.sm_scale,
                 topk_length=None,
@@ -363,55 +335,10 @@ class _MQASparseAttention(paddle.autograd.PyLayer):
                     dkv = dkv.cast(ctx.kv_dtype)
             d_attn_sink = None
             if gsink:
-                # The cuDNN DSA backward (SM100) allocates ``d_sink`` but its kernel
-                # never populates it -- it always returns zeros. So compute the sink
-                # gradient analytically here from the saved forward tensors.
-                #
-                # For a virtual sink logit ``s_h`` competing in the softmax denom
-                # ``Z = sum_k exp(logit_k) + exp(s_h)``, weight ``p_k = exp(l_k)/Z``
-                # and sink mass ``p_sink = exp(s_h)/Z``. Since
-                # ``d p_k / d s_h = -p_k * p_sink`` and ``out = sum_k p_k v_k``:
-                #   d out / d s_h = -p_sink * out
-                #   d_sink[h] = sum_{b,s}( dO . (d out / d s_h) )
-                #             = -sum_{b,s}( p_sink * (dO . out) )
-                #             = -sum_{b,s}( p_sink * Delta )
-                # with ``Delta[b,s,h] = sum_dv(out * dO)``. The forward LSE is
-                # KV-only (excludes the sink), so the full log-denominator is
-                # ``logaddexp(lse_kv, s_h)`` and ``p_sink = exp(s_h - lse_full)``.
-                #
-                # ``dsa_sink_grad_fusion`` runs that formula as a single Triton
-                # kernel, reading out/do once in their native dtype instead of
-                # materialising three ``[b, s, h, d_v]`` fp32 temporaries (~3.0
-                # GiB at b=1/s=8192/h=64/d_v=512). Both paths are kept so the
-                # switch can be flipped mid-run to isolate a regression.
-                if ctx.sink_grad_fusion:
-                    from paddlefleet.triton_ops.fused_sink_grad import (
-                        fused_sink_grad,
-                    )
-
-                    d_attn_sink = fused_sink_grad(out, do, lse, sink, h)
-                    # ``fused_sink_grad`` always returns fp32; match the dtype
-                    # of the ``attn_sink`` the forward received, the way
-                    # ``csa_sparse_attn.py`` does. A float32 grad on a bf16
-                    # parameter breaks the PyLayer contract and the optimizer's
-                    # master-weight path. Skip the cast when it is already fp32.
-                    if d_attn_sink.dtype != ctx.attn_sink_dtype:
-                        d_attn_sink = d_attn_sink.cast(ctx.attn_sink_dtype)
-                else:
-                    out_h = out[:, :, :h, :].astype("float32")
-                    do_h = do[:, :, :h, :].astype("float32")
-                    delta = (out_h * do_h).sum(axis=-1)  # [b, s, h]
-                    sink_real = sink[:h].astype("float32").reshape([1, 1, h])
-                    lse_h = lse[:, :, :h].astype("float32")
-                    lse_full = paddle.logaddexp(lse_h, sink_real)
-                    p_sink = paddle.exp(sink_real - lse_full)  # [b, s, h]
-                    d_attn_sink = (
-                        -(delta * p_sink).sum(axis=[0, 1])
-                    ).contiguous()
-                    # Match the dtype of the ``attn_sink`` the forward received,
-                    # the way ``csa_sparse_attn.py`` does; a float32 grad on a
-                    # bf16 parameter breaks the PyLayer contract and the
-                    # optimizer's master-weight path.
+                # fp32 kernel reduction; hand the parameter back the dtype the
+                # forward received (bf16 under AMP).
+                d_attn_sink = d_sink_flat[:h]
+                if d_attn_sink.dtype != ctx.attn_sink_dtype:
                     d_attn_sink = d_attn_sink.cast(ctx.attn_sink_dtype)
 
         # One returned grad per **tensor** input, in order. Non-tensor inputs
@@ -433,11 +360,10 @@ def mqa_sparse_attn(
     d_v,
     attn_sink=None,
     indexer_topk=0,
-    sink_grad_fusion=False,
     global_kv_idx_remap_fusion=False,
     backward_backend="cudnn",
 ):
-    """Absorbed-MQA sparse attention (FlashMLA sparse fwd + selectable bwd).
+    """Absorbed-MQA sparse attention (cuDNN/FlashMLA sparse fwd + selectable bwd).
 
     Args:
         query:         ``[b, s, h, d_qk]``, ``h <= 64``.
@@ -456,13 +382,6 @@ def mqa_sparse_attn(
                        That is the normalizer the indexer-loss target needs, so
                        the caller must put the indexer-selected columns first.
                        ``0`` keeps the single-output signature.
-        sink_grad_fusion: use the fused Triton sink-gradient epilogue instead of
-                       the eager one. No effect when ``attn_sink`` is ``None``
-                       (a sinkless layer has no sink gradient to compute).
-                       Only ``MQALatentAttention._sparse_attn`` wires this up,
-                       from the ``dsa_sink_grad_fusion`` config field; HySparse's
-                       ``block_sparse_mqa_attention_dsa`` leaves it at the default
-                       and keeps the eager epilogue by design.
         global_kv_idx_remap_fusion: use the fused Triton local->global KV
                        column index remap in the forward and in the ``"cudnn"``
                        backward instead of the eager elementwise chain.
@@ -483,7 +402,6 @@ def mqa_sparse_attn(
         int(d_v),
         attn_sink,
         int(indexer_topk),
-        sink_grad_fusion,
         global_kv_idx_remap_fusion,
         str(backward_backend),
     )

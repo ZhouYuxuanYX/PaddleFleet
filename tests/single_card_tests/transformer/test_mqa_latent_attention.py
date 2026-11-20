@@ -758,6 +758,23 @@ class TestHybridMLAConfig(unittest.TestCase):
                     with self.assertRaises(TypeError):
                         TransformerConfig(**self._kwargs(**{legacy: value}))
 
+    def test_removed_dsa_sink_grad_fusion_rejected_only_when_set(self):
+        """``dsa_sink_grad_fusion`` has no field any more: ``true`` must fail
+        loudly through ``from_config`` (it asked for a fusion that is gone),
+        ``false`` -- the old default -- is still absorbed, and direct
+        construction rejects the unknown kwarg either way.
+        """
+        stale = SimpleNamespace(**self._kwargs(dsa_sink_grad_fusion=True))
+        with self.assertRaises(ValueError) as raised:
+            TransformerConfig.from_config(stale)
+        self.assertIn("dsa_sink_grad_fusion", str(raised.exception))
+        self.assertIn("d_sink", str(raised.exception))
+        TransformerConfig.from_config(
+            SimpleNamespace(**self._kwargs(dsa_sink_grad_fusion=False))
+        )
+        with self.assertRaises(TypeError):
+            TransformerConfig(**self._kwargs(dsa_sink_grad_fusion=True))
+
     def test_from_config_accepts_the_current_key_names(self):
         """Control for the test above: the rejection is keyed on the old names
         only, so the new ones must survive the same ``from_config`` path.
@@ -2222,7 +2239,7 @@ class TestMQASparseAttnLseSideChannelMocked(unittest.TestCase):
             )
             return out, lse, lse_indexer
 
-        return mock.patch.object(fwd_mod, "flash_mla_sparse_attn", fake)
+        return mock.patch.object(fwd_mod, "sparse_attn_fwd", fake)
 
     def _call(self, indexer_topk, calls):
         from paddlefleet.fusions.mqa_sparse_attn import mqa_sparse_attn

@@ -1666,7 +1666,7 @@ class TestDSv4HybridDocumentRoPE(unittest.TestCase):
 
         with (
             patch.object(IND, "cudnn_indexer_topk_fwd", _mock_indexer_topk),
-            patch.object(SA, "flash_mla_sparse_attn", _mock_flash_mla),
+            patch.object(SA, "sparse_attn_fwd", _mock_flash_mla),
             patch.object(
                 DSA, "sparse_attn_score_recompute_wrapper", _mock_target
             ),
@@ -1769,7 +1769,7 @@ class TestDSv4HybridDocumentRoPE(unittest.TestCase):
 
         with (
             patch.object(IND, "cudnn_indexer_topk_fwd", _mock_indexer_topk),
-            patch.object(SA, "flash_mla_sparse_attn", _mock_flash_mla),
+            patch.object(SA, "sparse_attn_fwd", _mock_flash_mla),
             patch.object(
                 DSA,
                 "sparse_attn_score_recompute_wrapper",

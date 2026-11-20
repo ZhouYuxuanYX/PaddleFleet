@@ -288,24 +288,25 @@ class TestCudnnCsaIndexerBwd(unittest.TestCase):
         )
         self.assertEqual(grad_q.shape, list(index_q.shape))
 
-    def test_custom_block_I(self):
-        """block_I=64 covers the non-default tile size path."""
+    def test_custom_block_I_rejected(self):
+        """cuDNN >= 1.32.3 rejects block_I != 128 on SM100: the TMA Gather4
+        loader hangs at block_I=64 and the cp.async loader gets d_index_k wrong."""
         b, sq, sk, h, d, topk = 1, 1024, 256, 64, 128, 128
         index_q, weights, index_k, target, topk_probs, topk_indices = (
             _make_inputs(b, sq, sk, h, d, topk, seed=16)
         )
-        grad_q, grad_w, grad_k = self.cudnn_fn(
-            index_q,
-            weights,
-            index_k,
-            target,
-            topk_probs,
-            topk_indices,
-            loss_coeff=0.01,
-            grad_loss=paddle.to_tensor(1.0, dtype="float32"),
-            block_I=64,
-        )
-        self.assertEqual(grad_q.shape, list(index_q.shape))
+        with self.assertRaisesRegex(ValueError, "requires block_I=128"):
+            self.cudnn_fn(
+                index_q,
+                weights,
+                index_k,
+                target,
+                topk_probs,
+                topk_indices,
+                loss_coeff=0.01,
+                grad_loss=paddle.to_tensor(1.0, dtype="float32"),
+                block_I=64,
+            )
 
     def test_saved_tensors_not_mutated(self):
         """Wrapper must clone target/topk_probs; cuDNN overwrites in place."""

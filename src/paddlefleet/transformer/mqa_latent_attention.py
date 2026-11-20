@@ -818,7 +818,8 @@ class MQALatentAttention(FleetLayer):
         # ``test_block_sparse_dsa_gradcheck.py::TestDeterminism``); "tilelang"
         # (mqa_latent_sparse_bwd) is bitwise stable for identical inputs -- by
         # construction, not via ``FLAGS_cudnn_deterministic`` -- but ~14x slower
-        # on SM100. The forward is always FlashMLA regardless of this switch
+        # on SM100. The forward ignores this switch: cuDNN where
+        # ``cudnn_dsa_supported()`` (SM100 + cudnn-frontend), FlashMLA otherwise
         # (the tilelang forward cannot accept d_qk=576, which is not a power of
         # two). Default "cudnn" preserves the previous behaviour.
         self.sparse_attn_backward_backend = str(
@@ -851,9 +852,6 @@ class MQALatentAttention(FleetLayer):
         if kv_lora_rank is None:
             kv_lora_rank = config.kv_lora_rank
         self.kv_lora_rank = int(kv_lora_rank)
-        # Fused Triton epilogue for the analytic sink gradient. Only reachable
-        # when ``softmax_offset`` exists; a sinkless layer has no sink gradient.
-        self.sink_grad_fusion = getattr(config, "dsa_sink_grad_fusion", False)
         # Fused Triton local->global KV column index remap (bit-identical).
         self.global_kv_idx_remap_fusion = getattr(
             config, "sparse_attn_global_kv_idx_remap_fusion", False
@@ -1901,15 +1899,15 @@ class MQALatentAttention(FleetLayer):
     ):
         """Sparse MQA over the absorbed latent, via the shared cudnn backend.
 
-        Same FlashMLA sparse forward + cuDNN DSA backward pair that the CSA/HCA
-        layers use; the absorbed layout only differs in ``d_v`` (512 value dims
+        Same sparse forward (``sparse_attn_fwd``: cuDNN on SM100, FlashMLA
+        otherwise) + cuDNN DSA backward pair that the CSA/HCA layers use; the absorbed layout only differs in ``d_v`` (512 value dims
         out of a 576-wide query/key) and in the sink being optional --
         ``softmax_offset`` is ``None`` when ``add_full_attention_sink_bias`` is
         off, which the backend turns into a sinkless softmax. Query-head padding
         to the DSA-fixed ``h_q == 64`` is the backend's job.
 
-        The forward is always FlashMLA sparse; the backward kernel is selected
-        by ``mqa_sparse_attn_backward_backend`` (see ``__init__``).
+        The forward does not depend on ``mqa_sparse_attn_backward_backend``;
+        only the backward kernel is selected by it (see ``__init__``).
 
         ``indexer_topk > 0`` additionally returns the LSE over the first
         ``indexer_topk`` columns, which is the indexer-loss target's normalizer.
@@ -1924,7 +1922,6 @@ class MQALatentAttention(FleetLayer):
             d_v,
             attn_sink=self.softmax_offset,
             indexer_topk=indexer_topk,
-            sink_grad_fusion=self.sink_grad_fusion,
             global_kv_idx_remap_fusion=self.global_kv_idx_remap_fusion,
             backward_backend=self.sparse_attn_backward_backend,
         )

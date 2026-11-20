@@ -12,15 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DSA (FlashMLA sparse fwd + cuDNN DSA bwd) backend for the HySparse
+"""DSA (cuDNN DSA sparse fwd + bwd on SM100) backend for the HySparse
 block-sparse MQA gather branch.
 
-DeepSeek-v4's CSA sparse attention (FlashMLA sparse forward + cuDNN DSA
+DeepSeek-v4's CSA sparse attention (``sparse_attn_fwd`` + cuDNN DSA
 backward) natively handles the absorbed-MQA D=576 query / D_v=512 value
 single-shared-head layout. This module bridges the HySparse *block* selection
 onto that *token*-level DSA path; the kernel plumbing itself lives in the shared
-``paddlefleet.fusions.mqa_sparse_attn.mqa_sparse_attn`` entry (the same FlashMLA
-sparse forward + cuDNN DSA backward pair as
+``paddlefleet.fusions.mqa_sparse_attn.mqa_sparse_attn`` entry (the same sparse
+forward + cuDNN DSA backward pair as
 ``csa_sparse_attn(backend="cudnn")``), which owns the ``h_q == 64`` head padding,
 the sinkless ``-1e30`` sink, the asymmetric ``d_v`` and the finite-sink backward
 correction. What is specific to HySparse and stays here:
@@ -47,31 +47,18 @@ import paddle
 
 @lru_cache(maxsize=1)
 def is_dsa_available() -> bool:
-    """Whether the FlashMLA sparse fwd + cuDNN DSA bwd path can run here.
+    """Whether the cuDNN DSA sparse fwd + bwd path can run here.
 
-    The DSA fwd/bwd kernels are only implemented for SM100+ (Blackwell); there
-    is no eager fallback below it. Probe the actual PaddleFleet ops dependencies
-    once per process. Avoid importing the standalone ``cudnn`` package here:
-    under Paddle's torch proxy its module discovery can recursively enter
-    ``find_spec`` and hang the first attention forward.
+    Same predicate as the sparse forward dispatch (``cudnn_dsa_supported``):
+    the DSA fwd/bwd kernels exist for SM100 only, with no eager fallback, and
+    need the vendored cudnn-frontend. It only asks ``paddlefleet_ops``; it does
+    not import the standalone ``cudnn`` package, whose module discovery under
+    Paddle's torch proxy can recursively enter ``find_spec`` and hang the first
+    attention forward.
     """
-    try:
-        import paddlefleet_ops
+    from .attn.csa_sparse_attn_fwd_cudnn import cudnn_dsa_supported
 
-        from paddlefleet.cudnn_ops.attn import csa_sparse_attn_fwd_cudnn
-
-        if paddle.device.cuda.get_device_capability()[0] < 10:
-            return False
-        if (
-            not paddlefleet_ops.is_flash_mla_available()
-            or csa_sparse_attn_fwd_cudnn._flash_mla_sparse_fwd is None
-        ):
-            return False
-        if not paddlefleet_ops.is_cudnn_frontend_available():
-            return False
-    except (ImportError, RuntimeError, AttributeError):
-        return False
-    return True
+    return cudnn_dsa_supported()
 
 
 def _expand_blocks_to_token_indices(indices, valid_range, block_B):
@@ -194,10 +181,6 @@ def block_sparse_mqa_attention_dsa(
     else:
         query_p, key_p, eff_d_v = query, shared_key_sq, kv_lora_rank
 
-    # ``sink_grad_fusion`` is deliberately left at its default: the fused Triton
-    # sink-gradient epilogue (config ``dsa_sink_grad_fusion``) is scoped to
-    # MQALatentAttention, so HySparse keeps the eager epilogue even when a
-    # learnable ``attn_sink`` is supplied.
     out = mqa_sparse_attn(
         query_p,
         key_p,

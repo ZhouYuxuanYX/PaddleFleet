@@ -42,7 +42,8 @@ requires = [
     "wheel",
     "packaging",
     "ninja==1.11.1.1",  # For nvidia-cudnn-frontend
-    "pybind11[global]>=2.13,<3", # For nvidia-cudnn-frontend
+    "pybind11[global]>=2.13,<3", # For DeepEP / DeepGEMM / HybridEP / MoonEP
+    "nanobind>=3.0.1,<4", # For nvidia-cudnn-frontend >= 1.32 (moved from pybind11)
 ]
 build-backend = "build_backend"
 backend-path = ["."]

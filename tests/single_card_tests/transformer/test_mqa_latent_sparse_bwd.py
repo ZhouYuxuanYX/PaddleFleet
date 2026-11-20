@@ -250,10 +250,9 @@ class TestBackendDispatch(_Base):
         )
         self.assertLess(_relerr(dq_t, dq_c), REORDER_TOL * 4, "dq")
         self.assertLess(_relerr(dkv_t, dkv_c), REORDER_TOL, "dkv")
-        # The two d_sink values come from different code entirely -- the eager
-        # analytic epilogue for cuDNN (whose kernel returns zeros) versus the
-        # tilelang kernel's own reduction -- so agreement here is a real
-        # cross-check of both, not a tautology.
+        # The two d_sink values come from different kernels -- the cuDNN DSA
+        # backward's reduction versus the tilelang kernel's own -- so agreement
+        # here is a real cross-check of both, not a tautology.
         self.assertLess(_relerr(ds_t, ds_c), REORDER_TOL, "d_sink")
 
     def test_default_backend_is_cudnn(self):

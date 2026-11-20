@@ -18,7 +18,8 @@ A single ``backend`` argument selects one of three implementations of the
 final sparse MQA attention:
   - "unfused": pure-Paddle einsum forward + Paddle autograd backward
   - "tilelang": TileLang sparse MQA forward + TileLang backward
-  - "cudnn": FlashMLA sparse forward + cuDNN DSA backward
+  - "cudnn": ``sparse_attn_fwd`` (cuDNN on SM100 with cudnn-frontend, FlashMLA
+    otherwise) + cuDNN DSA backward
 
 Head counts below a kernel tile are supported by zero-padding, see
 ``_pad_query_heads``. Latent widths below 512 likewise, see
@@ -604,14 +605,14 @@ class CSASparseAttention(paddle.autograd.PyLayer):
         ctx.kernel_hn = _dsa_latent_dim(hn) if backend == "cudnn" else hn
         if backend == "cudnn":
             from paddlefleet.cudnn_ops.attn.csa_sparse_attn_fwd_cudnn import (
-                flash_mla_sparse_attn,
+                sparse_attn_fwd,
             )
 
             q_in, sink_in = query, attn_sink
             if head_tile != np_heads:
                 q_in, sink_in = _pad_query_heads(query, attn_sink, head_tile)
 
-            output, lse, lse_indexer = flash_mla_sparse_attn(
+            output, lse, lse_indexer = sparse_attn_fwd(
                 _pad_latent_dim(q_in, ctx.kernel_hn),
                 _pad_latent_dim(kv_full, ctx.kernel_hn),
                 sink_in,
