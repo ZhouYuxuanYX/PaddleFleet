@@ -18,6 +18,8 @@ prune third_party/DeepGEMM/deep_gemm_cpp.egg-info
 prune third_party/DeepGEMM/build
 prune third_party/DeepEP/deep_ep.egg-info
 prune third_party/DeepEP/build
+prune third_party/DeepEPV2/deep_ep.egg-info
+prune third_party/DeepEPV2/build
 prune third_party/HybridEP/deep_ep.egg-info
 prune third_party/HybridEP/build
 prune third_party/quack/quack_kernels.egg-info

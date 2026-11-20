@@ -75,12 +75,14 @@ from paddlefleet.transformer.utils import profile
 from paddlefleet.utils import use_dsv4_accuracy_compatible
 from paddlefleet.utils.tools import get_gpu_capability
 
+from .deepep_v2 import configure_buffer_v2, is_expand_enabled
 from .fp8_utils import (
     fused_stack_quant_without_cache,
     mxfp4_stack_quant_without_cache,
 )
 from .fused_a2a import configure_buffer, configure_ep_barrier
 from .fusion_layer_utils import (
+    DeepEPV2ExpandMoePyLayer,
     FusionMoePyLayer,
     HybridEPMoePyLayer,
 )
@@ -659,9 +661,13 @@ class MoELayer(nn.Layer):
                     "moe_token_dispatcher_type='moonep' requires GPU "
                     "architecture SM90 or higher."
                 )
-            if self.moe_token_dispatcher_type in ("deepep", "hybridep"):
+            if self.moe_token_dispatcher_type in (
+                "deepep",
+                "deepep_v2",
+                "hybridep",
+            ):
                 logger.info(
-                    "deepep/hybridep in paddlepaddle does not support compute capability < 9.0, "
+                    "deepep/deepep_v2/hybridep in paddlepaddle does not support compute capability < 9.0, "
                     "fallback to alltoall token dispatcher."
                 )
                 self.moe_token_dispatcher_type = "alltoall"
@@ -672,9 +678,12 @@ class MoELayer(nn.Layer):
                 self.moe_deep_gemm = False
 
         self.moe_use_fusion_node = config.moe_use_fusion_node
+        # Set from the module config when a deepep_v2 dispatcher is built below.
+        self.deepep_v2_do_expand = False
         if self.expert_model_parallel_size > 1:
             if self.moe_token_dispatcher_type in (
                 "deepep",
+                "deepep_v2",
                 "hybridep",
                 "moonep",
             ):
@@ -835,6 +844,7 @@ class MoELayer(nn.Layer):
         if self.expert_model_parallel_size > 1:
             if self.moe_token_dispatcher_type in (
                 "deepep",
+                "deepep_v2",
                 "hybridep",
                 "moonep",
             ):
@@ -856,6 +866,25 @@ class MoELayer(nn.Layer):
                         "Automatically set NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=%d for hybrid EP backend.",
                         num_of_hybrid_ep_ranks_per_nvlink_domain,
                     )
+                if self.moe_token_dispatcher_type == "deepep_v2":
+                    configure_buffer_v2(
+                        **(
+                            getattr(config, "deepep_v2_buffer_configs", None)
+                            or {}
+                        )
+                    )
+                    self.deepep_v2_do_expand = is_expand_enabled()
+                    if self.deepep_v2_do_expand:
+                        if self.using_sonic_moe:
+                            raise ValueError(
+                                "deepep_v2_buffer_configs['do_expand']=True is not supported "
+                                "together with using_sonic_moe."
+                            )
+                        if not self.moe_use_fusion_node:
+                            raise ValueError(
+                                "deepep_v2_buffer_configs['do_expand']=True requires "
+                                "moe_use_fusion_node=True."
+                            )
                 self.token_dispatcher = MoEFlexTokenDispatcher(
                     self.num_experts_per_device,
                     self.num_experts_per_tok,
@@ -1660,6 +1689,12 @@ class MoELayer(nn.Layer):
                     dispatched_probs,
                     fp8_dispatched_handle=fp8_dispatched_handle,
                 )
+            elif self._use_deepep_v2_expand_fusion():
+                hidden_states = self._run_deepep_v2_expand_fusion(
+                    dispatched_hidden_states,
+                    dispatched_probs,
+                    fp8_dispatched_handle=fp8_dispatched_handle,
+                )
             elif self.using_sonic_moe:
                 use_fp8 = self.fp8 is not None
                 fp8_scale = None
@@ -1833,6 +1868,43 @@ class MoELayer(nn.Layer):
             w4a8_route_factor_post_w2=self.w4a8_route_factor_post_w2,
         )
 
+    def _use_deepep_v2_expand_fusion(self):
+        """DeepEP V2.5 expanding layout: dispatch already permuted, so skip unzip/zip."""
+        return (
+            self.moe_use_fusion_node
+            and self.moe_token_dispatcher_type == "deepep_v2"
+            and self.deepep_v2_do_expand
+        )
+
+    def _run_deepep_v2_expand_fusion(
+        self,
+        dispatched_hidden_states,
+        dispatched_probs,
+        fp8_dispatched_handle=None,
+        is_first_fwd=False,
+    ):
+        dispatched_hidden_states.stop_gradient = False
+        dispatched_probs.stop_gradient = False
+        return DeepEPV2ExpandMoePyLayer.apply(
+            dispatched_hidden_states,
+            dispatched_probs,
+            self,
+            use_fp8_mlp=self.fp8,
+            moe_deep_gemm=self.moe_deep_gemm,
+            moe_expert_fusion=self.moe_expert_fusion,
+            use_ue8m0=self.use_ue8m0,
+            recompute_moe_gate_up=self.recompute_moe_gate_up,
+            use_bf16_gemm_weight_grad=not self.fp8_wgrad,
+            fp8_dispatched_handle=fp8_dispatched_handle,
+            is_first_fwd=is_first_fwd,
+            defer_expert_up_gate_dw=self.defer_expert_up_gate_dw,
+            defer_expert_down_dw=self.defer_expert_down_dw,
+            clamp_value=self.config.activation_func_clamp_value,
+            use_accuracy_compatible=getattr(
+                self.config, "use_accuracy_compatible", False
+            ),
+        )
+
     def dispatch_preprocess(self, args):
         hidden_states, token_probs, token_indices = args
         if self.use_latent_moe:
@@ -1877,7 +1949,10 @@ class MoELayer(nn.Layer):
             )
             guard_status["x"].stop_gradient = True
             dispatched_indices = None
-            if not self._use_hybrid_ep_fusion():
+            if not (
+                self._use_hybrid_ep_fusion()
+                or self._use_deepep_v2_expand_fusion()
+            ):
                 dispatched_indices = (
                     self.token_dispatcher._comm_manager.dispatched_indices
                 )
@@ -1909,6 +1984,13 @@ class MoELayer(nn.Layer):
 
             if self._use_hybrid_ep_fusion():
                 hidden_states = self._run_hybrid_ep_fusion(
+                    dispatched_hidden_states,
+                    dispatched_probs,
+                    fp8_dispatched_handle=fp8_dispatched_handle,
+                    is_first_fwd=is_first_fwd,
+                )
+            elif self._use_deepep_v2_expand_fusion():
+                hidden_states = self._run_deepep_v2_expand_fusion(
                     dispatched_hidden_states,
                     dispatched_probs,
                     fp8_dispatched_handle=fp8_dispatched_handle,

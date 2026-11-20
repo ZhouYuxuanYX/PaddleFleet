@@ -207,6 +207,7 @@ def check_submodule_updated():
             "fast-hadamard-transform",
             "DeepSelect",
             "FlashTopK",
+            "DeepEPV2",
         ]
         if os.environ.get("ENABLE_MOONEP", "0") == "1":
             third_parties.append("MoonEP")
@@ -356,6 +357,10 @@ def get_cuda_version():
     return cuda_major, cuda_minor
 
 
+#: DeepEP V2.5 needs the NCCL device API (GIN / symmetric-memory windows) at build time.
+_DEEPEP_V2_MIN_NCCL = (2, 32, 3)
+
+
 def get_special_build_deps():
     if backends.IS_NVIDIA:
         cuda_major, cuda_minor = get_cuda_version()
@@ -374,6 +379,10 @@ def get_special_build_deps():
             raise ValueError(
                 f"Unsupported CUDA version: {cuda_major}.{cuda_minor}."
             )
+        _nccl = get_nccl_version()
+        if _nccl is not None and _nccl >= _DEEPEP_V2_MIN_NCCL:
+            _min_nccl = ".".join(map(str, _DEEPEP_V2_MIN_NCCL))
+            deps.append(f"nvidia-nccl-cu{cuda_major}>={_min_nccl}")
         return deps
     elif backends.IS_XPU:
         try:
@@ -392,6 +401,40 @@ def get_special_build_deps():
         return deps
     else:
         return []
+
+
+def get_nccl_version():
+    """``(major, minor, patch)`` of the NCCL headers this build would use, or ``None``.
+
+    Resolution mirrors what DeepEP V2.5's own ``setup.py`` does
+    (``deep_ep/utils/find_pkgs.py::find_nccl_root``, overridable via ``EP_NCCL_ROOT_DIR``)
+    and what the in-package zcomm ops do (``setup.py::_zcomm_nccl``, ``NCCL_HOME``), so the
+    gate below and the actual compile agree on which NCCL they are talking about.
+    """
+    roots = [
+        os.environ.get(name, "").strip()
+        for name in ("EP_NCCL_ROOT_DIR", "NCCL_HOME", "NCCL_ROOT")
+    ]
+    try:
+        import nvidia.nccl
+
+        roots.append(next(iter(nvidia.nccl.__path__)))
+    except Exception:
+        pass
+    for root in roots:
+        if not root:
+            continue
+        header = Path(root) / "include" / "nccl.h"
+        if not header.is_file():
+            continue
+        text = header.read_text()
+        parts = [
+            re.search(rf"#define\s+NCCL_{key}\s+(\d+)", text)
+            for key in ("MAJOR", "MINOR", "PATCH")
+        ]
+        if all(parts):
+            return tuple(int(m.group(1)) for m in parts)
+    return None
 
 
 def get_libs():
@@ -509,6 +552,27 @@ def get_libs():
                 ],
                 extra_env={"PADDLE_CUDA_ARCH_LIST": _deep_ep_arch},
             ),
+        )
+    _nccl_version = get_nccl_version()
+    if _nccl_version is not None and _nccl_version >= _DEEPEP_V2_MIN_NCCL:
+        LIBRARIES.append(
+            EcosystemLibrary(
+                name="DeepEPV2",
+                source_rel_path="third_party/DeepEPV2",
+                artifacts=[
+                    Artifact("deep_ep", "deep_ep_v2"),
+                ],
+            ),
+        )
+    else:
+        _found = (
+            ".".join(map(str, _nccl_version)) if _nccl_version else "not found"
+        )
+        logger.warning(
+            f"DeepEPV2 skipped: NCCL {_found} lacks the device API it needs "
+            f"(>= {'.'.join(map(str, _DEEPEP_V2_MIN_NCCL))}). Every other library still "
+            "builds; `paddlefleet_ops.is_deep_ep_v2_available()` will report False and the "
+            "`deepep_v2` token dispatcher will be unavailable."
         )
     if (cuda_major, cuda_minor) >= (12, 9):
         LIBRARIES.append(

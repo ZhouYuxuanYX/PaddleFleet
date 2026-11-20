@@ -1169,7 +1169,9 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_token_dispatcher_type: str = "alltoall"
     """The type of token dispatcher to use. The default is 'alltoall'.
-    Options are 'allgather', 'alltoall', 'deepep', 'hybridep', 'ringmoe', and 'moonep'.
+    Options are 'allgather', 'alltoall', 'deepep', 'deepep_v2', 'hybridep', 'ringmoe', and 'moonep'.
+    'deepep_v2' uses DeepEP V2.5 (``paddlefleet_ops.deep_ep_v2``), which is built only when
+    the NCCL paddlefleet_ops was built against provides the device API (GIN).
     Call ``paddlefleet.transformer.moe.finalize_moonep`` before destroying
     the process group when using MoonEP."""
 
@@ -2345,6 +2347,36 @@ class TransformerConfig(ModelParallelConfig):
     deepep_buffer_configs: dict | None = None
     """DeepEP buffer configuration."""
 
+    deepep_v2_buffer_configs: dict | None = None
+    """DeepEP V2.5 (``moe_token_dispatcher_type='deepep_v2'``) buffer/kernel settings.
+
+    Accepted keys (all optional; anything else raises in ``__post_init__``). Values not given
+    fall back to the defaults below on every layer -- the backend restores them per layer, so a
+    layer that configures nothing does not inherit another layer's layout.
+
+    - ``num_max_tokens_per_rank`` (int > 0, default ``None``): static upper bound of tokens one
+      rank dispatches at once. Unset, every dispatch negotiates it with an ``all_reduce(MAX)``
+      plus a ``.item()`` host sync and grows the buffer monotonically; measured cost of that
+      negotiation is ~4% of dispatch time on 8x8 EP=64. Set, the sync is skipped and exceeding
+      the bound raises. The bound is ``per_device_train_batch_size * seq_len / cp_size`` for a
+      decoder-only MoE; a model whose encoder also dispatches is data dependent, so measure
+      first (the backend logs the negotiated value on the first dispatch).
+    - ``num_sms`` (int >= 0, default ``0``): SMs for the communication kernels. ``0`` lets
+      DeepEP size it from its bandwidth model, which deliberately stays small so the expert
+      GEMMs keep the rest of the device (EP=64 over 8 nodes resolves to 8, single-node EP=8
+      to 32).
+    - ``do_expand`` (bool, default ``False``): expanding layout -- dispatch returns
+      expert-contiguous rows so the framework's permute/unpermute is skipped. Requires
+      ``moe_use_fusion_node=True`` and is incompatible with ``using_sonic_moe``.
+    - ``expert_alignment`` (int > 0 and a multiple of 4, default ``FP8_ALIGN``): per-expert row
+      alignment in the expanding layout; the multiple-of-4 rule keeps the FP8 scale's leading
+      dimension TMA aligned.
+    - ``deterministic`` (bool, default ``False``): DeepEP V2.5's deterministic dispatch, giving
+      a reproducible receive order (and hence a reproducible expert weight-gradient accumulation
+      order). Fixed when the buffer is built. It constrains dispatch only -- combine's FP32
+      accumulation order still differs from V1's.
+    """
+
     # Field name mapping rules: HuggingFace config.json name -> TransformerConfig name
     transform_rules = {
         # DSA field mapping
@@ -2513,12 +2545,78 @@ class TransformerConfig(ModelParallelConfig):
     def get(self, key: str, default=None):
         return getattr(self, key, default)
 
+    _DEEPEP_V2_BUFFER_KEYS = (
+        "num_max_tokens_per_rank",
+        "num_sms",
+        "do_expand",
+        "expert_alignment",
+        "deterministic",
+    )
+
+    def _validate_deepep_v2_buffer_configs(self):
+        """Validate ``deepep_v2_buffer_configs`` keys, values and cross-field constraints.
+
+        Checked here rather than in ``MoELayer.__init__`` so a bad config fails when it is
+        built, not when the first layer happens to be constructed, and so the error does not
+        depend on reaching the DeepEP V2.5 code path at all.
+        """
+        cfg = self.deepep_v2_buffer_configs
+        if cfg is None:
+            return
+        if not isinstance(cfg, dict):
+            raise ValueError(
+                f"deepep_v2_buffer_configs must be a dict, got {type(cfg).__name__}."
+            )
+        unknown = sorted(set(cfg) - set(self._DEEPEP_V2_BUFFER_KEYS))
+        if unknown:
+            raise ValueError(
+                f"deepep_v2_buffer_configs got unknown keys {unknown}; "
+                f"accepted keys are {list(self._DEEPEP_V2_BUFFER_KEYS)}."
+            )
+        bound = cfg.get("num_max_tokens_per_rank")
+        if bound is not None and (not isinstance(bound, int) or bound <= 0):
+            raise ValueError(
+                "deepep_v2_buffer_configs['num_max_tokens_per_rank'] must be a positive int, "
+                f"got {bound!r}."
+            )
+        num_sms = cfg.get("num_sms")
+        if num_sms is not None and (
+            not isinstance(num_sms, int) or num_sms < 0
+        ):
+            raise ValueError(
+                "deepep_v2_buffer_configs['num_sms'] must be a non-negative int "
+                f"(0 = pick from bandwidths), got {num_sms!r}."
+            )
+        align = cfg.get("expert_alignment")
+        if align is not None and (
+            not isinstance(align, int) or align <= 0 or align % 4 != 0
+        ):
+            raise ValueError(
+                "deepep_v2_buffer_configs['expert_alignment'] must be a positive multiple of 4 "
+                f"(the FP8 scale's leading dimension stays TMA aligned), got {align!r}."
+            )
+        if not cfg.get("do_expand", False):
+            return
+        # The expanding layout returns no per-token expert ids, which the SonicMoE grouped GEMM
+        # needs, and it replaces the unzip/zip stages only the fused-node path can skip.
+        if self.using_sonic_moe:
+            raise ValueError(
+                "deepep_v2_buffer_configs['do_expand']=True is not supported with "
+                "using_sonic_moe=True."
+            )
+        if not self.moe_use_fusion_node:
+            raise ValueError(
+                "deepep_v2_buffer_configs['do_expand']=True requires "
+                "moe_use_fusion_node=True."
+            )
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
         super().__post_init__()
+        self._validate_deepep_v2_buffer_configs()
         # calculate_per_token_loss: reject layouts whose token count is not
         # handled yet, instead of silently mis-scaling the loss.
         if self.calculate_per_token_loss:

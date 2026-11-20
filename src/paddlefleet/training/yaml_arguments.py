@@ -15,7 +15,10 @@
 
 from omegaconf import DictConfig, OmegaConf
 
-_PRESERVED_DICT_CONFIG_KEYS = {"deepep_buffer_configs"}
+_PRESERVED_DICT_CONFIG_KEYS = {
+    "deepep_buffer_configs",
+    "deepep_v2_buffer_configs",
+}
 
 
 def _flatten_configs(cfg):

@@ -103,6 +103,11 @@ tests:
   - test_case: [tests/multi_card_tests/moe/test_qb_callback_cp_sharding.py]
     products:
       - num_gpus: 8
+  # DeepEP V2.5 vs V1 parity, expanding layout, token-bound negotiation; EP = world
+  # size, skipped unless paddlefleet_ops was built with deep_ep_v2 (NCCL device API).
+  - test_case: [tests/multi_card_tests/moe/test_deepep_v2_dispatcher_ep.py]
+    products:
+      - num_gpus: 8
   # coverage_test: tensor_parallel (Pattern A/B, TP=4 sharding=2 -> 8 GPUs)
   - test_case: [tests/multi_card_tests/tensor_parallel/test_mappings.py]
     products:

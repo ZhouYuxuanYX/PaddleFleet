@@ -138,6 +138,14 @@ if paddle.is_compiled_with_cuda():
         "For users: avoid `moe_token_dispatcher_type='deepep'` or use a GPU with compute capability equal to 9.x to enable."
     )
 
+    DEEP_EP_V2_HINT = (
+        "For developers: guard imports with `is_deep_ep_v2_available()` and only call `paddlefleet_ops.deep_ep_v2` when DeepEP V2 branch enabled.\n"
+        "For users: DeepEP V2.5 is built only when the NCCL paddlefleet_ops was built against is "
+        "new enough to provide the device API (GIN); see `_DEEPEP_V2_MIN_NCCL` in build_utils.py. "
+        "It also requires a GPU with compute capability >= 9.0 (Hopper or Blackwell). Avoid "
+        "`moe_token_dispatcher_type='deepep_v2'` when either is unavailable."
+    )
+
     HYBRID_EP_HINT = (
         "For developers: guard imports with `is_hybrid_ep_available()` and only call `paddlefleet_ops.hybrid_ep` when HybridEP branch enabled.\n"
         "For users: avoid `moe_token_dispatcher_type='hybridep'` or use a GPU with compute capability equal to 9.x to enable."
@@ -168,6 +176,7 @@ if paddle.is_compiled_with_cuda():
 else:
     DEEP_GEMM_HINT = "deep_gemm is not supported on XPU backend."
     DEEP_EP_HINT = "deep_ep is not supported on XPU backend."
+    DEEP_EP_V2_HINT = "deep_ep_v2 is not supported on XPU backend."
     HYBRID_EP_HINT = "hybrid_ep is not supported on XPU backend."
     SONIC_MOE_HINT = "sonicmoe is not supported on XPU backend."
     CUDNN_FRONTEND_HINT = "cudnn frontend is not supported on XPU backend."
@@ -242,6 +251,7 @@ def _sonic_moe_requirement(
 
 _DEEP_GEMM_AVAILABLE = False
 _DEEP_EP_AVAILABLE = False
+_DEEP_EP_V2_AVAILABLE = False
 _HYBRID_EP_AVAILABLE = False
 _SONIC_MOE_AVAILABLE = False
 _FLASH_MLA_AVAILABLE = False
@@ -258,6 +268,7 @@ if paddle.is_compiled_with_cuda():
     if paddle.cuda.get_device_capability()[0] >= 9:
         _DEEP_GEMM_AVAILABLE = True
         _DEEP_EP_AVAILABLE = True
+        _DEEP_EP_V2_AVAILABLE = (ops_dir / "deep_ep_v2").exists()
         _FLASH_MLA_AVAILABLE = True
         _MOON_EP_AVAILABLE = True
         _FLASH_MASK_AVAILABLE = True
@@ -289,6 +300,10 @@ def is_deep_gemm_available():
 
 def is_deep_ep_available():
     return _DEEP_EP_AVAILABLE
+
+
+def is_deep_ep_v2_available():
+    return _DEEP_EP_V2_AVAILABLE
 
 
 def is_hybrid_ep_available():
@@ -443,6 +458,36 @@ if paddle.is_compiled_with_cuda():
         )
         logger.warning(warning)
         blocked_import_messages["paddlefleet_ops.deep_ep"] = error
+
+    if is_deep_ep_v2_available():
+        # DeepEP V2.5 checks the NCCL runtime (>= 2.32.3, a single loaded copy) at import
+        # time. It is one optional backend among several, so a load failure only disables
+        # it and must never break V1 `deep_ep` or `import paddlefleet_ops`.
+        try:
+            paddle.enable_compat(scope={"deep_ep_v2"}, silent=True)
+            _safe_load_ecosystem_lib("deep_ep_v2", ops_dir, globals())
+        except Exception as e:
+            _DEEP_EP_V2_AVAILABLE = False
+            for _name in list(sys.modules):
+                if _name == "deep_ep_v2" or _name.startswith("deep_ep_v2."):
+                    sys.modules.pop(_name)
+            warning, error = _build_notice(
+                "paddlefleet_ops.deep_ep_v2",
+                f"failed to load: {type(e).__name__}: {e}",
+                hint_for_error=DEEP_EP_V2_HINT,
+            )
+            logger.warning(warning, exc_info=True)
+            blocked_import_messages["paddlefleet_ops.deep_ep_v2"] = error
+    else:
+        # Not built (the build-time NCCL was too old) or unsupported GPU: block the import
+        # without a warning.
+        _, error = _build_notice(
+            "paddlefleet_ops.deep_ep_v2",
+            "not built or GPU compute capability < 9.0 "
+            f"(current capability: {_capability_str}).",
+            hint_for_error=DEEP_EP_V2_HINT,
+        )
+        blocked_import_messages["paddlefleet_ops.deep_ep_v2"] = error
 
     if is_hybrid_ep_available():
         paddle.enable_compat(scope={"hybrid_ep"}, silent=True)

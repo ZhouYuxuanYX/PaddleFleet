@@ -3434,6 +3434,162 @@ class HybridEPMoePyLayer(paddle.autograd.PyLayer):
         return hidden_states_grad, dispatched_probs_grad
 
 
+def _deepep_v2_expand_expert_counts(custom_map, use_fp8_mlp, moe_expert_fusion):
+    """Per-expert row counts of DeepEP V2.5's expanding layout.
+
+    ``tokens_per_expert`` on the manager is DeepEP's ``num_recv_tokens_per_expert_list``, which in
+    the expanding layout is already padded to ``expert_alignment`` and therefore sums to the number
+    of expanded rows. Returned as a tensor only for the fused-weight FP8 GEMM, matching
+    ``_hybrid_ep_prepare_expert_counts``.
+    """
+    manager = custom_map.token_dispatcher._comm_manager
+    tokens_per_expert = manager.tokens_per_expert
+    assert tokens_per_expert is not None, (
+        "DeepEP V2 manager must populate tokens_per_expert before "
+        "DeepEPV2ExpandMoePyLayer runs."
+    )
+    num_permuted_tokens = manager.num_permuted_tokens
+    assert num_permuted_tokens is not None, (
+        "DeepEPV2ExpandMoePyLayer requires the expanding layout "
+        "(deepep_v2_buffer_configs['do_expand']=True)."
+    )
+    counts = list(tokens_per_expert)
+    assert sum(counts) == num_permuted_tokens, (
+        f"expanded rows {num_permuted_tokens} != sum of per-expert counts {sum(counts)}"
+    )
+    if use_fp8_mlp and moe_expert_fusion:
+        return paddle.to_tensor(counts, dtype="int64"), num_permuted_tokens
+    return counts, num_permuted_tokens
+
+
+def _restore_deepep_v2_prob_grad_shape(
+    dispatched_probs_grad,
+    original_probs_shape,
+):
+    """Normalize the probs grad back to the 1-D shape V2.5's dispatch handed out.
+
+    Deliberately not shared with ``_restore_hybrid_ep_prob_grad_shape``: that one's
+    assertions name HybridEP's contract, and a deepep_v2 run that trips them should not
+    report a HybridEP failure. The two backends keep their own copy so each reads on its
+    own; what must not be dropped is the 1-D check, whose absence let a 2-D grad through
+    into ``_pad_front_rows`` unnoticed.
+    """
+    assert len(original_probs_shape) == 1, (
+        "deepep_v2 dispatched_probs is expected to stay 1D on the public contract, "
+        f"got original shape {original_probs_shape}"
+    )
+    if (
+        len(dispatched_probs_grad.shape) == 2
+        and dispatched_probs_grad.shape[-1] == 1
+    ):
+        dispatched_probs_grad = dispatched_probs_grad.squeeze(-1)
+    assert len(dispatched_probs_grad.shape) == 1, (
+        "deepep_v2 probs grad must normalize back to 1D, "
+        f"got shape {tuple(dispatched_probs_grad.shape)}"
+    )
+    return _pad_front_rows(dispatched_probs_grad, original_probs_shape)
+
+
+class DeepEPV2ExpandMoePyLayer(paddle.autograd.PyLayer):
+    """Expert compute for DeepEP V2.5's expanding (``do_expand``) dispatch contract.
+
+    ``dispatch(do_expand=True)`` already returns expert-contiguous rows padded to
+    ``expert_alignment``, so -- like ``HybridEPMoePyLayer`` -- this layer skips FusionMoePyLayer's
+    unzip/zip stages and only reuses the grouped expert GEMM node. The probs are 1-D (one per
+    expanded row) and are consumed by that node, which also produces their gradient.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        hidden_states,
+        dispatched_probs,
+        custom_map,
+        use_fp8_mlp=True,
+        moe_deep_gemm=True,
+        moe_expert_fusion=False,
+        recompute_moe_gate_up=False,
+        use_bf16_gemm_weight_grad=False,
+        fp8_dispatched_handle=None,
+        is_first_fwd=False,
+        defer_expert_up_gate_dw=False,
+        defer_expert_down_dw=False,
+        clamp_value=None,
+        use_ue8m0=False,
+        use_accuracy_compatible=False,
+    ):
+        node = ExpertsGroupGemmContiguousNode(
+            custom_map,
+            recompute_moe_gate_up=recompute_moe_gate_up,
+            dequant_input=True,
+            use_bf16_gemm_weight_grad=use_bf16_gemm_weight_grad,
+            use_fp8_mlp=use_fp8_mlp,
+            moe_deep_gemm=moe_deep_gemm,
+            moe_expert_fusion=moe_expert_fusion,
+            use_ue8m0=use_ue8m0,
+            defer_expert_up_gate_dw=defer_expert_up_gate_dw,
+            defer_expert_down_dw=defer_expert_down_dw,
+            clamp_value=clamp_value,
+            activation_type=getattr(custom_map, "_activation_type", "swiglu"),
+            use_accuracy_compatible=use_accuracy_compatible,
+        )
+        original_hidden_shape = tuple(hidden_states.shape)
+        original_probs_shape = tuple(dispatched_probs.shape)
+        assert len(original_probs_shape) == 1, (
+            "DeepEP V2 expanding layout returns 1-D probs, got shape "
+            f"{original_probs_shape}"
+        )
+        (
+            padded_tokens_per_expert,
+            num_permuted_tokens,
+        ) = _deepep_v2_expand_expert_counts(
+            custom_map, use_fp8_mlp, moe_expert_fusion
+        )
+        # Normally a no-op: the expanded output has exactly num_permuted_tokens rows.
+        hidden_states = hidden_states[:num_permuted_tokens]
+        dispatched_probs = dispatched_probs[:num_permuted_tokens]
+        scale = None
+        if fp8_dispatched_handle is not None:
+            assert hidden_states.dtype == paddle.float8_e4m3fn
+            # Already column-major from use_tma_aligned_col_major_sf, which is the layout the
+            # node builds itself, so no conversion is needed here.
+            scale = fp8_dispatched_handle["scale"][:num_permuted_tokens]
+
+        out = node.forward(
+            hidden_states,
+            dispatched_probs,
+            padded_tokens_per_expert,
+            scale=scale,
+        )
+        out.stop_gradient = False
+
+        ctx.node = node
+        ctx.original_hidden_shape = original_hidden_shape
+        ctx.original_probs_shape = original_probs_shape
+        if is_first_fwd:
+            node.clear_cached_tensors()
+        ctx.save_for_backward([*node.cached_tensors(), dispatched_probs])
+        node.clear_cached_tensors()
+        return out
+
+    @staticmethod
+    def backward(ctx, output_grad):
+        (cached_tensors,) = ctx.saved_tensor()
+        dispatched_probs = cached_tensors[-1]
+        ctx.node.set_cached_tensors(cached_tensors[:-1])
+        hidden_states_grad, dispatched_probs_grad = ctx.node.backward(
+            output_grad, dispatched_probs
+        )
+        ctx.node.reset_state()
+        hidden_states_grad = _pad_front_rows(
+            hidden_states_grad, ctx.original_hidden_shape
+        )
+        dispatched_probs_grad = _restore_deepep_v2_prob_grad_shape(
+            dispatched_probs_grad, ctx.original_probs_shape
+        )
+        return hidden_states_grad, dispatched_probs_grad
+
+
 def run_sonic_moe(
     hidden_states,
     topk_indices,

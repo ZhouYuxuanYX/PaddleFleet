@@ -32,6 +32,12 @@ logger = logging.getLogger(__name__)
 from paddlefleet.transformer.utils import profile
 from paddlefleet.utils import use_dsv4_accuracy_compatible
 
+from .deepep_v2 import (
+    deepep_v2_combine,
+    deepep_v2_dispatch,
+    is_deep_ep_v2_available,
+    kernel_config_snapshot,
+)
 from .fp8_utils import FP8_ALIGN, _w4a8_quant_pack_for_hybridep_dispatch
 from .fused_a2a import (
     HYBRIDEP_TOKEN_ALIGNMENT,
@@ -97,13 +103,14 @@ def is_hybrid_ep_backend_selected(
         "allgather",
         "alltoall",
         "deepep",
+        "deepep_v2",
         "hybridep",
         "moonep",
         "ringmoe",
     ):
         raise ValueError(
             "moe_token_dispatcher_type must be one of: "
-            "allgather, alltoall, deepep, hybridep, moonep, ringmoe"
+            "allgather, alltoall, deepep, deepep_v2, hybridep, moonep, ringmoe"
         )
     if selected_dispatcher != "hybridep":
         return False
@@ -901,12 +908,16 @@ class _DeepEPManager(_DispatchManager):
         self.handle = None
         self.global_input_probs = None
 
+        self._require_backend()
+        self._rr_fusedcombined = None
+        self._rr_fuseddispatch = None
+
+    def _require_backend(self):
+        """Fail fast when the communication backend this manager needs is missing."""
         if fused_dispatch is None:
             raise ImportError(
                 "DeepEP is not supported in your paddlepaddle whl package."
             )
-        self._rr_fusedcombined = None
-        self._rr_fuseddispatch = None
 
     def setup_metadata(
         self,
@@ -1161,6 +1172,195 @@ class _DeepEPManager(_DispatchManager):
         return hidden_states.to(input_dtype)
 
 
+class _DeepEPV2Manager(_DeepEPManager):
+    """
+    DeepEP V2.5 (``EPBuffer``) manager for ``moe_token_dispatcher_type='deepep_v2'``.
+
+    Only the communication differs from ``_DeepEPManager``: dispatch/combine go through
+    ``deepep_v2.py``. Routing metadata, permute/unpermute and the dispatched-state attributes are
+    inherited unchanged, since V2.5 returns them with V1 semantics (``dispatched_indices`` holds
+    local expert ids or -1, ``tokens_per_expert`` is a Python list, probs are float32).
+    """
+
+    def __init__(
+        self,
+        group: Group,
+        router_topk: int,
+        num_experts: int | None = None,
+        num_local_experts: int | None = None,
+        moe_ep_barrier: bool = True,
+        use_accuracy_compatible: bool = False,
+    ):
+        super().__init__(
+            group,
+            router_topk,
+            num_experts=num_experts,
+            num_local_experts=num_local_experts,
+            moe_ep_barrier=moe_ep_barrier,
+            use_accuracy_compatible=use_accuracy_compatible,
+        )
+        self._states = None
+        # Expanding layout only: number of expert-contiguous rows dispatch returned.
+        self.num_permuted_tokens = None
+        # Freeze the dispatch geometry this model was configured with. configure_buffer_v2 is
+        # module level, so another model built later in the same process must not change it.
+        self.kernel_config = kernel_config_snapshot()
+
+    def _require_backend(self):
+        """V2.5 talks to ``deep_ep_v2``, not V1's ``fused_dispatch``."""
+        if not is_deep_ep_v2_available():
+            raise ImportError(
+                "moe_token_dispatcher_type='deepep_v2' requires "
+                "paddlefleet_ops.deep_ep_v2, which is built only when the NCCL "
+                "paddlefleet_ops was built against provides the device API "
+                "(see _DEEPEP_V2_MIN_NCCL in build_utils.py)."
+            )
+
+    def _dispatch(
+        self,
+        hidden_states,
+        token_indices,
+        token_probs,
+        fp8_dispatch,
+        async_finish,
+        use_ue8m0,
+        using_sonic_moe=False,
+    ):
+        if async_finish:
+            raise NotImplementedError(
+                "deepep_v2 does not support async dispatch "
+                "(TransformerLayerWithOverlap) yet."
+            )
+        hidden_states, dispatched_probs, states, scale = deepep_v2_dispatch(
+            hidden_states,
+            token_indices,
+            token_probs,
+            self.num_experts,
+            self.group,
+            fp8_dispatch=fp8_dispatch,
+            moe_ep_barrier=self.moe_ep_barrier,
+            use_ue8m0=use_ue8m0,
+            using_sonic_moe=using_sonic_moe,
+            kernel_config=self.kernel_config,
+        )
+        self._states = states
+        self.handle = states["handle"]
+        self.tokens_per_expert = states["tokens_per_expert"]
+        self.dispatched_indices = states["dispatched_indices"]
+        self.dispatched_probs = dispatched_probs
+        self.global_input_probs = None
+        self.num_permuted_tokens = states["num_permuted_tokens"]
+        return hidden_states, scale
+
+    def dispatch_overlap(
+        self,
+        hidden_states: paddle.Tensor,
+        token_indices: paddle.Tensor,
+        token_weights: paddle.Tensor,
+        fp8_dispatch: bool = False,
+        async_finish: bool = False,
+        use_ue8m0: bool = False,
+        using_sonic_moe: bool = False,
+    ) -> tuple[paddle.Tensor, dict | None]:
+        return self._dispatch(
+            hidden_states,
+            token_indices,
+            token_weights,
+            fp8_dispatch,
+            async_finish,
+            use_ue8m0,
+            using_sonic_moe,
+        )
+
+    def dispatch(
+        self,
+        hidden_states: paddle.Tensor,
+        fp8_dispatch: bool = False,
+        async_finish: bool = False,
+        use_ue8m0: bool = False,
+        using_sonic_moe: bool = False,
+        use_rr_deepep_dispatch: bool = False,
+    ) -> tuple[paddle.Tensor, dict | None]:
+        # moe_dispatch refined recompute reuses V1's DeepEPDispatchRefinedRecompute. Reaching
+        # here means a direct manager call: MoELayer reaches it through
+        # ``validate_rr_module_env``, which only accepts ``deepep``.
+        if use_rr_deepep_dispatch:
+            raise NotImplementedError(
+                "moe_dispatch refined recompute is not supported by deepep_v2 yet."
+            )
+        return self._dispatch(
+            hidden_states,
+            self.token_indices,
+            self.token_probs,
+            fp8_dispatch,
+            async_finish,
+            use_ue8m0,
+            using_sonic_moe,
+        )
+
+    def combine(
+        self,
+        hidden_states: paddle.Tensor,
+        combine_overlap_handle: dict | None = None,
+        async_finish: bool = False,
+        use_rr_deepep_combine: bool = False,
+        fp8_dispatch: bool = False,
+        combine_grad_handle: dict | None = None,
+    ) -> paddle.Tensor:
+        if async_finish:
+            raise NotImplementedError(
+                "deepep_v2 does not support async combine "
+                "(TransformerLayerWithOverlap) yet."
+            )
+        if use_rr_deepep_combine:
+            raise NotImplementedError(
+                "moe_combine refined recompute is not supported by deepep_v2 yet."
+            )
+        if fp8_dispatch is True:
+            assert combine_grad_handle is not None, (
+                "fp8_dispatch=True, but combine_grad_handle is None."
+            )
+        hidden_states = deepep_v2_combine(
+            hidden_states,
+            self.group,
+            self._states,
+            combine_overlap_handle=combine_overlap_handle,
+            moe_ep_barrier=self.moe_ep_barrier,
+            fp8_dispatch=fp8_dispatch,
+            combine_grad_handle=combine_grad_handle,
+        )
+        # Release the handle and routing state after combine.
+        self._states = None
+        self.num_permuted_tokens = None
+        self.handle = None
+        self.token_indices = None
+        self.token_probs = None
+        self.dispatched_probs = None
+        self.dispatched_indices = None
+        return hidden_states
+
+    def get_permuted_hidden_states_by_experts(
+        self, hidden_states: paddle.Tensor
+    ) -> paddle.Tensor:
+        if self.num_permuted_tokens is None:
+            return super().get_permuted_hidden_states_by_experts(hidden_states)
+        # Expanding layout: dispatch already grouped the rows by expert.
+        return hidden_states
+
+    def get_restored_hidden_states_by_experts(
+        self, hidden_states: paddle.Tensor
+    ) -> paddle.Tensor:
+        if self.num_permuted_tokens is None:
+            return super().get_restored_hidden_states_by_experts(hidden_states)
+        # Expanding layout: nothing to unpermute, only apply the 1-D per-row probs. The
+        # fused-node path never reaches here (the GEMM node applies them instead).
+        if self.dispatched_probs is None:
+            return hidden_states
+        return (hidden_states * self.dispatched_probs.unsqueeze(-1)).cast(
+            hidden_states.dtype
+        )
+
+
 class MoETokenDispatcher:
     """
     MoE Token Dispatcher
@@ -1243,6 +1443,8 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         assert self.ep_size > 1, "Flex token dispatcher requires EP > 1"
         if dispatcher_type == "moonep":
             manager_cls = _MoonEPManager
+        elif dispatcher_type == "deepep_v2":
+            manager_cls = _DeepEPV2Manager
         elif is_hybrid_ep_backend_selected(dispatcher_type):
             manager_cls = _HybridEPManager
         else:
@@ -1261,6 +1463,20 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             manager_kwargs["hybridep_buffer_configs"] = hybridep_buffer_configs
             manager_kwargs["moe_deep_gemm"] = moe_deep_gemm
             manager_kwargs["use_w4a8"] = use_w4a8
+        elif manager_cls is _DeepEPV2Manager:
+            # The V2.5 dispatch/combine wrappers have no w4a8 or sonic group-size
+            # knob, so _DeepEPV2Manager does not accept them; reject the combination
+            # instead of silently dispatching in a format the experts do not expect.
+            if use_w4a8:
+                raise ValueError(
+                    "moe_token_dispatcher_type='deepep_v2' does not support use_w4a8=True."
+                )
+            if sonic_fp8_group_size != 32:
+                raise ValueError(
+                    "moe_token_dispatcher_type='deepep_v2' always quantizes sonic "
+                    f"activations with group_size=32, got {sonic_fp8_group_size}."
+                )
+            manager_kwargs["use_accuracy_compatible"] = use_accuracy_compatible
         elif manager_cls is _DeepEPManager:
             manager_kwargs["use_accuracy_compatible"] = use_accuracy_compatible
             manager_kwargs["use_w4a8"] = use_w4a8
