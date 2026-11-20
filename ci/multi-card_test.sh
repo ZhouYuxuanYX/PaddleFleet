@@ -79,6 +79,20 @@ export FLAGS_tcp_store_using_libuv=0
 # directory (e.g. ``tests.single_card_tests.transformer.hybrid_mla_utils``).
 export PYTHONPATH="$work_dir${PYTHONPATH:+:$PYTHONPATH}"
 
+# Cap every multi-card case at 10 minutes. Without this a single hanging
+# test (e.g. a deadlocked collective) stalls the whole job until the
+# 90-minute job-level timeout and blocks all remaining cases from ever
+# running. ``timeout`` sends SIGTERM at 10m and, if the launcher has not
+# exited 30s later, SIGKILL to reap stray ``paddle.distributed.launch``
+# workers; it returns 124 on timeout, which falls through to the FAILED
+# path so the loop continues with the next test.
+run_case() {
+    timeout --kill-after=30s 10m \
+        coverage run -m paddle.distributed.launch --gpus "$gpus_arg" "$test_file" \
+        | tee "$log_file"
+    return ${PIPESTATUS[0]}
+}
+
 run_count=0
 failed_tests=()
 for test_file in $(find $test_dir -type f -name "test_*.py"); do
@@ -94,24 +108,26 @@ for test_file in $(find $test_dir -type f -name "test_*.py"); do
     echo "Running multi-card test: $test_file with $num_gpus GPUs ($gpus_arg)"
 
     run_count=$((run_count + 1))
-    # Cap every multi-card case at 10 minutes. Without this a single hanging
-    # test (e.g. a deadlocked collective) stalls the whole job until the
-    # 90-minute job-level timeout and blocks all remaining cases from ever
-    # running. ``timeout`` sends SIGTERM at 10m and, if the launcher has not
-    # exited 30s later, SIGKILL to reap stray ``paddle.distributed.launch``
-    # workers; it returns 124 on timeout, which falls through to the FAILED
-    # path so the loop continues with the next test.
-    timeout --kill-after=30s 10m \
-        coverage run -m paddle.distributed.launch --gpus "$gpus_arg" "$test_file" \
-        | tee "./$(basename ${test_file%.*})_multi_card.log"
-    check_exit_code=${PIPESTATUS[0]}
+    log_file="./$(basename ${test_file%.*})_multi_card.log"
+    run_case
+    check_exit_code=$?
+    # The launcher picks the TCPStore port by binding port 0 and releasing
+    # it, so another process can take the port before rank 0 binds it and
+    # ``fleet.init`` fails with "Bind network on IP_ANY:<port> failed" before
+    # any test runs. Retry once on that error only.
+    if [ $check_exit_code -ne 0 ] && grep -q "Bind network on IP_ANY" "$log_file"; then
+        echo "TCPStore port bind failed for $test_file, retrying once..."
+        sleep 5
+        run_case
+        check_exit_code=$?
+    fi
     if [ $check_exit_code -ne 0 ]; then
         if [ $check_exit_code -eq 124 ]; then
             echo "Test TIMEOUT: $test_file exceeded the 10m per-case limit and was killed."
             failed_tests+=("$test_file")
         else
             echo "Test FAILED: $test_file, see log for details..."
-            python $work_dir/ci/check_log_for_exitcode.py "./$(basename ${test_file%.*})_multi_card.log" "OK"
+            python $work_dir/ci/check_log_for_exitcode.py "$log_file" "OK"
             exit_code=$?
             if [ $exit_code -ne 0 ]; then
                 failed_tests+=("$test_file")
