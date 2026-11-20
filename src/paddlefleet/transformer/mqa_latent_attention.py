@@ -40,11 +40,12 @@ The indexer reuses the model-wide ``index_n_heads`` / ``index_head_dim``.
 
 The two full-causal phases attend over the whole per-document causal span, which
 is exactly what the caller's ``attn_mask_startend_row_indices`` already says, so
-they run as dense FA4 flashmask (``_dense_attn``), context parallel included.
-FA4 is their only backend: ``_assert_dense_fa4`` refuses to start rather than
-substitute one that would need an ``O(s^2)`` column table (see
-``_dense_attn`` for what that costs). Only phase 3 genuinely selects columns,
-and only it builds a table.
+they run as dense cutedsl flashmask (``_dense_attn``), context parallel
+included. The cutedsl kernels (FA3 on SM90, FA4 on SM100) are their only
+backend: ``_assert_dense_cutedsl`` refuses to start rather than substitute
+one that would need an ``O(s^2)`` column table (see ``_dense_attn`` for what
+that costs). Only phase 3 genuinely selects columns, and only it builds a
+table.
 
 Note the ``mqa_*`` modes here are *latent* MQA (this module). A
 ``csa_compress_ratios`` entry of ``-1`` is *CSA full-causal MQA*, a different
@@ -654,9 +655,9 @@ class MQADocMeta:
         Everything this class holds is ``O(seqlen)`` or ``O(seqlen *
         window_size)``, so warming all of it is cheap. The one ``O(seqlen^2)``
         table latent MQA used to need -- the per-document causal column ids -- is
-        gone: both non-sparse phases now run as dense FA4 flashmask off
-        ``attn_mask_startend_row_indices`` (``_dense_attn``) and build no table at
-        all.
+        gone: both non-sparse phases now run as dense cutedsl flashmask off
+        ``attn_mask_startend_row_indices`` (``_dense_attn``) and build no table
+        at all.
         """
         self._global_window_topk_idxs(window_size)
         self._global_valid_range(window_size)
@@ -1190,7 +1191,7 @@ class MQALatentAttention(FleetLayer):
         # or inference; in every one of those cases everything below runs the
         # pre-existing code untouched.
         #
-        # ``row_end`` itself stays outside: the dense-FA4 phases pass it to the
+        # ``row_end`` itself stays outside: the dense-cutedsl phases pass it to the
         # kernel as the mask, so it is needed either way, and normalising it is
         # ``O(1)`` -- the part worth sharing is ``_derive_csa_doc_boundaries``.
         meta = None
@@ -1280,13 +1281,14 @@ class MQALatentAttention(FleetLayer):
         the attention half of the phase-2 warmup, which must not consume the
         indexer's ranking while the indexer is still being learned.
 
-        One backend: dense FA4 flashmask (``_dense_attn``). "The whole causal
-        span" is already what ``attn_mask_startend_row_indices`` says, so the
-        mask stays ``O(s)``; ``_assert_dense_fa4`` rejects an environment where
-        FA4 would not serve it.
+        One backend: dense cutedsl flashmask (``_dense_attn``) -- FA3 on SM90,
+        FA4 on SM100. "The whole causal span" is already what
+        ``attn_mask_startend_row_indices`` says, so the mask stays ``O(s)``;
+        ``_assert_dense_cutedsl`` rejects an environment where the cutedsl
+        kernels would not serve it.
         """
         q_dim = int(query.shape[-1])
-        self._assert_dense_fa4(q_dim, kv_lora_rank, row_end)
+        self._assert_dense_cutedsl(q_dim, kv_lora_rank, row_end)
         core_out = self._dense_attn(query, kv, row_end, kv_lora_rank)
         return self._deabsorb(core_out, v_b_proj_weight, self.split_kv_b)
 
@@ -1673,7 +1675,7 @@ class MQALatentAttention(FleetLayer):
         flashmask facade flattens its LSE to ``[b, s]``
         (``flash_mask_facade.py:205``), which cannot hold a per-head one. And the
         candidate set is narrower than the attention's anyway -- no forced window,
-        no sink -- so even a per-head FA4 LSE would be the wrong normaliser
+        no sink -- so even a per-head cutedsl LSE would be the wrong normaliser
         (measured gap 4.4e-3 at the production sink init; see
         :meth:`_attn_target`).
 
@@ -1927,39 +1929,40 @@ class MQALatentAttention(FleetLayer):
         )
 
     @staticmethod
-    def _assert_dense_fa4(q_dim: int, v_dim: int, row_end: Tensor) -> None:
-        """Refuse to run the full-causal phases on anything but FA4.
+    def _assert_dense_cutedsl(q_dim: int, v_dim: int, row_end: Tensor) -> None:
+        """Refuse to run the full-causal phases on a non-cutedsl backend.
 
         Applies to both phases that attend over the whole per-document causal
-        span -- ``mqa_full_causal`` and the attention half of the warmup. FA4 is
-        the only backend they support: query/key are
-        ``kv_lora_rank + qk_rope_head_dim`` wide while the value is only
-        ``kv_lora_rank``, a pair FA2/FA3 serve by padding the value out to the
-        query width, and the alternative of expanding the document mask into a
+        span -- ``mqa_full_causal`` and the attention half of the warmup. The
+        cutedsl (cute) flashmask kernels are their only backend -- FA3 on SM90
+        and FA4 on SM100, which serve the same head-dim pairs, (576, 512)
+        included. The alternative of expanding the document mask into a
         ``[b, s, s]`` column table for the sparse kernel costs ``O(s^2)`` memory
         (100 GiB at s=65536 on the production geometry -- see ``_dense_attn``)
-        and is not addressable in int32 past s=46336. Neither is worth having as
-        a silent substitution, so fail here instead.
+        and is not addressable in int32 past s=46336. That is not worth having
+        as a silent substitution, so fail here instead.
 
         ``get_fa_version`` answers from the head-dim whitelist *and* two
         process-global flags, so all three inputs go into the message -- the
         head-dim pair alone rarely explains the answer. In particular
-        ``FLAGS_flash_attn_version`` must be 4, which production sets from the
-        compute capability (``TrainingArguments.__post_init__``, SM100 -> 4).
-        ``FLAGS_cudnn_deterministic`` is *not* a rejection condition: FA4's
-        big-head-dim backward gained an ordered (semaphore-serialised) reduction
-        in flash-attention ``5007a05``, so this pair stays on FA4 under
-        determinism. Its value is still reported, because it is one of the two
-        flags the answer is derived from.
+        ``FLAGS_flash_attn_version`` must be the value production derives from
+        the compute capability (``TrainingArguments.__post_init__``: SM100 -> 4,
+        SM90 -> 3), not 2.
+        ``FLAGS_cudnn_deterministic`` is *not* a rejection condition: the cutedsl
+        backward has an ordered (semaphore-serialised) reduction -- FA4's
+        big-head-dim backward gained it in flash-attention ``5007a05`` -- so
+        this pair stays on the cutedsl kernels under determinism. Its value is
+        still reported, because it is one of the two flags the answer is
+        derived from.
 
-        ``get_fa_version`` answers from flags alone and never checks that an FA4
-        backend exists, so the extension's availability is a separate condition
-        here. Without it the facade binds ``_flashmask_attention`` to Paddle's
-        native implementation (``flash_mask_facade.py``, the ``else`` branch of
-        the ``is_flash_mask_available()`` import guard), which serves neither
-        this head-dim pair nor the sink, and the failure would surface from
-        inside the kernel call as ``Invalid flash attention version: 4`` -- true
-        but not actionable.
+        ``get_fa_version`` answers from flags alone and never checks that a
+        cutedsl backend exists, so the extension's availability is a separate
+        condition here. Without it the facade binds ``_flashmask_attention`` to
+        Paddle's native implementation (``flash_mask_facade.py``, the ``else``
+        branch of the ``is_flash_mask_available()`` import guard), which serves
+        neither this head-dim pair nor the sink, and the failure would surface
+        from inside the kernel call as ``Invalid flash attention version: 3``
+        (or 4) -- true but not actionable.
 
         Checked every forward rather than in ``__init__``: the flags are
         settable at any point and the check is a whitelist lookup.
@@ -1969,28 +1972,32 @@ class MQALatentAttention(FleetLayer):
 
         fa_version = get_fa_version(q_dim, v_dim, row_end)
         flash_mask_ok = is_flash_mask_available()
-        if fa_version != 4 or not flash_mask_ok:
+        # FA3 (SM90) and FA4 (SM100) both run the cute (cutedsl) flashmask kernel.
+        if fa_version not in (3, 4) or not flash_mask_ok:
             flags = paddle.get_flags(
                 ["FLAGS_flash_attn_version", "FLAGS_cudnn_deterministic"]
             )
             raise RuntimeError(
-                "latent MQA full-causal attention requires FA4 dense "
-                f"flashmask, but head dims ({q_dim}, {v_dim}) resolve to "
-                f"FA{fa_version} and flash_mask_available="
-                f"{flash_mask_ok}. FLAGS_flash_attn_version="
+                "latent MQA full-causal attention requires the cutedsl dense "
+                f"flashmask (FA3 on SM90, FA4 on SM100), but head dims "
+                f"({q_dim}, {v_dim}) resolve to FA{fa_version} and "
+                f"flash_mask_available={flash_mask_ok}. "
+                "FLAGS_flash_attn_version="
                 f"{flags['FLAGS_flash_attn_version']}, "
                 "FLAGS_cudnn_deterministic="
                 f"{flags['FLAGS_cudnn_deterministic']}. Run on a device whose "
-                "compute capability selects FA4 (SM100+, which is also what the "
-                "sparse phase-3 kernels require) with the flashmask (cute) "
-                "extension built into paddlefleet_ops, and leave "
-                "FLAGS_flash_attn_version at the value the trainer derives."
+                "compute capability selects FA3 or FA4 (SM90 or SM100; SM100 "
+                "is also what the sparse phase-3 kernels require) with the "
+                "flashmask (cute) extension built into paddlefleet_ops, and "
+                "leave FLAGS_flash_attn_version at the value the trainer "
+                "derives."
             )
 
     def _dense_attn(
         self, query: Tensor, kv: Tensor, row_end: Tensor, kv_lora_rank: int
     ) -> Tensor:
-        """Per-document dense causal MQA on the absorbed latent, via FA4.
+        """Per-document dense causal MQA on the absorbed latent, via cutedsl
+        (FA3 on SM90, FA4 on SM100).
 
         Mathematically the same softmax over the same column set the phase-3
         sparse kernel would compute from an explicit ``[b, s, s]`` table, but the

@@ -93,15 +93,15 @@ from .hybrid_mla_utils import (
     _build_module,
     _check_index_invariants,
     _create_mqa_config,
+    _cutedsl_module_hooks,
     _doc_meta,
-    _fa4_module_hooks,
     _full_causal_indices,
     _make_inputs,
     _pad_row_end,
     _row_end,
 )
 
-setUpModule, tearDownModule = _fa4_module_hooks()
+setUpModule, tearDownModule = _cutedsl_module_hooks()
 
 _EPS = 1e-10  # mqa_latent_attention._EPS, the KL/renormalisation epsilon
 

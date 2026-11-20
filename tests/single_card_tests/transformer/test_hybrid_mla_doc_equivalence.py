@@ -68,14 +68,14 @@ from .hybrid_mla_utils import (
     _build_module,
     _check_index_invariants,
     _create_mqa_config,
+    _cutedsl_module_hooks,
     _dense_reference,
     _doc_meta,
-    _fa4_module_hooks,
     _make_inputs,
     _row_end,
 )
 
-setUpModule, tearDownModule = _fa4_module_hooks()
+setUpModule, tearDownModule = _cutedsl_module_hooks()
 
 
 def _doc_segments(layout, seqlen):

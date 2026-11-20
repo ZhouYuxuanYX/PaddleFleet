@@ -74,13 +74,13 @@ from .hybrid_mla_utils import (
     _GPU,
     _build_module,
     _create_mqa_config,
-    _fa4_module_hooks,
+    _cutedsl_module_hooks,
     _make_inputs,
     _pad_row_end,
     _row_end,
 )
 
-setUpModule, tearDownModule = _fa4_module_hooks()
+setUpModule, tearDownModule = _cutedsl_module_hooks()
 
 _EPS = 1e-10  # mqa_latent_attention._EPS
 

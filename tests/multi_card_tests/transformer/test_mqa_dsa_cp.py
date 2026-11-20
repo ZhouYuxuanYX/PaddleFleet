@@ -44,7 +44,8 @@ the full-MLA integration):
 7. The ``cp_balance_mode`` guard.
 
 Backend note: the full-causal phases (``mqa_full_causal`` and the phase-2 warmup)
-have dense FA4 as their only backend -- ``_assert_dense_fa4`` raises when the
+have dense cutedsl (FA3 on SM90, FA4 on SM100) as their only backend --
+``_assert_dense_cutedsl`` raises when the
 process flags do not resolve to it -- and a bare launcher process leaves
 ``FLAGS_flash_attn_version`` at the image default 2. ``setUpModule`` therefore
 pins 4, the value ``TrainingArguments.__post_init__`` derives on the SM100 boxes
@@ -99,14 +100,14 @@ S_GLOBAL = 512
 # pinned to the value production derives on these boxes -- and left alone where
 # no FA4 backend exists, or the non-``_GPU``-gated cases would break. Module
 # scope: nothing here asserts on the refusal.
-_FA4_PIN = U._fa4_pin()
+_CUTEDSL_PIN = U._cutedsl_pin()
 
 
 def setUpModule():
     global CP_SIZE, CP_RANK, CP_GROUP
     if dist.get_world_size() < 2:
         raise unittest.SkipTest("MQA context-parallel tests require >= 2 GPUs")
-    _FA4_PIN.__enter__()
+    _CUTEDSL_PIN.__enter__()
     world = dist.get_world_size()
     strategy = fleet.DistributedStrategy()
     strategy.hybrid_configs = {
@@ -136,7 +137,7 @@ def setUpModule():
 
 
 def tearDownModule():
-    _FA4_PIN.__exit__(None, None, None)
+    _CUTEDSL_PIN.__exit__(None, None, None)
 
 
 def _build(

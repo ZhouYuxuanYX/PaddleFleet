@@ -775,60 +775,64 @@ def _flash_attn_version(value):
         paddle.set_flags({key: previous})
 
 
-def _fa4_can_serve():
-    """Whether pinning ``FLAGS_flash_attn_version=4`` can actually be served.
+def _cutedsl_can_serve():
+    """Whether the cutedsl kernels can serve the production flag value.
 
     ``get_fa_version`` degrades to FA2 on its own when the cutedsl kernels are
-    missing, so a pinned 4 quietly becomes 2 instead of reaching a backend that
-    cannot serve it. This probe exists so callers can tell the difference: the
-    ``mha`` cases are not ``_GPU``-gated and run on cc 9.0 CI images without the
+    missing, so a pinned 3 or 4 quietly becomes 2 instead of reaching a backend
+    that cannot serve it. This probe exists so callers can tell the difference:
+    the ``mha`` cases are not ``_GPU``-gated and run on CI images without the
     kernel, where they must keep taking the image default rather than asserting
-    FA4 behaviour.
+    cutedsl behaviour.
     """
     try:
         from paddlefleet_ops import is_flash_mask_available
     except ImportError:  # pragma: no cover - packaged build always has it
         return False
-    return bool(is_flash_mask_available()) and _production_fa_version() == 4
+    return bool(is_flash_mask_available()) and _production_fa_version() in (
+        3,
+        4,
+    )
 
 
 @contextlib.contextmanager
-def _fa4_pin():
-    """FA4's *whole* flag pair where FA4 can serve, a no-op where it cannot.
+def _cutedsl_pin():
+    """The production FA flag pair where cutedsl can serve it, else a no-op.
 
     The full-causal phases have exactly one backend, and
-    ``MQALatentAttention._assert_dense_fa4`` raises when the process flags do not
-    resolve to FA4, so a module running such a forward has to reproduce the
-    production flag value. Those cases are all ``_GPU``-gated to the SM100 boxes,
-    where ``_fa4_can_serve()`` is True -- and the same modules also hold ``mha``
-    cases that do run without FA4, which is why the pin has to stand down rather
-    than force a value the box cannot honour.
+    ``MQALatentAttention._assert_dense_cutedsl`` raises when the process flags
+    do not resolve to the cutedsl kernels, so a module running such a forward
+    has to reproduce the production flag value -- 4 on SM100, 3 on SM90 since
+    the SM90 large-head-dim kernels landed. Those cases are all ``_GPU``-gated
+    to boxes where ``_cutedsl_can_serve()`` is True -- and the same modules also
+    hold ``mha`` cases that do run without cutedsl, which is why the pin has to
+    stand down rather than force a value the box cannot honour.
 
     ``FLAGS_cudnn_deterministic`` is part of the pin, not a separate concern:
-    ``_dispatch_fa_version`` (``flash_mask_facade.py``) whitelists the
-    ``(576, 512)`` head-dim pair for FA4 only ``and not deterministic``, because
-    FA4's big-head-dim backward has no ordered-accumulation variant. Both CI
-    entrypoints export ``FLAGS_cudnn_deterministic=1``
-    (``ci/multi-card_test.sh``, ``ci/single_card_test.sh``), so pinning the
-    version alone still degrades to FA2 and trips ``_assert_dense_fa4``. The
-    non-deterministic FA4 backward is what production runs, and the gradient
-    comparisons here use bf16-scale relative tolerances that have room for the
-    atomics accumulation order.
+    ``_dispatch_fa_version`` (``flash_mask_facade.py``) serves the
+    ``(576, 512)`` head-dim pair on both cutedsl versions, deterministic or
+    not: FA4's big-head-dim backward gained an ordered (semaphore-serialised)
+    reduction in flash-attention ``5007a05``, and the SM90 split-N backward is
+    ordered by construction. Both CI entrypoints still export
+    ``FLAGS_cudnn_deterministic=1`` (``ci/multi-card_test.sh``,
+    ``ci/single_card_test.sh``), so the pin clears it for the backward, which
+    is what production runs; the gradient comparisons here use bf16-scale
+    relative tolerances that have room for the atomics accumulation order.
     """
-    if not _fa4_can_serve():
+    if not _cutedsl_can_serve():
         yield
         return
-    with _flash_attn_version(4), _cudnn_deterministic(0):
+    with _flash_attn_version(_production_fa_version()), _cudnn_deterministic(0):
         yield
 
 
-def _fa4_module_hooks():
-    """``(setUpModule, tearDownModule)`` wrapping the module in ``_fa4_pin()``.
+def _cutedsl_module_hooks():
+    """``(setUpModule, tearDownModule)`` wrapping the module in ``_cutedsl_pin()``.
 
     Doing it once per module beats repeating the pin at every call site, and the
     restore keeps it from leaking into modules that assert on the refusal.
     """
-    pin = _fa4_pin()
+    pin = _cutedsl_pin()
 
     def setUpModule():
         pin.__enter__()

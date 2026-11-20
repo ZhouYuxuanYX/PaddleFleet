@@ -19,31 +19,27 @@ import paddle
 from . import is_flash_mask_available
 
 
-def _cutedsl_hdim_ok(fa_version: int, head_dim: int, head_dim_v: int) -> bool:
+def _cutedsl_hdim_ok(head_dim: int, head_dim_v: int) -> bool:
     """Whether the cutedsl kernels serve ``(head_dim, head_dim_v)``.
 
-    ``deterministic`` is not a parameter: no pair in this whitelist is
+    FA3 (SM90) and FA4 (SM100) serve the same pairs, so ``fa_version`` is not a
+    parameter. Neither is ``deterministic``: no pair in this whitelist is
     deterministic-only. FA3 on cutedsl has an ordered-accumulation backward, and
     FA4's big-head-dim backward gained an ordered (semaphore-serialised)
     reduction in flash-attention ``5007a05``.
 
     Args:
-        fa_version: 3 or 4. Only FA4 serves the big head dims.
         head_dim: Query/Key head dim.
         head_dim_v: Value head dim, already defaulted by the caller.
 
     Returns:
         ``True`` when the pair is served; ``False`` means degrade to FA2.
     """
-    if (
+    return (
         (head_dim <= 128 and head_dim_v <= 128)
         or (head_dim == 192 and head_dim_v == 128)
         or (head_dim == 256 and head_dim_v == 256)
-    ):
-        return True
-    # FA4 additionally supports larger head dims, via its big-head-dim backward.
-    return fa_version == 4 and (
-        (head_dim == 512 and head_dim_v == 512)
+        or (head_dim == 512 and head_dim_v == 512)
         or (head_dim == 576 and head_dim_v == 512)
     )
 
@@ -88,7 +84,7 @@ def _dispatch_fa_version(
         if not is_flash_mask_available():
             return 2
         _head_dim_v = head_dim_v if head_dim_v is not None else head_dim
-        if not _cutedsl_hdim_ok(fa_version, head_dim, _head_dim_v):
+        if not _cutedsl_hdim_ok(head_dim, _head_dim_v):
             return 2
 
     return fa_version
@@ -149,14 +145,11 @@ def needs_value_padding(
     Returns:
         ``True`` when ``value`` needs padding.
     """
-    fa3_native_pair = (fa_version == 3) and (
-        head_dim == 192 and head_dim_v == 128
-    )
-    fa4_native_pair = (fa_version == 4) and (
+    native_pair = (fa_version in (3, 4)) and (
         (head_dim == 192 and head_dim_v == 128)
         or (head_dim == 576 and head_dim_v == 512)
     )
-    return head_dim != head_dim_v and not (fa3_native_pair or fa4_native_pair)
+    return head_dim != head_dim_v and not native_pair
 
 
 def flashmask_attention(

@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The full-causal phases run as dense FA4, and refuse to run as anything else.
+"""The full-causal phases run on the cutedsl dense flashmask (FA4 on SM100, FA3
+on SM90), and refuse to run as anything else.
 
 Phase 1 (``hybrid_mla_attention="mqa_full_causal"``) and phase 2
 (``"mqa_dsa"`` + ``dsa_indexer_use_sparse_loss=False``) both attend over the
@@ -23,15 +24,17 @@ for no benefit: measured net allocation for the table alone is 1.6 GiB at s=8192
 dense forward *and* backward), and past s=46336 the sparse kernel's own
 ``(b*s-1)*topk_padded`` index arithmetic overflows int32 -- which does *not*
 reliably crash: s=46337 returns finite but wrong numbers for its last 55 rows.
-So ``MQALatentAttention._dense_attn`` hands the same softmax to FA4's dense
-flashmask instead, keeping the document structure in the caller's own
-``startend_row_indices`` -- and ``_assert_dense_fa4`` raises rather than
-substituting the table when FA4 is not what the environment resolves to.
+So ``MQALatentAttention._dense_attn`` hands the same softmax to the cutedsl
+dense flashmask instead, keeping the document structure in the caller's own
+``startend_row_indices`` -- and ``_assert_dense_cutedsl`` raises rather than
+substituting the table when the cutedsl kernels are not what the environment
+resolves to.
 
 What is pinned here:
 
 * ``TestBackendSelection`` -- the dense path is taken whenever it can be, and
-  every way of not resolving to FA4 raises instead of degrading. Phase 1 shares
+  every way of not resolving to the cutedsl kernels raises instead of
+  degrading. Phase 1 shares
   ``_forward_full_causal`` with the warmup's attention half, so both are covered
   by one selection point; phase 3, which genuinely selects 640 columns, keeps
   ``_sparse_attn`` and is *not* subject to the assertion.
@@ -47,7 +50,8 @@ What is pinned here:
   ``hybrid_mla_utils._full_causal_indices``.
 * ``TestDenseWarmupPadRows`` -- a pad row is a query row with *every* column
   masked, which is a softmax-over-nothing hazard the sparse path avoids
-  structurally (all ``-1`` columns). FA4 returns exact zeros there instead of
+  structurally (all ``-1`` columns). The cutedsl kernels return exact zeros
+  there instead of
   NaN; that is a kernel property, so it needs a regression test.
 * ``TestFrozenInputs`` -- ``train_indexer_only`` freezes the backbone and can
   freeze ``softmax_offset``, and a ``PyLayer`` whose input has
@@ -57,11 +61,13 @@ What is pinned here:
   forward-neutral.
 
 ``FLAGS_flash_attn_version`` is process-global and a bare pytest process never
-constructs ``TrainingArguments``, so it keeps the image default 2. Production on
-this SM100 box gets 4 from ``training_args.py:1764-1780``. Every case that runs a
-full-causal forward therefore has to pin it with
-``hybrid_mla_utils._flash_attn_version(4)`` -- without that the forward now
-raises rather than quietly taking a second backend.
+constructs ``TrainingArguments``, so it keeps the image default 2. Production
+derives the flag from the compute capability at ``training_args.py:1764-1780``:
+4 on SM100, 3 on SM90 (which serves the same dense flashmask pairs since the
+SM90 large-head-dim kernels landed). Every case that runs a full-causal
+forward therefore has to pin it with ``hybrid_mla_utils._flash_attn_version``
+-- without that the forward raises rather than quietly taking a second
+backend.
 
 Run:
     R=<erniebot checkout>
@@ -80,7 +86,6 @@ import paddle
 from paddlefleet.transformer.csa_attention import _derive_csa_doc_boundaries
 
 from .hybrid_mla_utils import (
-    _GPU,
     DV,
     H,
     MQALatentAttention,
@@ -88,6 +93,7 @@ from .hybrid_mla_utils import (
     _create_mqa_config,
     _cudnn_deterministic,
     _dense_reference,
+    _dsa_kernels_available,
     _flash_attn_version,
     _full_causal_indices,
     _make_inputs,
@@ -114,7 +120,7 @@ _LAYOUTS = [
 _PAD_LAYOUT = ([100, 50, 60], 256)
 
 
-def _fa4_is_the_production_kernel():
+def _cutedsl_is_the_production_backend():
     """``_production_fa_version()`` needs a CUDA device to answer.
 
     Evaluated at import time by the ``skipUnless`` below, so it must not raise on
@@ -122,16 +128,19 @@ def _fa4_is_the_production_kernel():
     skipping (and upstream CI only accepts pytest exit 0).
     """
     try:
-        return _production_fa_version() == 4
+        return _production_fa_version() in (3, 4)
     except Exception:
         return False
 
 
-_FA4 = unittest.skipUnless(
-    _fa4_is_the_production_kernel(),
-    "the dense warmup path needs the FA4 (cute) kernel, which production selects "
-    "from the compute capability -- the cutedsl kernels are available from SM90 "
-    "on, but only SM100 derives FLAGS_flash_attn_version=4",
+# The dense warmup path runs on the cutedsl flashmask kernels: FA4 on SM100,
+# FA3 on SM90 (same head-dim pairs since the SM90 large-head-dim kernels
+# landed). Production selects the version from the compute capability, so the
+# gate is "this box derives a cutedsl version", not "this box derives 4".
+_CUTEDSL = unittest.skipUnless(
+    _cutedsl_is_the_production_backend(),
+    "the dense warmup path needs the cutedsl (cute) flashmask kernel, which "
+    "production selects from the compute capability (FA4 on SM100, FA3 on SM90)",
 )
 
 
@@ -222,14 +231,14 @@ def _sparse_full_causal(module, tensors, row_end, w_v):
     return module._deabsorb(core_out, w_v, module.split_kv_b)
 
 
-@_GPU
-@_FA4
+@_CUTEDSL
 class TestBackendSelection(unittest.TestCase):
-    """Dense whenever FA4 serves it, a hard error whenever it does not.
+    """Dense whenever the cutedsl kernels serve it, a hard error otherwise.
 
-    The full-causal phases have one backend. Not resolving to FA4 used to mean
-    falling back to an ``O(s^2)`` column table; it now means refusing to start,
-    so each way of not resolving to FA4 has to be pinned as a raise -- otherwise
+    The full-causal phases have one backend. Not resolving to the cutedsl
+    kernels used to mean falling back to an ``O(s^2)`` column table; it now
+    means refusing to start, so each way of not resolving to them has to be
+    pinned as a raise -- otherwise
     a silent change of backend could reappear and only show up as a memory
     figure.
     """
@@ -249,7 +258,9 @@ class TestBackendSelection(unittest.TestCase):
         with (
             _flash_attn_version(fa_version),
             _backend_spy(module) as calls,
-            self.assertRaisesRegex(RuntimeError, "requires FA4"),
+            self.assertRaisesRegex(
+                RuntimeError, "requires the cutedsl dense flashmask"
+            ),
         ):
             _forward(module, tensors, row_end, w_v)
         self.assertEqual(calls, [])
@@ -258,8 +269,19 @@ class TestBackendSelection(unittest.TestCase):
         module = _module()
         self.assertEqual(self._calls(module, 4), ["dense"])
 
+    def test_fa3_takes_the_dense_path(self):
+        """SM90's FA3 serves the same dense pairs -- and must be accepted.
+
+        ``_assert_dense_cutedsl`` used to demand FA4, so on SM90 the trainer's
+        own flag value (3) was rejected and the forward raised before reaching
+        a backend at all. Pinning 3 asserts the acceptance directly, on any
+        box with the flashmask extension.
+        """
+        module = _module()
+        self.assertEqual(self._calls(module, 3), ["dense"])
+
     def test_fa2_raises(self):
-        """No FA4, no full-causal attention -- and no s^2 table either."""
+        """No cutedsl, no full-causal attention -- and no s^2 table either."""
         self._assert_forward_refuses(_module(), fa_version=2)
 
     def test_the_message_names_all_three_inputs(self):
@@ -294,42 +316,49 @@ class TestBackendSelection(unittest.TestCase):
         """
         module = _module()
         row_end = _row_end([256], 256)
-        with _flash_attn_version(4):
+        with _flash_attn_version(_production_fa_version()):
             module.cp_size, module.cp_rank = 2, 1
-            self.assertIsNone(module._assert_dense_fa4(576, 512, row_end))
+            self.assertIsNone(module._assert_dense_cutedsl(576, 512, row_end))
 
     def test_unsupported_head_dims_raise(self):
         """The head-dim pair comes from the layer, not from a constant."""
         module = _module()
         row_end = _row_end([256], 256)
         with (
-            _flash_attn_version(4),
+            _flash_attn_version(_production_fa_version()),
             self.assertRaisesRegex(RuntimeError, r"\(576, 511\)"),
         ):
-            module._assert_dense_fa4(576, 511, row_end)
+            module._assert_dense_cutedsl(576, 511, row_end)
 
     def test_deterministic_is_not_a_rejection_condition(self):
-        """``FLAGS_cudnn_deterministic`` keeps (576, 512) on FA4.
+        """``FLAGS_cudnn_deterministic`` keeps (576, 512) on cutedsl.
 
         It used to degrade the pair: FA4 serves it with the big-head-dim
         backward, which accumulated dQ / dK / dV with unordered
         ``red.global.add`` and asserted ``not deterministic``. flash-attention
         ``5007a05`` pins that order with a global semaphore, so the pair stays
-        FA4 and the layer has nothing left to refuse. Pinned because the flag is
+        on the cutedsl kernels and the layer has nothing left to refuse. Pinned
+        because the flag is
         still one of the two inputs ``get_fa_version`` reads, and a re-tightening
         on either side would otherwise surface as a mid-backward failure.
         """
         module = _module()
         row_end = _row_end([256], 256)
-        with _flash_attn_version(4), _cudnn_deterministic(1):
-            self.assertIsNone(module._assert_dense_fa4(576, 512, row_end))
-        with _flash_attn_version(4), _cudnn_deterministic(0):
-            self.assertIsNone(module._assert_dense_fa4(576, 512, row_end))
+        with (
+            _flash_attn_version(_production_fa_version()),
+            _cudnn_deterministic(1),
+        ):
+            self.assertIsNone(module._assert_dense_cutedsl(576, 512, row_end))
+        with (
+            _flash_attn_version(_production_fa_version()),
+            _cudnn_deterministic(0),
+        ):
+            self.assertIsNone(module._assert_dense_cutedsl(576, 512, row_end))
 
     def test_deterministic_forward_still_takes_the_dense_path(self):
         """The whole forward, not just the assertion, survives determinism.
 
-        ``_assert_dense_fa4`` is only one of two places the flag could bite; the
+        ``_assert_dense_cutedsl`` is only one of two places the flag could bite; the
         forward also has to reach ``_dense_attn`` rather than a substituted
         backend, so the spy is what decides this rather than the absence of a
         raise.
@@ -339,7 +368,7 @@ class TestBackendSelection(unittest.TestCase):
         row_end = _row_end([seqlen], seqlen)
         tensors, w_v = _inputs(seqlen)
         with (
-            _flash_attn_version(4),
+            _flash_attn_version(_production_fa_version()),
             _cudnn_deterministic(1),
             _backend_spy(module) as calls,
         ):
@@ -347,14 +376,15 @@ class TestBackendSelection(unittest.TestCase):
         self.assertEqual(calls, ["dense"])
 
     def test_missing_flash_mask_extension_raises(self):
-        """FA4 as a flag value is not FA4 as a backend.
+        """A cutedsl flag value is not a cutedsl backend.
 
         Without the flashmask (cute) extension ``get_fa_version`` degrades to
-        FA2, so the pinned flag value of 4 never reaches a kernel that cannot
-        serve it. The check here is that the layer says so in its own terms --
-        naming the head-dim pair, the flags and ``flash_mask_available`` --
-        instead of letting a bare ``Invalid flash attention version: 4`` surface
-        from a frame that mentions nothing about this layer.
+        FA2, so the pinned cutedsl flag value never reaches a kernel that
+        cannot serve it. The check here is that the layer says so in its own
+        terms -- naming the head-dim pair, the flags and
+        ``flash_mask_available`` -- instead of letting a bare ``Invalid flash
+        attention version: 3`` (or 4) surface from a frame that mentions
+        nothing about this layer.
         """
         import paddlefleet_ops
 
@@ -364,19 +394,19 @@ class TestBackendSelection(unittest.TestCase):
         paddlefleet_ops.is_flash_mask_available = lambda: False
         try:
             with (
-                _flash_attn_version(4),
+                _flash_attn_version(_production_fa_version()),
                 self.assertRaises(RuntimeError) as caught,
             ):
-                module._assert_dense_fa4(576, 512, row_end)
+                module._assert_dense_cutedsl(576, 512, row_end)
         finally:
             paddlefleet_ops.is_flash_mask_available = original
         message = str(caught.exception)
-        self.assertIn("requires FA4", message)
+        self.assertIn("requires the cutedsl dense flashmask", message)
         self.assertIn("flash_mask_available=False", message)
         # Same call passes again with the extension back, so nothing but the
         # availability answer decided it.
-        with _flash_attn_version(4):
-            self.assertIsNone(module._assert_dense_fa4(576, 512, row_end))
+        with _flash_attn_version(_production_fa_version()):
+            self.assertIsNone(module._assert_dense_cutedsl(576, 512, row_end))
 
     def test_full_causal_phase_also_takes_the_dense_path(self):
         """Phase 1 attends over the same whole causal span, so same backend.
@@ -387,6 +417,7 @@ class TestBackendSelection(unittest.TestCase):
         """
         module = _module(mode="mqa")
         self.assertEqual(self._calls(module, 4), ["dense"])
+        self.assertEqual(self._calls(module, 3), ["dense"])
 
     def test_full_causal_phase_raises_on_fa2(self):
         self._assert_forward_refuses(_module(mode="mqa"), fa_version=2)
@@ -397,7 +428,7 @@ class TestBackendSelection(unittest.TestCase):
         self.assertEqual(self._calls(module, 4), ["sparse"])
 
     def test_the_assertion_is_scoped_to_the_full_causal_phases(self):
-        """Phase 3 does not go through FA4 at all, so it must not be gated.
+        """Phase 3 does not go through cutedsl at all, so it must not be gated.
 
         Its forward is the FlashMLA sparse kernel, whose availability has nothing
         to do with ``FLAGS_flash_attn_version``. Pinning this keeps the new hard
@@ -410,7 +441,7 @@ class TestBackendSelection(unittest.TestCase):
 class TestCpRowBounds(unittest.TestCase):
     """``_cp_row_bounds`` must reproduce the global mask on every rank.
 
-    Under CP the dense path cannot use the kernel's own ``causal=True``: FA4
+    Under CP the dense path cannot use the kernel's own ``causal=True``: it
     bottom-right-aligns the diagonal at ``seqlen_k - seqlen_q``, which is this
     rank's offset only on the last rank, and ``row_end``'s values are global row
     ids compared against local rows. So the diagonal becomes an explicit second
@@ -536,8 +567,7 @@ def _loss_weight(seqlen, seed=7):
     return paddle.randn([1, seqlen, H * 64], dtype="float32")
 
 
-@_GPU
-@_FA4
+@_CUTEDSL
 class TestDenseWarmupPrecision(unittest.TestCase):
     """Dense must be at least as close to fp32 as the sparse path it replaces.
 
@@ -574,7 +604,13 @@ class TestDenseWarmupPrecision(unittest.TestCase):
     _SLACK = 1.5
 
     def _measure(self, row_end, seqlen, sink):
-        """``(expected, got)``: fp32 autograd reference vs both backends."""
+        """``(expected, got)``: fp32 autograd reference vs both backends.
+
+        The sparse yardstick needs the SM100-only sparse kernel, so on a box
+        without it the loop only fills ``got["dense"]``: the fp32 reference
+        against the absolute floors is a weaker but still real numerical check,
+        and it is what lets this suite exercise FA3 on SM90 at all.
+        """
         module = _module(sink=sink)
         weight = _loss_weight(seqlen)
 
@@ -587,11 +623,18 @@ class TestDenseWarmupPrecision(unittest.TestCase):
 
         got = {}
         for tag in ("dense", "sparse"):
+            if tag == "sparse" and not _dsa_kernels_available():
+                # No sparse kernel on this box (SM90): the floors still bound
+                # the dense error, so skip the yardstick rather than the case.
+                continue
             module.clear_gradients()
             tensors, w_v = _inputs(seqlen)
             if tag == "dense":
                 # The production path, through the module's own forward.
-                with _flash_attn_version(4), _backend_spy(module) as calls:
+                with (
+                    _flash_attn_version(_production_fa_version()),
+                    _backend_spy(module) as calls,
+                ):
                     out = _forward(module, tensors, row_end, w_v)
                 self.assertEqual(calls, ["dense"])
             else:
@@ -621,13 +664,21 @@ class TestDenseWarmupPrecision(unittest.TestCase):
         for i, name in enumerate(("out", "dq", "dkv", "dw_v")):
             floor = self._FORWARD_FLOOR if i == 0 else self._GRAD_FLOOR
             dense = _rel(got["dense"][i], expected[i])
-            sparse = _rel(got["sparse"][i], expected[i])
             with self.subTest(
                 quantity=name, docs=doc_lens, sink=sink is not None
             ):
                 self.assertTrue(
                     paddle.isfinite(got["dense"][i].cast("float32")).all()
                 )
+                if "sparse" not in got:
+                    self.assertLessEqual(
+                        dense,
+                        floor,
+                        f"{name}: dense rel {dense:.3e} vs fp32 "
+                        f"(docs={doc_lens}, s={seqlen}, sink={sink is not None})",
+                    )
+                    continue
+                sparse = _rel(got["sparse"][i], expected[i])
                 self.assertLessEqual(
                     dense,
                     max(sparse * self._SLACK, floor),
@@ -648,17 +699,21 @@ class TestDenseWarmupPrecision(unittest.TestCase):
     def test_sink_gradient_cross_validates(self):
         """Two independent computations of ``d_sink`` must agree.
 
-        FA4 differentiates the sink column natively. The sparse backend cannot:
-        the SM100 kernel returns an all-zero ``d_sink`` on the ``d_qk != d_v``
-        branch, so ``mqa_sparse_attn`` computes it analytically from the KV-only
-        LSE. Neither is a reference for the other, which is exactly why their
-        agreement is worth pinning -- a sign or scale error on either side would
-        show up here and nowhere else.
+        The cutedsl kernels differentiate the sink column natively. The sparse
+        backend cannot: the SM100 kernel returns an all-zero ``d_sink`` on the
+        ``d_qk != d_v`` branch, so ``mqa_sparse_attn`` computes it analytically
+        from the KV-only LSE. Neither is a reference for the other, which is
+        exactly why their agreement is worth pinning -- a sign or scale error on
+        either side would show up here and nowhere else.
+
+        Needs the sparse kernel, so SM90 boxes skip it.
 
         Measured: identical to the last bit on all three layouts (max abs diff
         0.0, with ``|d_sink|`` up to 4.4), though ``d_sink`` is bf16, so read that
         as agreement within bf16 resolution rather than as identical arithmetic.
         """
+        if not _dsa_kernels_available():
+            self.skipTest("the sparse yardstick needs the SM100 sparse kernel")
         for doc_lens, seqlen in _LAYOUTS:
             row_end = _row_end(doc_lens, seqlen)
             _, got = self._measure(row_end, seqlen, _SINK)
@@ -672,8 +727,7 @@ class TestDenseWarmupPrecision(unittest.TestCase):
                 self.assertLessEqual(_rel(dense, sparse), self._GRAD_FLOOR)
 
 
-@_GPU
-@_FA4
+@_CUTEDSL
 class TestDenseWarmupPadRows(unittest.TestCase):
     """A fully-masked query row must give zeros, not NaN.
 
@@ -691,7 +745,10 @@ class TestDenseWarmupPadRows(unittest.TestCase):
         row_end = _pad_row_end(doc_lens, seqlen)
         module = _module(sink=sink)
         tensors, w_v = _inputs(seqlen)
-        with _flash_attn_version(4), _backend_spy(module) as calls:
+        with (
+            _flash_attn_version(_production_fa_version()),
+            _backend_spy(module) as calls,
+        ):
             out = _forward(module, tensors, row_end, w_v)
         self.assertEqual(calls, ["dense"])
         paddle.autograd.backward(out.cast("float32").sum())
@@ -727,8 +784,7 @@ class TestDenseWarmupPadRows(unittest.TestCase):
         self._assert_pad_rows_vanish(_SINK)
 
 
-@_GPU
-@_FA4
+@_CUTEDSL
 class TestFrozenInputs(unittest.TestCase):
     """Frozen inputs on the dense path, which ``train_indexer_only`` produces.
 
@@ -760,7 +816,10 @@ class TestFrozenInputs(unittest.TestCase):
             # that trips the contract at position 1 rather than 3.
             tensors[0].stop_gradient = True
             tensors[1].stop_gradient = True
-        with _flash_attn_version(4), _backend_spy(module) as calls:
+        with (
+            _flash_attn_version(_production_fa_version()),
+            _backend_spy(module) as calls,
+        ):
             out = _forward(module, tensors, row_end, w_v)
         self.assertEqual(calls, ["dense"])
         paddle.autograd.backward(out.cast("float32").sum())

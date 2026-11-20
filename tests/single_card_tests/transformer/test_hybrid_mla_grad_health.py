@@ -92,13 +92,16 @@ from paddlefleet.transformer.transformer_config import (
     TransformerConfig,
 )
 
-from .hybrid_mla_utils import _fa4_module_hooks, _row_end as _row_end_from_docs
+from .hybrid_mla_utils import (
+    _cutedsl_module_hooks,
+    _row_end as _row_end_from_docs,
+)
 
-# The full-causal phases have exactly one backend: ``_assert_dense_fa4`` raises
+# The full-causal phases have exactly one backend: ``_assert_dense_cutedsl`` raises
 # unless the process flags resolve to FA4, and the ``mha`` sink parameter is
 # likewise only created under FA3/FA4. Reproducing the flag the trainer derives
 # once per module covers both.
-setUpModule, tearDownModule = _fa4_module_hooks()
+setUpModule, tearDownModule = _cutedsl_module_hooks()
 
 try:
     from paddlefleet.cudnn_ops.block_sparse_mqa_dsa import is_dsa_available
@@ -240,7 +243,7 @@ def _fa4_for_mha_sink(mode, sink):
     ``flashmask_attention_func(learnable_sink=...)`` which only exists on the
     cute path (multi_latent_attention.py, guard next to the parameter creation).
 
-    The module-level ``_fa4_pin()`` cannot cover this: it stands down where no
+    The module-level ``_cutedsl_pin()`` cannot cover this: it stands down where no
     FA4 backend can serve, which is every upstream CI box, and these ``mha``
     cases are not gated to SM100. Creating the parameter launches no kernel, so
     the flag only has to hold across the construction -- pin it here and restore,

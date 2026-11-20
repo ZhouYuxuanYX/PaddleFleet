@@ -84,7 +84,7 @@ from .hybrid_mla_utils import (
     _build_module,
     _check_index_invariants,
     _create_mqa_config,
-    _fa4_module_hooks,
+    _cutedsl_module_hooks,
     _make_inputs,
     _rel,
     _row_end,
@@ -97,7 +97,7 @@ from .test_hybrid_mla_rope_audit import (
 )
 from .test_mqa_latent_attention import _fp32, _full_causal_table
 
-setUpModule, tearDownModule = _fa4_module_hooks()
+setUpModule, tearDownModule = _cutedsl_module_hooks()
 
 SEQLEN = 256
 # Two documents, the second longer than the forced window (so the indexer's

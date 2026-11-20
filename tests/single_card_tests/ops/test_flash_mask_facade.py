@@ -51,6 +51,7 @@ class _RecordingFrontend:
     def __call__(self, query, key, value, startend_row_indices=None, **kwargs):
         self.calls.append(
             {
+                "value": value,
                 "value_shape": list(value.shape),
                 "startend_row_indices": startend_row_indices,
                 **kwargs,
@@ -112,6 +113,22 @@ class TestFlashAttentionCutedslPath(unittest.TestCase):
         self._call(3, q_dim=192, v_dim=128, causal=True)
         self.assertEqual(self.frontend.calls[0]["value_shape"][-1], 128)
 
+    def test_mla_pair_is_not_padded_on_fa3_and_fa4(self):
+        # 576/512 is native on both, so a value that aliases key[..., :512]
+        # reaches the kernel unchanged and kv shared can be detected.
+        for fa_version in (3, 4):
+            self.frontend.calls.clear()
+            self._call(fa_version, q_dim=576, v_dim=512, causal=True)
+            self.assertEqual(self.frontend.calls[0]["value_shape"][-1], 512)
+
+    def test_flashmask_attention_passes_value_through(self):
+        q = paddle.zeros([2, 8, 4, 576], "float32")
+        k = paddle.zeros([2, 8, 1, 576], "float32")
+        v = k[..., :512]
+        with mock.patch.object(facade, "get_fa_version", return_value=3):
+            facade.flashmask_attention(q, k, v, causal=True)
+        self.assertIs(self.frontend.calls[0]["value"], v)
+
     def test_dropout_in_training_is_rejected(self):
         with self.assertRaisesRegex(NotImplementedError, "dropout"):
             self._call(4, dropout=0.1, training=True)
@@ -132,6 +149,40 @@ class TestUsesCutedslBackend(unittest.TestCase):
         self.assertFalse(facade.uses_cutedsl_backend(2))
         self.assertTrue(facade.uses_cutedsl_backend(3))
         self.assertTrue(facade.uses_cutedsl_backend(4))
+
+
+@unittest.skipIf(_IMPORT_ERROR is not None, _SKIP_REASON)
+class TestLargeHeadDimDispatch(unittest.TestCase):
+    def _dispatch(self, flag, head_dim, head_dim_v):
+        with (
+            mock.patch.object(paddle, "get_device", return_value="gpu:0"),
+            mock.patch.object(
+                paddle.base.framework,
+                "get_flags",
+                return_value={"FLAGS_flash_attn_version": flag},
+            ),
+            mock.patch.object(
+                facade, "is_flash_mask_available", return_value=True
+            ),
+        ):
+            return facade.get_fa_version(head_dim, head_dim_v)
+
+    def test_large_head_dims_stay_on_cutedsl(self):
+        # SM90 (FA3) and SM100 (FA4) both serve 512/512 and 576/512.
+        for flag in (3, 4):
+            for head_dim, head_dim_v in ((512, 512), (576, 512)):
+                self.assertEqual(
+                    self._dispatch(flag, head_dim, head_dim_v), flag
+                )
+
+    def test_unsupported_large_head_dim_degrades_to_fa2(self):
+        for flag in (3, 4):
+            self.assertEqual(self._dispatch(flag, 512, 256), 2)
+
+    def test_mla_pair_needs_no_value_padding(self):
+        for fa_version in (3, 4):
+            self.assertFalse(facade.needs_value_padding(fa_version, 576, 512))
+        self.assertTrue(facade.needs_value_padding(2, 576, 512))
 
 
 if __name__ == "__main__":

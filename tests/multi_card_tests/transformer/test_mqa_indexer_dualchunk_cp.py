@@ -57,7 +57,7 @@ CP_GROUP = None
 
 S_GLOBAL = 512
 
-_FA4_PIN = U._fa4_pin()
+_CUTEDSL_PIN = U._cutedsl_pin()
 
 
 def setUpModule():
@@ -66,7 +66,7 @@ def setUpModule():
         raise unittest.SkipTest(
             "MQA dual-chunk tests require >= 2 GPUs (one peer to swap with)"
         )
-    _FA4_PIN.__enter__()
+    _CUTEDSL_PIN.__enter__()
     world = dist.get_world_size()
     strategy = fleet.DistributedStrategy()
     strategy.hybrid_configs = {
@@ -96,7 +96,7 @@ def setUpModule():
 
 
 def tearDownModule():
-    _FA4_PIN.__exit__(None, None, None)
+    _CUTEDSL_PIN.__exit__(None, None, None)
 
 
 def _build(dualchunk, loss_coeff=0.0, seed=7):

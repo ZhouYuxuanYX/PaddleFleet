@@ -99,15 +99,15 @@ from .hybrid_mla_utils import (
     _build_module,
     _check_index_invariants,
     _create_mqa_config,
+    _cutedsl_module_hooks,
     _dense_reference,
-    _fa4_module_hooks,
     _full_causal_indices,
     _make_inputs,
     _rel,
     _row_end,
 )
 
-setUpModule, tearDownModule = _fa4_module_hooks()
+setUpModule, tearDownModule = _cutedsl_module_hooks()
 
 # Adversarial document layouts: shorter than / equal to / longer than the
 # forced window, single-token documents, and a document overrunning the buffer.

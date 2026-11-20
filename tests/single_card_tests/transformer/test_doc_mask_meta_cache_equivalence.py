@@ -25,7 +25,8 @@ backward must be bit-identical too.
 
 Which phases actually consume the metadata, on the current architecture:
 
-* ``mqa_full_causal`` (no indexer) runs as dense FA4 flashmask off the row-end
+* ``mqa_full_causal`` (no indexer) runs as dense cutedsl flashmask (FA3 on
+  SM90, FA4 on SM100) off the row-end
   mask alone -- no index table at all, so the cache only proves the preload ->
   lookup plumbing disturbs nothing (``test_full_causal_plumbing``).
 * the DSA ``warmup`` phase (indexer present, ``indexer_use_sparse_loss`` off)
@@ -77,16 +78,16 @@ from .hybrid_mla_utils import (
     WINDOW,
     _build_module,
     _create_mqa_config,
-    _fa4_module_hooks,
+    _cutedsl_module_hooks,
     _make_inputs,
     _row_end,
 )
 
 _ACC = 2  # gradient accumulation steps, matching the registry's step model
 
-# The MQA full-causal / warmup phases run dense FA4 flashmask, which the flag
-# pin reproduces (``_fa4_pin`` stands down where FA4 cannot serve).
-setUpModule, tearDownModule = _fa4_module_hooks()
+# The MQA full-causal / warmup phases run dense cutedsl flashmask, which the flag
+# pin reproduces (``_cutedsl_pin`` stands down where FA4 cannot serve).
+setUpModule, tearDownModule = _cutedsl_module_hooks()
 
 
 def _leaf(t):

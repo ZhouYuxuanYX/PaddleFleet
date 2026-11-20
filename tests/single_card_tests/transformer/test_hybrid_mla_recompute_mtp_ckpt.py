@@ -635,7 +635,7 @@ class TestRecomputeEquivalence(unittest.TestCase):
         )
 
         # Pinned per call site rather than per module: the full-causal phase has
-        # exactly one backend and ``_assert_dense_fa4`` raises otherwise, while
+        # exactly one backend and ``_assert_dense_cutedsl`` raises otherwise, while
         # ``test_production_dims_sink_support_follows_the_backend`` pins the
         # production version itself, so a module-wide pin would fight it.
         with _flash_attn_version(4):
