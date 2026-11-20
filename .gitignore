@@ -48,6 +48,7 @@ packages/paddlefleet_ops/src/paddlefleet_ops/fast_hadamard_transform
 packages/paddlefleet_ops/src/paddlefleet_ops/fast_hadamard_transform_cuda
 packages/paddlefleet_ops/src/paddlefleet_ops/moonep
 packages/paddlefleet_ops/src/paddlefleet_ops/deep_select
+packages/paddlefleet_ops/src/paddlefleet_ops/flashtopk
 
 # Generated version files
 # Both version.py files are auto-generated at build time by build_backend.py.

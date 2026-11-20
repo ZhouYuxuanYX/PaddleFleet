@@ -150,6 +150,8 @@ if paddle.is_compiled_with_cuda():
 
     CUDNN_FRONTEND_HINT = "For developers: guard imports with `is_cudnn_frontend_available()` and only call `paddlefleet_ops.cudnn` when flag branch enabled."
 
+    FLASHTOPK_HINT = "For developers: guard imports with `is_flashtopk_available()` and only call `paddlefleet_ops.flashtopk` when flag branch enabled."
+
     FLASH_MLA_HINT = (
         "For developers: guard imports with `is_flash_mla_available()` and only call `paddlefleet_ops.flash_mla` when flag branch enabled.\n"
         "For users: use a GPU with compute capability >= 9.0 (Hopper or Blackwell) to enable."
@@ -175,6 +177,7 @@ else:
         "fast_hadamard_transform is not supported on XPU backend."
     )
     MOON_EP_HINT = "moonep is not supported on XPU backend."
+    FLASHTOPK_HINT = "flashtopk is not supported on XPU backend."
 
 FLASH_MASK_HINT = (
     "For developers: guard imports with `is_flash_mask_available()` and only call `paddlefleet_ops.flashmask` when flag branch enabled.\n"
@@ -245,6 +248,7 @@ _FLASH_MLA_AVAILABLE = False
 _FLA_AVAILABLE = False
 _FLASH_MASK_AVAILABLE = False
 _CUDNN_FRONTEND_AVAILABLE = False
+_FLASHTOPK_AVAILABLE = False
 _FAST_HADAMARD_TRANSFORM_AVAILABLE = False
 _MOON_EP_AVAILABLE = False
 _DEEP_SELECT_AVAILABLE = False
@@ -267,6 +271,7 @@ if paddle.is_compiled_with_cuda():
         _SONIC_MOE_AVAILABLE = True
     if sys.version_info >= (3, 12):
         _CUDNN_FRONTEND_AVAILABLE = True
+        _FLASHTOPK_AVAILABLE = paddle.cuda.get_device_capability()[0] == 10
     _FAST_HADAMARD_TRANSFORM_AVAILABLE = True
     if paddle.cuda.get_device_capability()[0] >= 9 and _cuda_version >= (
         12,
@@ -308,6 +313,10 @@ def is_flash_mask_available():
 
 def is_cudnn_frontend_available():
     return _CUDNN_FRONTEND_AVAILABLE
+
+
+def is_flashtopk_available():
+    return _FLASHTOPK_AVAILABLE
 
 
 def is_fast_hadamard_transform_available():
@@ -548,6 +557,19 @@ if paddle.is_compiled_with_cuda():
         )
         logger.warning(warning)
         blocked_import_messages["paddlefleet_ops.cudnn"] = error
+
+    if is_flashtopk_available():
+        paddle.enable_compat(scope={"flashtopk"}, silent=True)
+        _safe_load_ecosystem_lib("flashtopk", ops_dir, globals())
+    else:
+        warning, error = _build_notice(
+            "paddlefleet_ops.flashtopk",
+            "requires Python >= 3.12 and GPU compute capability 10.x (SM100). "
+            f"Current: Python {_python_version_str}, capability {_capability_str}.",
+            hint_for_error=FLASHTOPK_HINT,
+        )
+        logger.warning(warning)
+        blocked_import_messages["paddlefleet_ops.flashtopk"] = error
 
     if blocked_import_messages:
         sys.meta_path.insert(

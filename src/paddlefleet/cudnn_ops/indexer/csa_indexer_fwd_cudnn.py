@@ -61,6 +61,18 @@ def _require_deep_select():
     return deep_select
 
 
+def _require_flashtopk():
+    """Import FlashTopK's fused indexer top-k from paddlefleet_ops on first use."""
+    try:
+        from paddlefleet_ops.flashtopk import flashtopk_indexer_topk
+    except (ImportError, RuntimeError) as error:
+        raise ImportError(
+            "dsa_index_topk_backend='flashtopk' requires paddlefleet_ops built "
+            "with FlashTopK, Python >= 3.12 and an SM100 GPU"
+        ) from error
+    return flashtopk_indexer_topk
+
+
 def _deep_select_alignment(dtype):
     """Return DeepSelect's input-row alignment in elements."""
     itemsize = 4 if dtype == paddle.float32 else 2
@@ -189,10 +201,10 @@ def _validate_indexer_inputs(index_q, index_k_comp, weights):
         )
     if heads not in (32, 64):
         raise ValueError(
-            f"cuDNN IndexerForward requires H_i (qhead_per_kv_head) in {{32, 64}}, got {heads}"
+            f"IndexerForward requires H_i (qhead_per_kv_head) in {{32, 64}}, got {heads}"
         )
     if dim != 128:
-        raise ValueError(f"cuDNN IndexerForward requires D_i=128, got {dim}")
+        raise ValueError(f"IndexerForward requires D_i=128, got {dim}")
 
 
 def _indexer_top_k_unfused(
@@ -441,7 +453,10 @@ def cudnn_indexer_topk_fwd(
         return_topk_scores: return selected raw scores as a third output. This
             avoids gathering from a packed-global score tensor on the THD path.
         dsa_index_topk_backend: top-k implementation, ``"paddle"`` or
-            ``"deep_select"``.
+            ``"deep_select"`` (on the cuDNN scores), or ``"flashtopk"``
+            (fused score + top-k; the cuDNN forward is not run, and
+            ``startend_row_indices`` / ``doc_lens`` are ignored: the windows
+            come from ``valid_range``, or the causal limit when it is None).
 
     Returns:
         topk_indices: [B, S, topk_effective] int32 global compressed-buffer ids,
@@ -449,6 +464,24 @@ def cudnn_indexer_topk_fwd(
         topk_length:  [B, S] int32, per-row valid count.
         topk_scores:  optional [B, S, topk_effective] fp32 selected scores.
     """
+    if dsa_index_topk_backend not in {"paddle", "deep_select", "flashtopk"}:
+        raise ValueError(
+            f"dsa_index_topk_backend={dsa_index_topk_backend!r} is invalid; "
+            "expected 'paddle', 'deep_select' or 'flashtopk'"
+        )
+    _validate_indexer_inputs(index_q, index_k_comp, weights)
+    if dsa_index_topk_backend == "flashtopk":
+        return _flashtopk_indexer_topk_fwd(
+            index_q,
+            index_k_comp,
+            weights,
+            ratio=ratio,
+            topk_effective=topk_effective,
+            indexer_softmax_scale=indexer_softmax_scale,
+            valid_range=valid_range,
+            seq_offset=seq_offset,
+            return_topk_scores=return_topk_scores,
+        )
     return _cudnn_indexer_topk_fwd_impl(
         index_q,
         index_k_comp,
@@ -465,6 +498,35 @@ def cudnn_indexer_topk_fwd(
     )
 
 
+def _flashtopk_indexer_topk_fwd(
+    index_q,
+    index_k_comp,
+    weights,
+    ratio,
+    topk_effective,
+    indexer_softmax_scale,
+    valid_range,
+    seq_offset,
+    return_topk_scores,
+):
+    """``cudnn_indexer_topk_fwd`` as one fused FlashTopK score + top-k call."""
+    indices, length, scores = _require_flashtopk()(
+        index_q,
+        index_k_comp,
+        weights,
+        int(topk_effective),
+        softmax_scale=float(index_q.shape[-1]) ** -0.5
+        * float(indexer_softmax_scale),
+        ratio=int(ratio),
+        seq_offset=int(seq_offset),
+        valid_range=valid_range,
+        return_scores=return_topk_scores,
+    )
+    if return_topk_scores:
+        return indices, length, scores
+    return indices, length
+
+
 def _cudnn_indexer_topk_fwd_impl(
     index_q,
     index_k_comp,
@@ -479,12 +541,6 @@ def _cudnn_indexer_topk_fwd_impl(
     return_topk_scores=False,
     dsa_index_topk_backend="paddle",
 ):
-    if dsa_index_topk_backend not in {"paddle", "deep_select"}:
-        raise ValueError(
-            f"dsa_index_topk_backend={dsa_index_topk_backend!r} is invalid; "
-            "expected 'paddle' or 'deep_select'"
-        )
-    _validate_indexer_inputs(index_q, index_k_comp, weights)
     if int(topk_effective) <= 0:
         raise ValueError(
             f"topk_effective must be positive, got {topk_effective}"

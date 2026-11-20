@@ -160,5 +160,18 @@ class TestDeepSelectImport(unittest.TestCase):
         self.assertTrue(callable(deep_select.topk))
 
 
+class TestFlashTopKImport(unittest.TestCase):
+    def test_flashtopk_import(self):
+        import paddlefleet_ops
+
+        if not paddlefleet_ops.is_flashtopk_available():
+            with self.assertRaises(RuntimeError):
+                from paddlefleet_ops import flashtopk  # noqa: F401
+            return
+        from paddlefleet_ops.flashtopk import flashtopk_indexer_topk
+
+        self.assertTrue(callable(flashtopk_indexer_topk))
+
+
 if __name__ == "__main__":
     unittest.main()

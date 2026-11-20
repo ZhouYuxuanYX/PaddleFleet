@@ -2486,7 +2486,7 @@ class TestForwardDsaFusedDispatchMocked(unittest.TestCase):
         self.assertTrue(np.isfinite(loss))
 
     def test_dsa_index_topk_backend_reaches_the_kernel(self):
-        for backend in ("paddle", "deep_select"):
+        for backend in ("paddle", "deep_select", "flashtopk"):
             seen = self._run(_LSE_INDEXER_TOPKS[0], backend)
             self.assertEqual(seen["dsa_index_topk_backend"], backend)
 

@@ -1970,12 +1970,18 @@ class TransformerConfig(ModelParallelConfig):
     by TransformerConfig.transform_rules.
     """
 
-    dsa_index_topk_backend: Literal["paddle", "deep_select"] = "paddle"
-    """Top-k implementation for the sparse DSA indexer.
+    dsa_index_topk_backend: Literal["paddle", "deep_select", "flashtopk"] = (
+        "paddle"
+    )
+    """Top-k implementation for the MLA (``MQALatentAttention``) DSA indexer;
+    CSA layers do not read it.
 
-    One of ``{"paddle", "deep_select"}``. ``"paddle"`` is the default to
-    preserve existing behavior. ``"deep_select"`` uses native row limits,
-    unsorted output, int32 indices, and omits values outside the loss pass.
+    One of ``{"paddle", "deep_select", "flashtopk"}``. ``"paddle"`` is the
+    default to preserve existing behavior. ``"deep_select"`` uses native row
+    limits, unsorted output, int32 indices, and omits values outside the loss
+    pass. ``"flashtopk"`` (experimental, SM100 only) replaces the forward score
+    and the top-k with one fused FlashTopK call
+    (``paddlefleet_ops.flashtopk``). The indexer backward is unchanged.
     """
 
     dsa_indexer_loss_coeff: float = 0.0
@@ -3605,10 +3611,14 @@ class TransformerConfig(ModelParallelConfig):
                     "inside the full-layer recompute."
                 )
 
-        if self.dsa_index_topk_backend not in {"paddle", "deep_select"}:
+        if self.dsa_index_topk_backend not in {
+            "paddle",
+            "deep_select",
+            "flashtopk",
+        }:
             raise ValueError(
                 f"dsa_index_topk_backend={self.dsa_index_topk_backend!r} is invalid. "
-                "Must be one of {'paddle', 'deep_select'}."
+                "Must be one of {'paddle', 'deep_select', 'flashtopk'}."
             )
 
         # DSv4 Hybrid Attention validation

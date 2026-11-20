@@ -493,10 +493,11 @@ class TestIndexTopKBackend(unittest.TestCase):
     def test_default_and_accepted_values(self):
         config = TransformerConfig(num_hidden_layers=2)
         self.assertEqual(config.dsa_index_topk_backend, "paddle")
-        config = TransformerConfig(
-            num_hidden_layers=2, dsa_index_topk_backend="deep_select"
-        )
-        self.assertEqual(config.dsa_index_topk_backend, "deep_select")
+        for backend in ("deep_select", "flashtopk"):
+            config = TransformerConfig(
+                num_hidden_layers=2, dsa_index_topk_backend=backend
+            )
+            self.assertEqual(config.dsa_index_topk_backend, backend)
 
     def test_unknown_value_is_rejected(self):
         with self.assertRaisesRegex(

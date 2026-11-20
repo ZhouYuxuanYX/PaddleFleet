@@ -77,7 +77,7 @@ _PRODUCTION_TOP_K = M._indexer_top_k_unfused
 
 RATIO = 4
 SQ_GLOBAL = 128
-# cuDNN IndexerForward only accepts H_i in {32, 64} and D_i == 128
+# IndexerForward only accepts H_i in {32, 64} and D_i == 128
 # (``_check_cudnn_indexer_shape_support``), which the CSA fixture's 16/32 does
 # not satisfy -- so this file sets its own indexer dims.
 INDEX_HEADS = 32

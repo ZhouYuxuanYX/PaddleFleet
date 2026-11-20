@@ -136,7 +136,7 @@ def _legacy_indexer_top_k_unfused(
 # Harness
 # =========================================================================
 
-_HEADS = 64  # cuDNN IndexerForward accepts H_i in {32, 64}
+_HEADS = 64  # IndexerForward accepts H_i in {32, 64}
 _DIM = 128  # ... and requires D_i == 128
 
 

@@ -206,6 +206,7 @@ def check_submodule_updated():
             "FlashMLA",
             "fast-hadamard-transform",
             "DeepSelect",
+            "FlashTopK",
         ]
         if os.environ.get("ENABLE_MOONEP", "0") == "1":
             third_parties.append("MoonEP")
@@ -563,6 +564,13 @@ def get_libs():
                 artifacts=[
                     Artifact("cudnn", "cudnn"),
                 ],
+            )
+        )
+        LIBRARIES.append(
+            EcosystemLibrary(
+                name="FlashTopK",
+                source_rel_path="third_party/FlashTopK",
+                artifacts=[Artifact("flashtopk", "flashtopk")],
             )
         )
     return LIBRARIES

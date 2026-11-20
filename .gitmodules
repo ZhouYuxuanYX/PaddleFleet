@@ -34,3 +34,6 @@
 [submodule "packages/paddlefleet_ops/third_party/DeepSelect"]
 	path = packages/paddlefleet_ops/third_party/DeepSelect
 	url = https://github.com/PFCCLab/DeepSelect.git
+[submodule "packages/paddlefleet_ops/third_party/FlashTopK"]
+	path = packages/paddlefleet_ops/third_party/FlashTopK
+	url = https://github.com/PFCCLab/FlashTopK.git
