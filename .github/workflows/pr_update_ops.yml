@@ -117,7 +117,7 @@ jobs:
       matrix:
         python_version: ["3.12"]
         cuda:
-          - {CUDA_VERSION: CUDA12.9, IMAGE_TAG: ubuntu24-cuda129-py312-dev-fleet, bos_CUDA: cu129, CUDA_ARCH_LIST: "8.0;9.0;10.0;10.3"}
+          - {CUDA_VERSION: CUDA12.9, IMAGE_TAG: ubuntu24-cuda129-py312-dev-fleet, bos_CUDA: cu129, CUDA_ARCH_LIST: "8.0;9.0"}
           - {CUDA_VERSION: CUDA13.0, IMAGE_TAG: ubuntu24-cuda130-py312-dev-fleet, bos_CUDA: cu130, CUDA_ARCH_LIST: "8.0;9.0;10.0;10.3"}
           - {CUDA_VERSION: CUDA13.2, IMAGE_TAG: ubuntu24-cuda132-py312-dev-fleet, bos_CUDA: cu132, CUDA_ARCH_LIST: "8.0;9.0;10.0;10.3"}
     env:
