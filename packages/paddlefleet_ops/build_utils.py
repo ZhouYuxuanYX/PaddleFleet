@@ -460,6 +460,8 @@ def get_libs():
         ";".join(a for a in re.split(r"[;,]", _raw) if a.strip() in _supported)
         or _default_arch
     )
+    # Post-merge cu129 wheels are built for 8.0;9.0 only (pr_update_ops.yml);
+    # B-card (SM100+) wheels come from cu130/cu132.
     # The FlashMask overlap bridge is B-card only (SM100+): build it for the
     # SM100+ archs in PADDLE_CUDA_ARCH_LIST (wheels are built on GPU-less hosts,
     # where FlashMask would otherwise target sm_90a), else for a local B card.
