@@ -33,34 +33,19 @@ PrecisionSwitch = namedtuple(
     "PrecisionSwitch", ["target", "key", "value", "reason"]
 )
 
+# ``csa_sparse_attn_backend`` / ``mqa_sparse_attn_backward_backend`` are not
+# pinned: with cudnn-frontend >= 1.32.3 and FLAGS_cudnn_deterministic the cuDNN
+# DSA sparse attention backward runs its deterministic kernels (bitwise across
+# reruns), so the accuracy run keeps the production cuDNN path.
 PRECISION_SWITCHES = (
-    PrecisionSwitch(
-        target="yaml",
-        key="csa_sparse_attn_backend",
-        value="tilelang",
-        reason=(
-            "精度对齐：HCA/CSA 稀疏注意力的 cudnn 后端"
-            "（FlashMLA 前向 + cuDNN 反向）与 tilelang 结果不一致，"
-            "精度测试统一走 tilelang"
-        ),
-    ),
     PrecisionSwitch(
         target="yaml",
         key="csa_indexer_backend",
         value="tilelang",
         reason=(
-            "精度对齐：indexer 的 cudnn top-k 与 tilelang 存在差异，"
-            "与 sparse attention 后端取齐为 tilelang"
-        ),
-    ),
-    PrecisionSwitch(
-        target="yaml",
-        key="mqa_sparse_attn_backward_backend",
-        value="tilelang",
-        reason=(
-            "精度对齐：absorbed-MQA（csa_compress_ratios=-2）层的 dKV 反向"
-            "默认走 cuDNN，其原子累加不可逐位复现，"
-            "与 CSA 后端一起统一切到确定性的 tilelang"
+            "精度对齐：DSA warmup 的 dense KL 反向"
+            "（cuDNN dense_indexer_backward）没有确定性实现，"
+            "dIndexK 的 fp32 原子累加不可逐位复现，indexer 统一走 tilelang"
         ),
     ),
     PrecisionSwitch(

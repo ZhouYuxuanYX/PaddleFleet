@@ -30,6 +30,13 @@ def _require_cudnn_frontend():
         raise ImportError(CUDNN_FRONTEND_HINT)
 
 
+def _deterministic_requested() -> bool:
+    import paddle
+
+    flag = "FLAGS_cudnn_deterministic"
+    return bool(paddle.get_flags([flag])[flag])
+
+
 def _patch_paddle_memory_format():
     """Patch paddle with torch.memory_format sentinel attributes for H-Card.
 
@@ -172,6 +179,14 @@ def csa_sparse_attn_bwd_cudnn(
         require_recent_cudnn_frontend(
             cudnn_frontend_version(),
             "The cuDNN DSA backward with d_qk != d_v (kernel d_sink)",
+        )
+    elif _deterministic_requested():
+        # An older cudnn-frontend has no deterministic DSA backward; running it
+        # anyway would silently break the run-to-run reproducibility the flag
+        # asks for (accuracy runs rely on it).
+        require_recent_cudnn_frontend(
+            cudnn_frontend_version(),
+            "The deterministic cuDNN DSA backward (FLAGS_cudnn_deterministic)",
         )
     from paddlefleet_ops.cudnn.deepseek_sparse_attention.sparse_attention_backward.api import (
         sparse_attention_backward_wrapper,

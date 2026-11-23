@@ -112,7 +112,7 @@ expert_model_parallel_size: 64
 pipeline_model_parallel_size: 8
 virtual_pipeline_model_parallel_size: 2
 context_parallel_size: 1
-csa_indexer_backend: tilelang
+csa_indexer_backend: cudnn
 csa_sparse_attn_backend: cudnn
 max_steps: 1000000
 """
@@ -305,20 +305,20 @@ class TestPrecisionSwitches(unittest.TestCase):
 
     def test_yaml_key_pinned_in_yaml(self):
         applied, skipped = plan_precision_switches(
-            {"csa_sparse_attn_backend": "cudnn"}, {}
+            {"csa_indexer_backend": "cudnn"}, {}
         )
         self.assertIn(
-            ("yaml", "csa_sparse_attn_backend", "tilelang"),
+            ("yaml", "csa_indexer_backend", "tilelang"),
             [(t, k, v) for t, k, v, _r in applied],
         )
         self.assertEqual(skipped, [])
 
     def test_key_declared_in_json_is_pinned_there_too(self):
         applied, _skipped = plan_precision_switches(
-            {}, {"csa_sparse_attn_backend": "cudnn"}
+            {}, {"csa_indexer_backend": "cudnn"}
         )
         targets = {(t, k) for t, k, _v, _r in applied}
-        self.assertIn(("json", "csa_sparse_attn_backend"), targets)
+        self.assertIn(("json", "csa_indexer_backend"), targets)
 
     def test_json_switch_skipped_without_model_config(self):
         _applied, skipped = plan_precision_switches({}, None)
@@ -345,26 +345,20 @@ class TestPrecisionSwitches(unittest.TestCase):
             frozenset({"multimax_modules"}),
         )
 
-    def test_mqa_backward_backend_is_pinned_even_when_absent(self):
-        # The absorbed-MQA dKV backward defaults to cuDNN, whose atomic
-        # accumulation is not bit-reproducible, so accuracy runs must pin it
-        # like the two CSA backends -- including when no document declares it
-        # yet, which is the common case for existing YAMLs.
-        applied, skipped = plan_precision_switches({}, {})
-        self.assertIn(
-            ("yaml", "mqa_sparse_attn_backward_backend", "tilelang"),
-            [(t, k, v) for t, k, v, _r in applied],
-        )
-        self.assertEqual(skipped, [])
-
-    def test_mqa_backward_backend_follows_the_declaring_document(self):
+    def test_cudnn_sparse_attn_backends_are_not_pinned(self):
+        # cudnn-frontend >= 1.32.3 runs the DSA sparse attention backward
+        # deterministically under FLAGS_cudnn_deterministic, so accuracy runs
+        # keep the cuDNN CSA / MQA backends, declared or not.
         applied, _skipped = plan_precision_switches(
-            {"mqa_sparse_attn_backward_backend": "cudnn"},
+            {
+                "csa_sparse_attn_backend": "cudnn",
+                "mqa_sparse_attn_backward_backend": "cudnn",
+            },
             {"mqa_sparse_attn_backward_backend": "cudnn"},
         )
-        targets = {(t, k) for t, k, _v, _r in applied}
-        self.assertIn(("yaml", "mqa_sparse_attn_backward_backend"), targets)
-        self.assertIn(("json", "mqa_sparse_attn_backward_backend"), targets)
+        keys = {k for _t, k, _v, _r in applied}
+        self.assertNotIn("csa_sparse_attn_backend", keys)
+        self.assertNotIn("mqa_sparse_attn_backward_backend", keys)
 
 
 class TestShardingShrinkSwitches(unittest.TestCase):
@@ -1907,10 +1901,10 @@ class TestAccuracySwitch(ConfigAdapterTestBase):
         # acc follows the data-parallel width (96 -> 2): GBS must equal
         # micro_bs * acc * dataset_world_size, so acc = 192 / (1 * 2) = 96.
         self.assertEqual(config["gradient_accumulation_steps"], 96)
-        self.assertEqual(config["csa_sparse_attn_backend"], "tilelang")
-        # Written even though the source YAML never declared it: the field's
-        # own default is the non-deterministic cuDNN backward.
-        self.assertEqual(config["mqa_sparse_attn_backward_backend"], "tilelang")
+        self.assertEqual(config["csa_indexer_backend"], "tilelang")
+        # The cuDNN sparse attention backends are deterministic now: kept.
+        self.assertEqual(config["csa_sparse_attn_backend"], "cudnn")
+        self.assertNotIn("mqa_sparse_attn_backward_backend", config)
         self.assertIsNone(self.load_output_json(8)["multimax_modules"])
         self.assertIn("精度对齐", message)
 
@@ -1924,7 +1918,7 @@ class TestAccuracySwitch(ConfigAdapterTestBase):
         self.assertEqual(config["expert_model_parallel_size"], 64)
         self.assertEqual(config["gradient_accumulation_steps"], 2)
         self.assertEqual(config["global_batch_size"], 128)
-        self.assertEqual(config["csa_sparse_attn_backend"], "tilelang")
+        self.assertEqual(config["csa_indexer_backend"], "tilelang")
         self.assertIsNone(self.load_output_json(512)["multimax_modules"])
 
     def test_skip_precision_switch_keeps_source_value(self):
@@ -1939,7 +1933,7 @@ class TestAccuracySwitch(ConfigAdapterTestBase):
         )
         # Only the named switch is skipped; the others are still pinned.
         self.assertEqual(
-            self.load_output_yaml(8)["csa_sparse_attn_backend"], "tilelang"
+            self.load_output_yaml(8)["csa_indexer_backend"], "tilelang"
         )
         self.assertIn("--skip-precision-switch", message)
 
@@ -2795,7 +2789,7 @@ max_steps: 100
         self.assertEqual(out["expert_model_parallel_size"], 16)
         self.assertIn("REQUIRED_NODES=16", message)
         # The determinism switches still land: only the shrink search is gone.
-        self.assertEqual(out["csa_sparse_attn_backend"], "tilelang")
+        self.assertEqual(out["csa_indexer_backend"], "tilelang")
 
     def test_headroom_over_the_floor_is_preserved(self):
         # 16 cards against a floor of 8: the derived scale keeps the 2x.

@@ -20,7 +20,8 @@
   probe falls back size by size and warns when no size can launch.
 * ``cudnn_frontend_version`` parses the vendored version; with one older
   than 1.32.3 the ``d_qk != d_v`` backward raises instead of returning the old
-  kernel's all-zero ``d_sink``.
+  kernel's all-zero ``d_sink``, and so does any backward under
+  FLAGS_cudnn_deterministic (the old kernels are not deterministic).
 * ``csa_sparse_attn_bwd_cudnn`` on a GPU: with FLAGS_cudnn_deterministic the
   rows are sorted before the wrapper (dKV / d_sink equal to the unsorted
   deterministic run bit for bit, equal to a pre-sorted wrapper call in every
@@ -225,6 +226,25 @@ class TestFrontendVersion(unittest.TestCase):
                 bwd.csa_sparse_attn_bwd_cudnn(
                     q, None, out, None, None, None, None
                 )
+
+    def test_old_frontend_rejects_deterministic_backward(self):
+        # d_qk == d_v (CSA / HCA): an old wheel has no deterministic kernel, so
+        # FLAGS_cudnn_deterministic must fail loudly instead of running the
+        # atomic one.
+        q = paddle.zeros([2, 1, 512], dtype="bfloat16")
+        with (
+            _flag(True),
+            mock.patch.object(
+                bwd, "is_cudnn_frontend_available", return_value=True
+            ),
+            mock.patch.object(
+                bwd, "cudnn_frontend_version", return_value=(1, 28, 0)
+            ),
+            self.assertRaisesRegex(
+                RuntimeError, "deterministic.*1.32.3.*found 1.28.0"
+            ),
+        ):
+            bwd.csa_sparse_attn_bwd_cudnn(q, None, q, None, None, None, None)
 
 
 H, D, S, SKV, TOPK = 64, 512, 256, 1024, 128
