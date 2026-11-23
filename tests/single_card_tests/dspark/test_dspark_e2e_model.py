@@ -44,6 +44,10 @@ _H, _NH, _NRS, _V = 256, 8, 4, 320
 
 
 def _make_config(add_dspark_loss: bool, **overrides) -> GPTConfig:
+    overrides.setdefault("csa_compress_ratios", [0, 0, 0])
+    overrides.setdefault("moe_layer_freq", [0, 1, 1])
+    overrides.setdefault("context_parallel_size", 1)
+    overrides.setdefault("moe_token_dispatcher_type", "allgather")
     config = GPTConfig(
         num_hidden_layers=3,
         hidden_size=_H,
@@ -62,7 +66,6 @@ def _make_config(add_dspark_loss: bool, **overrides) -> GPTConfig:
         tie_word_embeddings=False,
         sequence_parallel=False,
         tensor_model_parallel_size=1,
-        context_parallel_size=1,
         multi_latent_attention=True,
         experimental_attention_variant="dsv4_hybrid",
         gated_attention=True,
@@ -87,7 +90,6 @@ def _make_config(add_dspark_loss: bool, **overrides) -> GPTConfig:
         rope_type="rope",
         rotary_base=10000.0,
         rotary_percent=1.0,
-        csa_compress_ratios=[0, 0, 0],
         csa_window_size=16,
         dsa_index_n_heads=4,
         dsa_index_head_dim=32,
@@ -102,12 +104,10 @@ def _make_config(add_dspark_loss: bool, **overrides) -> GPTConfig:
         csa_indexer_backend="unfused",
         csa_sparse_attn_backend="unfused",
         csa_dense_mode=False,
-        moe_layer_freq=[0, 1, 1],
         n_routed_experts=8,
         moe_intermediate_size=64,
         num_experts_per_tok=2,
         n_shared_experts=1,
-        moe_token_dispatcher_type="allgather",
         scoring_func="sigmoid",
         topk_method="noaux_tc",
         n_group=1,
@@ -259,6 +259,97 @@ class TestDsparkEndToEndModel(unittest.TestCase):
         self.assertIsNotNone(embed_param.grad)
         self.assertTrue(bool(paddle.isfinite(embed_param.grad).all()))
 
+    def _build_and_run_with_mtp(self, K=1, **config_overrides):
+        seed = 46
+        random.seed(seed)
+        np.random.seed(seed)
+        paddle.seed(seed)
+        strategy = _ensure_fleet_ready()
+        model_parallel_cuda_manual_seed(seed, tp_rank=0, ep_rank=0, etp_rank=0)
+
+        config = _make_config(
+            True,
+            num_nextn_predict_layers=K,
+            csa_compress_ratios=[0] * (3 + K),
+            mtp_loss_scaling_factor=0.3,
+            add_mtp_loss=True,
+            **config_overrides,
+        )
+        # release/0.5 reads the main-length mask layout from this flag (develop
+        # infers it from mtp_startend_row_indices_all, #2257); the batch below
+        # uses that layout, as the dspark SFT yaml does.
+        config.mtp_attention_flexible = True
+        model = gpt_builder(config, num_stages=1)
+
+        B, S = 1, 16
+        rng = np.random.default_rng(0)
+        data = paddle.to_tensor(
+            rng.integers(1, _V, size=(B, S + K + 1)).astype("int64")
+        )
+        input_ids = data[:, :-1].contiguous()
+        labels = data[:, 1:].contiguous()
+        position_ids = (
+            paddle.arange(S + K, dtype="int64")
+            .reshape([1, S + K])
+            .expand([B, S + K])
+        )
+        startend = paddle.full([B, 1, S, 1], S, dtype="int32")
+        mtp_mask = paddle.ones([B, K, S], dtype="int32")
+        mtp_mask[:, :, -2:] = 0
+        mtp_startend = paddle.full([B, K, S, 1], S, dtype="int32")
+
+        pipe = NoPipelineParallel(model, strategy)
+        data = (
+            {
+                "input_ids": [input_ids],
+                "position_ids": [position_ids],
+                "labels": [labels],
+                "attn_mask_startend_row_indices": [startend],
+                "mtp_startend_row_indices_all": [mtp_startend],
+                "mtp_hidden_inputs_mask_all": [mtp_mask],
+            },
+            [labels],
+        )
+        loss = pipe.forward_backward_pipeline(data)
+        return model, loss
+
+    def test_mtp_and_dspark_train_together(self):
+        from paddlefleet.transformer.multi_token_prediction import (
+            MultiTokenPredictionLayer,
+        )
+
+        variants = (
+            {"separate_mtp_input": True},
+            {},
+            {"K": 2},
+            {"separate_mtp_input": True, "mtp_shared_last_layer": True},
+        )
+        for extra in variants:
+            with self.subTest(**extra):
+                model, loss = self._build_and_run_with_mtp(**extra)
+                self.assertTrue(np.isfinite(float(loss)))
+                for layer_type, count in (
+                    (MultiTokenPredictionLayer, extra.get("K", 1)),
+                    (pm.DsparkPredictionLayer, 1),
+                ):
+                    layers = [
+                        m for m in model.sublayers() if type(m) is layer_type
+                    ]
+                    self.assertEqual(len(layers), count, layer_type.__name__)
+                    for layer in layers:
+                        # Routed experts the router never picked on this tiny
+                        # batch legitimately get no gradient.
+                        missing = [
+                            name
+                            for name, param in layer.named_parameters()
+                            if param.grad is None and ".experts." not in name
+                        ]
+                        self.assertEqual(
+                            missing,
+                            [],
+                            f"{layer_type.__name__} has no gradient",
+                        )
+
     def test_config_selects_the_weight_type_actually_optimized(self):
         """``dspark_loss_weight_type`` must reach the loss, not sit unused.
 
@@ -293,6 +384,47 @@ class TestDsparkEndToEndModel(unittest.TestCase):
             for profile in seen:
                 self.assertEqual(profile.weight_type, weight_type)
                 self.assertAlmostEqual(profile.dpace_alpha, 0.25)
+
+    def test_config_selects_the_selector_loss_alpha_actually_optimized(self):
+        """``dspark_selector_loss_alpha`` must reach the loss only under the selector.
+
+        A wrong condition or a constant 0.0 would leave ``selector_enabled``
+        False in ``compute_dspark_loss``, so the selector term would silently
+        drop out of training while every loss value stays finite.
+        """
+        from paddlefleet.utils.dspark import dspark_losses
+
+        seen = []
+        real = dspark_losses.compute_dspark_loss
+
+        def _spy(output, profile=None, **kwargs):
+            seen.append(profile)
+            return real(output, profile, **kwargs)
+
+        cases = (
+            (
+                {
+                    "dspark_refiner_type": "candidate_selector",
+                    "dspark_selector_top_k": 4,
+                },
+                0.5,
+            ),
+            ({"dspark_refiner_type": "markov_head"}, 0.0),
+        )
+        for refiner_overrides, expected_alpha in cases:
+            seen.clear()
+            with mock.patch.object(dspark_losses, "compute_dspark_loss", _spy):
+                _, loss = self._build_and_run(
+                    add_dspark_loss=True,
+                    dspark_selector_loss_alpha=0.5,
+                    **refiner_overrides,
+                )
+            self.assertTrue(np.isfinite(float(loss)))
+            self.assertTrue(seen, "DSpark loss was never computed")
+            for profile in seen:
+                self.assertAlmostEqual(
+                    profile.selector_loss_alpha, expected_alpha
+                )
 
 
 class TestDsparkSharedLayerAssembly(unittest.TestCase):

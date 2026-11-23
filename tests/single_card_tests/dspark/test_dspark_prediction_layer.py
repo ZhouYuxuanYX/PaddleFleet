@@ -138,18 +138,26 @@ def _make_config(**overrides):
     return config
 
 
+def _mtp_overrides(k):
+    # The target's per-layer CSA ratios carry one entry per MTP depth.
+    return {
+        "num_nextn_predict_layers": k,
+        "csa_compress_ratios": [0] * (3 + k),
+    }
+
+
 class TestDsparkConfigGuards(unittest.TestCase):
     """``TransformerConfig.__post_init__`` guards around the DSpark switch."""
 
-    def test_mtp_target_is_rejected_when_dspark_is_active(self):
-        # The draft reads main-stream input_ids/labels, but an MTP target
-        # appends its K-token tail to them; the combination is refused rather
-        # than left to the draft's coordinate handling.
+    def test_mtp_target_builds_with_dspark(self):
+        config = _make_config(**_mtp_overrides(2))
+        self.assertEqual(int(config.num_nextn_predict_layers), 2)
+        self.assertTrue(config.dspark_target_layer_ids)
+
+    def test_magic_send_mtp_is_rejected_when_dspark_is_active(self):
         with self.assertRaises(ValueError) as caught:
-            _make_config(num_nextn_predict_layers=2)
-        message = str(caught.exception)
-        self.assertIn("num_nextn_predict_layers==0", message)
-        self.assertIn("DSpark", message)
+            _make_config(**_mtp_overrides(1), enable_mtp_magic_send=True)
+        self.assertIn("enable_mtp_magic_send", str(caught.exception))
 
     def test_dspark_without_mtp_builds(self):
         config = _make_config()
@@ -293,6 +301,120 @@ class TestDsparkPredictionLayer(unittest.TestCase):
         self.assertIsNotNone(layer.feature_projection.weight.grad)
         self.assertIsNone(head_w.grad)  # shared, read-only
         self.assertIsNone(emb_w.grad)  # shared, read-only
+
+
+class TestDsparkRefinerAndConfidenceSwitch(unittest.TestCase):
+    """``dspark_refiner_type`` / ``dspark_confidence_head`` pick what is built."""
+
+    def _run(self, **overrides):
+        model_parallel_cuda_manual_seed(42, tp_rank=0, ep_rank=0, etp_rank=0)
+        paddle.seed(42)
+        config = _make_config(**overrides)
+        config.dspark_num_anchors = 4
+        layer = pm.DsparkPredictionLayer(config, vocab_size=_V, layer_number=0)
+        B, S = 1, 16
+        rng = np.random.default_rng(0)
+        ids = paddle.to_tensor(rng.integers(1, _V, size=(B, S)).astype("int64"))
+        labels = paddle.to_tensor(
+            rng.integers(1, _V, size=(B, S)).astype("int64")
+        )
+        feats = paddle.randn([B, S, len(config.dspark_target_layer_ids) * _H])
+        final_hidden = paddle.randn([B, S, _H])
+        feats.stop_gradient = True
+        final_hidden.stop_gradient = True
+        dict_args = {
+            "input_ids": ids,
+            "labels": labels,
+            "position_ids": paddle.arange(S, dtype="int64")
+            .reshape([1, S])
+            .expand([B, S]),
+            "dspark_features": feats,
+            "dspark_final_hidden": final_hidden,
+            "dspark_embedding_weight": paddle.randn([_V, _H]),
+            "dspark_head_weight": paddle.randn([_V, _H]),
+            "hidden_states": paddle.randn([B, S, _NRS * _H]),
+        }
+        out = layer.forward(dict_args)["dspark_out"]
+        return config, layer, out
+
+    @staticmethod
+    def _loss(out, **profile):
+        return compute_dspark_loss(
+            DrafterOutput(
+                draft_logits=None,
+                target_ids=out["target_ids"],
+                eval_mask=out["eval_mask"],
+                block_keep_mask=out["block_keep_mask"],
+                confidence_pred=out["confidence_pred"],
+                draft_hidden_states=out["draft_hidden_states"],
+                aligned_target_hidden_states=out[
+                    "aligned_target_hidden_states"
+                ],
+                previous_token_ids=out["previous_token_ids"],
+                logits_projection=out["logits_projection"],
+                markov_head=out["markov_head"],
+                candidate_selector=out["candidate_selector"],
+            ),
+            LossProfile(**profile),
+        )
+
+    def test_default_builds_markov_head_and_confidence_head(self):
+        _, layer, out = self._run()
+        self.assertIsInstance(layer.markov_head, pm.MarkovHead)
+        self.assertIsNone(layer.candidate_selector)
+        self.assertIs(layer.refiner, layer.markov_head)
+        self.assertIsNotNone(layer.confidence_head)
+        self.assertIsNotNone(out["confidence_pred"])
+
+    def test_candidate_selector_replaces_markov_head_and_trains(self):
+        _, layer, out = self._run(
+            dspark_refiner_type="candidate_selector", dspark_selector_top_k=4
+        )
+        self.assertIsNone(layer.markov_head)
+        self.assertIsInstance(layer.candidate_selector, pm.CandidateSelector)
+        self.assertIs(layer.refiner, layer.candidate_selector)
+        self.assertEqual(layer.candidate_selector.top_k, 4)
+        self.assertIsNone(out["markov_head"])
+        self.assertIsNotNone(out["confidence_pred"])
+        loss = self._loss(out, selector_loss_alpha=1.0)
+        self.assertTrue(np.isfinite(float(loss)))
+        loss.backward()
+        self.assertIsNotNone(layer.feature_projection.weight.grad)
+        self.assertIsNotNone(
+            layer.candidate_selector.hidden_projection.weight.grad
+        )
+        self.assertIsNotNone(layer.confidence_head.proj.weight.grad)
+
+    def test_confidence_head_can_be_disabled(self):
+        _, layer, out = self._run(dspark_confidence_head=False)
+        self.assertIsNone(layer.confidence_head)
+        self.assertIsNone(out["confidence_pred"])
+        loss = self._loss(out)
+        self.assertTrue(np.isfinite(float(loss)))
+        loss.backward()
+        self.assertIsNotNone(layer.markov_head.markov_w2.weight.grad)
+
+    def test_invalid_refiner_configs_are_rejected(self):
+        cases = {
+            "unknown_type": {"dspark_refiner_type": "nope"},
+            "selector_without_loss": {
+                "dspark_refiner_type": "candidate_selector",
+                "dspark_selector_loss_alpha": 0.0,
+            },
+            "selector_top_k_zero": {
+                "dspark_refiner_type": "candidate_selector",
+                "dspark_selector_top_k": 0,
+            },
+        }
+        for name, overrides in cases.items():
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                _make_config(**overrides)
+
+    def test_selector_knobs_are_inert_under_markov_head(self):
+        config = _make_config(
+            dspark_selector_top_k=0, dspark_selector_loss_alpha=0.0
+        )
+        self.assertEqual(config.dspark_refiner_type, "markov_head")
 
 
 class TestDsparkForwardCpFrame(unittest.TestCase):
@@ -502,6 +624,205 @@ class TestDsparkForwardCpFrame(unittest.TestCase):
 
 _STEP_KEYS = ("TRAINER_GLOBAL_STEP", "PDC_INIT_STEP")
 _R = 16  # dspark_markov_rank in _make_config()
+
+
+class TestDsparkForwardMtpTail(unittest.TestCase):
+    """An MTP target hands the draft [main + K] ids; the draft reads the main prefix."""
+
+    def _setup(self, mtp, cp_size):
+        model_parallel_cuda_manual_seed(42, tp_rank=0, ep_rank=0, etp_rank=0)
+        paddle.seed(42)
+        config = _make_config(**_mtp_overrides(mtp))
+        config.dspark_num_anchors = 4
+        config.cp_balance_mode = "contiguous_allgather"
+        layer = pm.DsparkPredictionLayer(config, vocab_size=_V, layer_number=0)
+        layer._pg_collection = types.SimpleNamespace(
+            cp=types.SimpleNamespace(rank=0, nranks=cp_size)
+        )
+        B, S = 1, 16
+        F = len(config.dspark_target_layer_ids) * _H
+        rng = np.random.default_rng(0)
+        total = S * cp_size
+        ids = paddle.to_tensor(
+            rng.integers(1, _V, size=(B, total + mtp)).astype("int64")
+        )
+        labels = paddle.to_tensor(
+            rng.integers(1, _V, size=(B, total + mtp)).astype("int64")
+        )
+        feats = paddle.randn([B, S, F])
+        feats.stop_gradient = True
+        final_hidden = paddle.randn([B, S, _H])
+        final_hidden.stop_gradient = True
+        shared = {
+            "attn_mask_startend_row_indices": paddle.full(
+                [1, total], total, dtype="int64"
+            ),
+            "dspark_features": feats,
+            "dspark_final_hidden": final_hidden,
+            "dspark_embedding_weight": paddle.randn([_V, _H]),
+            "dspark_head_weight": paddle.randn([_V, _H]),
+            "hidden_states": paddle.randn([B, S, _NRS * _H]),
+        }
+        return config, layer, ids, labels, shared, total
+
+    def _forward(
+        self, config, layer, shared, ids, labels, position_ids, dataflow
+    ):
+        config.experimental_dataflow = dataflow
+        args = {**shared, "input_ids": ids, "labels": labels}
+        if position_ids is not None:
+            args["position_ids"] = position_ids
+        return layer.forward(args)["dspark_out"]
+
+    def test_tail_is_dropped_under_global_ids(self):
+        for cp_size in (1, 2):
+            with self.subTest(cp_size=cp_size):
+                config, layer, ids, labels, shared, total = self._setup(
+                    1, cp_size
+                )
+                # Same draft, same weights, no MTP: the reference sees main ids only.
+                ref_config, ref_layer, _, _, _, _ = self._setup(0, cp_size)
+                ref_layer.set_state_dict(layer.state_dict())
+                pos = paddle.arange(total + 1, dtype="int64").reshape(
+                    [1, total + 1]
+                )
+                dataflow = cp_size > 1
+                # position_ids may arrive with or without the tail.
+                for position_ids in (pos, pos[:, :total]):
+                    with_tail = self._forward(
+                        config,
+                        layer,
+                        shared,
+                        ids,
+                        labels,
+                        position_ids,
+                        dataflow,
+                    )
+                    main_only = self._forward(
+                        ref_config,
+                        ref_layer,
+                        shared,
+                        ids[:, :total],
+                        labels[:, :total],
+                        pos[:, :total],
+                        dataflow,
+                    )
+                    for key in (
+                        "target_ids",
+                        "eval_mask",
+                        "previous_token_ids",
+                    ):
+                        np.testing.assert_array_equal(
+                            with_tail[key].numpy(), main_only[key].numpy()
+                        )
+                    np.testing.assert_allclose(
+                        with_tail["draft_hidden_states"].numpy(),
+                        main_only["draft_hidden_states"].numpy(),
+                        rtol=1e-6,
+                        atol=1e-6,
+                    )
+
+    def test_startend_mask_with_or_without_tail_matches_main_only(self):
+        for cp_size in (1, 2):
+            config, layer, ids, labels, shared, total = self._setup(1, cp_size)
+            ref_config, ref_layer, _, _, _, _ = self._setup(0, cp_size)
+            ref_layer.set_state_dict(layer.state_dict())
+            pos = paddle.arange(total, dtype="int64").reshape([1, total])
+            dataflow = cp_size > 1
+            # Default (non-flexible) layout, main + K long: tokens [0, 12) end
+            # at row 12, tokens [12, total) end at row total, and the K tail
+            # row ends at total + 1. Only the boundary at 12 matters for the
+            # draft's doc start; the tail row is what must be stripped.
+            rows = [12] * 12 + [total] * (total - 12) + [total + 1]
+            full = paddle.to_tensor(np.asarray(rows, dtype="int32"))
+            main_rows = full[:total]
+            masks = {
+                "4d_with_tail": full.reshape([1, 1, total + 1, 1]),
+                "4d_main_only": main_rows.reshape([1, 1, total, 1]),
+                "2d_with_tail": full.reshape([1, total + 1]),
+                "2d_main_only": main_rows.reshape([1, total]),
+            }
+            ref_out = self._forward(
+                ref_config,
+                ref_layer,
+                {
+                    **shared,
+                    "attn_mask_startend_row_indices": masks["4d_main_only"],
+                },
+                ids[:, :total],
+                labels[:, :total],
+                pos,
+                dataflow,
+            )
+            for name, mask in masks.items():
+                with self.subTest(cp_size=cp_size, mask=name):
+                    out = self._forward(
+                        config,
+                        layer,
+                        {**shared, "attn_mask_startend_row_indices": mask},
+                        ids,
+                        labels,
+                        pos,
+                        dataflow,
+                    )
+                    np.testing.assert_allclose(
+                        out["draft_hidden_states"].numpy(),
+                        ref_out["draft_hidden_states"].numpy(),
+                        rtol=1e-6,
+                        atol=1e-6,
+                    )
+
+    def test_startend_mask_with_unexpected_length_is_rejected(self):
+        config, layer, ids, labels, shared, total = self._setup(1, 2)
+        pos = paddle.arange(total, dtype="int64").reshape([1, total])
+        # A LOCAL-coordinate mask under CP=2: neither main nor main + K long.
+        local_mask = paddle.full(
+            [1, 1, total // 2, 1], total // 2, dtype="int32"
+        )
+        with self.assertRaisesRegex(ValueError, "must be GLOBAL"):
+            self._forward(
+                config,
+                layer,
+                {**shared, "attn_mask_startend_row_indices": local_mask},
+                ids,
+                labels,
+                pos,
+                True,
+            )
+
+    def test_position_ids_without_tail_are_accepted(self):
+        config, layer, ids, labels, shared, total = self._setup(2, 1)
+        pos = paddle.arange(total, dtype="int64").reshape([1, total])
+        out = self._forward(config, layer, shared, ids, labels, pos, False)
+        self.assertEqual(int(out["target_ids"].shape[0]), 1)
+
+    def test_erndata_appends_no_tail(self):
+        config, layer, ids, labels, shared, total = self._setup(1, 1)
+        config.use_erndata = True
+        args = {
+            **shared,
+            "input_ids": ids[:, :total],
+            "labels": labels[:, :total],
+        }
+        layer.forward(args)
+
+    def test_ids_without_the_declared_tail_are_rejected(self):
+        config, layer, ids, labels, shared, total = self._setup(2, 1)
+        with self.assertRaisesRegex(ValueError, "2-token MTP tail"):
+            self._forward(
+                config,
+                layer,
+                shared,
+                ids[:, :total],
+                labels[:, :total],
+                None,
+                False,
+            )
+
+    def test_loader_sharded_mtp_batch_is_rejected(self):
+        config, layer, ids, labels, shared, total = self._setup(1, 2)
+        with self.assertRaisesRegex(ValueError, "use_erndata=True"):
+            self._forward(config, layer, shared, ids, labels, None, False)
 
 
 class TestDsparkGlobalStep(unittest.TestCase):

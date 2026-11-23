@@ -486,14 +486,48 @@ class TransformerConfig(ModelParallelConfig):
     """
 
     dspark_markov_rank: int = 256
-    """Rank of the default Markov transition refiner (``MarkovHead``).
+    """Shared rank of the DSpark refiner and the confidence head.
 
-    The refiner adds a low-rank transition term ``w2 @ w1[prev_token]`` to the
-    draft logits, with ``w1`` of shape ``[vocab, rank]`` and ``w2`` of shape
-    ``[rank, vocab]``. Default 256 trades refiner capacity against parameter
-    count and memory; larger values cost more at both ends. Must be a positive
-    integer.
+    With ``dspark_refiner_type == "markov_head"`` (``MarkovHead``) the refiner
+    adds a low-rank transition term ``w2 @ w1[prev_token]`` to the draft
+    logits, with ``w1`` of shape ``[vocab, rank]`` and ``w2`` of shape
+    ``[rank, vocab]``. With ``"candidate_selector"`` it is the ``state_rank`` of
+    ``CandidateSelector`` (``predecessor_codebook`` / ``successor_codebook``
+    of shape ``[vocab, rank]``). In both modes it is also the width of the
+    predecessor embedding concatenated into the confidence head input
+    (``dspark_confidence_head``). Default 256 trades refiner capacity against
+    parameter count and memory; larger values cost more at both ends. Must be
+    a positive integer.
     """
+
+    dspark_refiner_type: Literal["markov_head", "candidate_selector"] = (
+        "markov_head"
+    )
+    """Which refiner the draft uses on top of its unary logits.
+
+    ``"markov_head"`` (default): dense low-rank transition term over the full
+    vocabulary (``MarkovHead``). ``"candidate_selector"``: re-rank the unary
+    top-``dspark_selector_top_k`` candidates with a low-rank predecessor /
+    successor score (``CandidateSelector``), trained by the selector term of
+    the DSpark loss (``dspark_selector_loss_alpha``). Exactly one refiner is
+    built. Both take their rank from ``dspark_markov_rank``.
+    """
+
+    dspark_selector_top_k: int = 16
+    """Candidate-set size of the ``candidate_selector`` refiner (ignored by
+    ``markov_head``). Must be >= 1 when ``dspark_refiner_type ==
+    "candidate_selector"``; not validated under ``markov_head``."""
+
+    dspark_selector_loss_alpha: float = 1.0
+    """Weight of the selector term inside the DSpark loss
+    (``LossProfile.selector_loss_alpha``). Only read when
+    ``dspark_refiner_type == "candidate_selector"``, where it must be > 0 or
+    the selector would never train; ignored by ``markov_head``."""
+
+    dspark_confidence_head: bool = True
+    """Whether the draft builds the per-token acceptance-confidence head.
+    When False the draft emits no ``confidence_pred`` and the confidence term
+    drops out of the DSpark loss."""
 
     dspark_loss_scaling_factor: float = 1.0
     """Multiplier applied to the DSpark distillation loss before backward.
@@ -2673,14 +2707,12 @@ class TransformerConfig(ModelParallelConfig):
                 )
         # Validate DSpark topology and target layers.
         if dspark_layers_active(self):
-            if int(getattr(self, "num_nextn_predict_layers", 0) or 0) != 0:
+            if self.enable_mtp_magic_send and mtp_layers_active(self):
                 raise ValueError(
-                    "DSpark requires num_nextn_predict_layers==0: the draft "
-                    "consumes the main-stream input_ids/labels, but an MTP "
-                    "target appends its K-token tail to those same tensors, "
-                    "which the draft's global/local CP coordinate handling "
-                    "does not reconcile. Got num_nextn_predict_layers="
-                    f"{self.num_nextn_predict_layers}."
+                    "DSpark + MTP does not support enable_mtp_magic_send: magic "
+                    "send is the pipeline_model_parallel_size>1 transport, while "
+                    "DSpark requires pipeline_model_parallel_size==1. Use "
+                    "separate_mtp_input or the default MTP layout."
                 )
             if int(getattr(self, "pipeline_model_parallel_size", 1)) != 1:
                 raise ValueError(
@@ -2713,6 +2745,29 @@ class TransformerConfig(ModelParallelConfig):
                     "dspark_dpace_alpha must be in [0, 1], got "
                     f"{self.dspark_dpace_alpha!r}."
                 )
+            if self.dspark_refiner_type not in {
+                "markov_head",
+                "candidate_selector",
+            }:
+                raise ValueError(
+                    f"dspark_refiner_type={self.dspark_refiner_type!r} is "
+                    "invalid. Must be one of "
+                    "{'markov_head', 'candidate_selector'}."
+                )
+            if self.dspark_refiner_type == "candidate_selector":
+                if int(self.dspark_selector_top_k) < 1:
+                    raise ValueError(
+                        "dspark_selector_top_k must be >= 1 for "
+                        "dspark_refiner_type='candidate_selector', got "
+                        f"{self.dspark_selector_top_k!r}."
+                    )
+                if not float(self.dspark_selector_loss_alpha) > 0:
+                    raise ValueError(
+                        "dspark_selector_loss_alpha must be > 0 for "
+                        "dspark_refiner_type='candidate_selector' (the "
+                        "selector would never train), got "
+                        f"{self.dspark_selector_loss_alpha!r}."
+                    )
         self.fp8_weight_quant_format = (
             _resolve_sonic_moe_fp8_weight_quant_format(
                 self.using_sonic_moe, self.fp8_weight_quant_format

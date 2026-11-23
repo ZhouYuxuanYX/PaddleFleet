@@ -298,6 +298,12 @@ tests:
   - test_case: [tests/multi_card_tests/test_mixed_sharding_optimizer.py]
     products:
       - num_gpus: 2
+  # MTP + DSpark under CP: setUpModule uses the world size as the CP/EP/sharding
+  # degree, so an unregistered run would take the 8-card default (CP=8, 8
+  # tokens per rank) instead of the CP=2 this case is written for.
+  - test_case: [tests/multi_card_tests/dspark/test_dspark_mtp_cp.py]
+    products:
+      - num_gpus: 2
   - test_case: [tests/multi_card_tests/test_hyperbody_encoder_cp_shard.py]
     products:
       - num_gpus: 4

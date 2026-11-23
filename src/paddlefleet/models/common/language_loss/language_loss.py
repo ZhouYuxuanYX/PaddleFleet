@@ -1669,6 +1669,11 @@ class DSparkLanguageLoss(LanguageLoss):
                     self.config, "dspark_loss_weight_type", "dpace"
                 ),
                 dpace_alpha=getattr(self.config, "dspark_dpace_alpha", 0.6),
+                selector_loss_alpha=(
+                    float(self.config.dspark_selector_loss_alpha)
+                    if output.candidate_selector is not None
+                    else 0.0
+                ),
             ),
             return_terms=True,
             normalization_group=normalization_group,

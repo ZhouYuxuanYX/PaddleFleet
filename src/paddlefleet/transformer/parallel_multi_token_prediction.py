@@ -37,6 +37,7 @@ from paddlefleet.transformer.hyper_connection import (
 )
 from paddlefleet.transformer.layer import FleetLayer
 from paddlefleet.transformer.paddle_norm import WrappedPaddleNorm
+from paddlefleet.transformer.transformer_config import mtp_layers_active
 from paddlefleet.utils.dspark.dspark_utils import (
     ReadOnlyProjection,
     build_draft_blocks,
@@ -161,12 +162,12 @@ class CandidateSelector(nn.Layer):
         successor = paddle.nn.functional.embedding(
             candidate_ids, self.successor_codebook
         )
-        predecessor = self.get_predecessor_embeddings(predecessor_ids)
+        predecessor = self.get_prev_embeddings(predecessor_ids)
         context = predecessor * self.hidden_projection(hidden_states)
         transition = paddle.einsum("...r,...kr->...k", context, successor)
         return unary_logits + transition
 
-    def get_predecessor_embeddings(self, token_ids: Tensor) -> Tensor:
+    def get_prev_embeddings(self, token_ids: Tensor) -> Tensor:
         """Return codebook states for predecessor token ids."""
 
         return paddle.nn.functional.embedding(
@@ -177,9 +178,9 @@ class CandidateSelector(nn.Layer):
 class ConfidenceHead(nn.Layer):
     """Predict a per-draft-token acceptance logit (confidence BCE target).
 
-    Input is the draft hidden, optionally concatenated with the refiner's
-    predecessor embedding (``confidence_head_with_markov/selector``); kept as a
-    plain bias-free linear to the scalar logit.
+    Input is the draft hidden concatenated with the active refiner's
+    predecessor embedding; kept as a plain bias-free linear to the scalar
+    logit.
     """
 
     def __init__(self, *, hidden_size: int, extra_rank: int = 0) -> None:
@@ -429,15 +430,43 @@ class DsparkPredictionLayer(FleetLayer):
             self.draft_config, self.hidden_size, self.draft_config.rms_norm_eps
         )
 
-        # Markov refinement is the default.
-        self.markov_head = MarkovHead(
-            self.vocab_size, int(config.dspark_markov_rank)
-        )
+        # Exactly one refiner, chosen by ``dspark_refiner_type``. Attribute names
+        # stay ``markov_head`` / ``candidate_selector`` (checkpoint keys).
+        self.markov_head = None
         self.candidate_selector = None
-        # Confidence prediction for each draft token.
-        self.confidence_head = ConfidenceHead(
-            hidden_size=self.hidden_size,
-            extra_rank=config.dspark_markov_rank,
+        if config.dspark_refiner_type == "markov_head":
+            self.markov_head = MarkovHead(
+                self.vocab_size, int(config.dspark_markov_rank)
+            )
+        elif config.dspark_refiner_type == "candidate_selector":
+            self.candidate_selector = CandidateSelector(
+                hidden_size=self.hidden_size,
+                vocab_size=self.vocab_size,
+                state_rank=int(config.dspark_markov_rank),
+                top_k=int(config.dspark_selector_top_k),
+                initializer_range=float(config.init_method_std),
+            )
+        else:
+            raise ValueError(
+                f"Unknown dspark_refiner_type={config.dspark_refiner_type!r}."
+            )
+        # Confidence prediction for each draft token (optional).
+        self.confidence_head = (
+            ConfidenceHead(
+                hidden_size=self.hidden_size,
+                extra_rank=config.dspark_markov_rank,
+            )
+            if config.dspark_confidence_head
+            else None
+        )
+
+    @property
+    def refiner(self):
+        """The active refiner module (``MarkovHead`` or ``CandidateSelector``)."""
+        return (
+            self.markov_head
+            if self.markov_head is not None
+            else self.candidate_selector
         )
 
     def forward(self, dict_args: dict):
@@ -471,6 +500,20 @@ class DsparkPredictionLayer(FleetLayer):
         cp_source = cp_shard_source(self.config, cp_size=cp_size)
         global_ids = cp_source in ("scatter", "local")
         expected = sq * cp_size if global_ids else sq
+        position_ids = dict_args.get("position_ids")
+        (
+            input_ids,
+            labels,
+            position_ids,
+            attn_mask_startend_row_indices,
+        ) = self._drop_mtp_tail(
+            input_ids,
+            labels,
+            position_ids,
+            attn_mask_startend_row_indices,
+            cp_source=cp_source,
+            expected=expected,
+        )
         for name, tensor in (("input_ids", input_ids), ("labels", labels)):
             if tensor is None:
                 continue
@@ -495,7 +538,6 @@ class DsparkPredictionLayer(FleetLayer):
         # position_ids rides the same contract. A 1D-RoPE reader produces no
         # such key, in which case the local frame is stated explicitly; it must
         # be the same tensor for build_draft_blocks and the backbone.
-        position_ids = dict_args.get("position_ids")
         if position_ids is not None:
             if int(position_ids.shape[-1]) != expected:
                 raise ValueError(
@@ -592,6 +634,103 @@ class DsparkPredictionLayer(FleetLayer):
             "confidence_pred": confidence_pred,
         }
         return dict_args
+
+    def _drop_mtp_tail(
+        self,
+        input_ids,
+        labels,
+        position_ids,
+        attn_mask_startend_row_indices,
+        *,
+        cp_source,
+        expected,
+    ):
+        """Drop the [main + K] MTP tail so the draft reads the main prefix.
+
+        An MTP target ships input_ids / labels as [main + K]: the K-token tail
+        only feeds the MTP depths. The tail is declared by config (erndata rolls
+        inside the MTP layer and appends nothing); position_ids and the startend
+        mask may or may not carry it, so each is trimmed only when it does. A
+        loader-sharded CP batch would have split the tail across ranks.
+        """
+        if not (
+            mtp_layers_active(self.config)
+            and not getattr(self.config, "use_erndata", False)
+        ):
+            return (
+                input_ids,
+                labels,
+                position_ids,
+                attn_mask_startend_row_indices,
+            )
+        tail = int(self.config.num_nextn_predict_layers)
+        if cp_source == "loader":
+            # Backstop for the TransformerConfig check of the same name: cp_size
+            # here is the runtime CP group, so it still fires for a config that
+            # skipped __post_init__ validation.
+            raise ValueError(
+                "MTP with context_parallel_size>1 requires "
+                "experimental_dataflow=True or use_erndata=True: the "
+                "loader-sharded batch has split the MTP tail across CP ranks."
+            )
+        input_ids = self._strip_mtp_tail(
+            input_ids, "input_ids", expected, tail, axis=1
+        )
+        labels = self._strip_mtp_tail(labels, "labels", expected, tail, axis=1)
+        if position_ids is not None and int(position_ids.shape[-1]) == (
+            expected + tail
+        ):
+            position_ids = position_ids[..., :expected].contiguous()
+        attn_mask_startend_row_indices = self._strip_mtp_tail_from_mask(
+            attn_mask_startend_row_indices, expected, tail
+        )
+        return (
+            input_ids,
+            labels,
+            position_ids,
+            attn_mask_startend_row_indices,
+        )
+
+    @staticmethod
+    def _strip_mtp_tail(tensor, name, main_len, tail, *, axis):
+        """Drop the trailing MTP tokens, requiring exactly ``main_len + tail``."""
+        if tensor is None:
+            return tensor
+        length = int(tensor.shape[axis])
+        if length != main_len + tail:
+            raise ValueError(
+                f"{name} must carry the {tail}-token MTP tail: expected seq "
+                f"len {main_len} + {tail}, got {tuple(tensor.shape)}."
+            )
+        index = [slice(None)] * len(tensor.shape)
+        index[axis] = slice(0, main_len)
+        return tensor[tuple(index)].contiguous()
+
+    @staticmethod
+    def _strip_mtp_tail_from_mask(mask, main_len, tail):
+        """Drop the MTP tail rows of a startend mask, only if it carries them.
+
+        The default collate layout builds the main mask at ``main + tail``
+        (``mtp_attention_flexible=False``), while the flexible layout builds it
+        at ``main``; either reaches the draft and any other length is rejected.
+        The sequence axis is 2 for ``[B, 1, S, 1]`` and the last axis for
+        ``[B, S]``.
+        """
+        if mask is None:
+            return mask
+        axis = 2 if len(mask.shape) == 4 else len(mask.shape) - 1
+        length = int(mask.shape[axis])
+        if length == main_len:
+            return mask
+        if length != main_len + tail:
+            raise ValueError(
+                "attn_mask_startend_row_indices must be GLOBAL and "
+                f"{main_len} (main) or {main_len + tail} (main + {tail}-token "
+                f"MTP tail) long on the sequence axis, got {tuple(mask.shape)}."
+            )
+        index = [slice(None)] * len(mask.shape)
+        index[axis] = slice(0, main_len)
+        return mask[tuple(index)].contiguous()
 
     def _resolve_inputs(self, dict_args):
         """Resolve captured or directly supplied draft inputs.
@@ -774,7 +913,7 @@ class DsparkPredictionLayer(FleetLayer):
         draft_hidden = self.final_norm(contracted)
         confidence = None
         if self.confidence_head is not None:
-            prev_emb = self.markov_head.get_prev_embeddings(
+            prev_emb = self.refiner.get_prev_embeddings(
                 blocks.previous_token_ids
             )
             prev_emb = prev_emb.astype(contracted.dtype)
