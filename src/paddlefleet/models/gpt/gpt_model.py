@@ -852,6 +852,7 @@ class GPTModel(PipelineLayer):
         # because the draft's head pass-through desc needs it.
         if tie_word_embeddings or spec.mtp_lm_head:
             head_key = "embed"
+            head_name = f"{name_prefix}.shared_head"
         elif has_draft:
             # Deliberately distinct from embed_key: paddle keeps only the first
             # instance registered per key and reuses it for every later desc, so
@@ -859,8 +860,17 @@ class GPTModel(PipelineLayer):
             # embedding. The guard below rejects the configuration that would
             # collide.
             head_key = "dspark_lm_head"
+            # The draft only adds a second desc for the same head instance, so
+            # its parameters keep the plain ``lm_head`` name and a checkpoint
+            # written without a draft loads as is. Older DSpark DCP
+            # checkpoints named the head ``model.shared_head.*``; they no
+            # longer load directly (the head keys only get a missing-key
+            # warning). Rename the key prefix ``model.shared_head.`` to
+            # ``model.lm_head.`` to load them.
+            head_name = f"{name_prefix}.lm_head"
         else:
             head_key = None
+            head_name = f"{name_prefix}.lm_head"
         if has_draft and head_key == embed_key:
             raise NotImplementedError(
                 "DSpark cannot share the embedding and the LM head under one "
@@ -904,7 +914,7 @@ class GPTModel(PipelineLayer):
                     forward_func=dspark_share_lm_head,
                     shared_weight_attr=lmhead_shared_weights,
                 ),
-                f"{name_prefix}.shared_head",
+                head_name,
             )
         for dspark_spec in dspark_specs:
             desc = LayerDesc(dspark_spec)
@@ -945,11 +955,11 @@ class GPTModel(PipelineLayer):
                     spec.lm_head,
                     shared_weight_attr=lmhead_shared_weights,
                 ),
-                f"{name_prefix}.shared_head",
+                head_name,
             )
         else:
             self.add_sequential_layer(
-                layers, LayerDesc(spec.lm_head), f"{name_prefix}.lm_head"
+                layers, LayerDesc(spec.lm_head), head_name
             )
 
         return layers

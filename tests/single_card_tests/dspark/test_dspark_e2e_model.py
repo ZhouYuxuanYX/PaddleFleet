@@ -466,6 +466,13 @@ class TestDsparkSharedLayerAssembly(unittest.TestCase):
         # so the head position runs the very object built next to the draft.
         self.assertEqual(sum(1 for rf in model.run_function if rf is head), 1)
         self.assertIsNot(embed.embedding_weight, head.weight)
+        # The checkpoint keys keep the head name of a model without a draft,
+        # so such a checkpoint loads its head as is.
+        keys = list(model.state_dict().keys())
+        self.assertIn("model.lm_head.weight", keys)
+        self.assertEqual(
+            [k for k in keys if k.startswith("model.shared_head.")], []
+        )
 
         # Capture what the draft is actually handed during a real forward.
         captured = {}
@@ -514,16 +521,21 @@ class TestDsparkSharedLayerAssembly(unittest.TestCase):
 
 
 class _RecordingGPT:
-    """Stub ``self`` that records each desc's shared key, if it has one."""
+    """Stub ``self`` that records each desc's shared key, if it has one.
+
+    The parameter name prefix of each desc goes to ``names`` in the same order.
+    """
 
     def __init__(self, config):
         self.config = config
+        self.names = []
 
     def _model_name_prefix(self):
         return "model"
 
     def add_sequential_layer(self, layers, desc, name_prefix):
         layers.append(getattr(desc, "layer_name", None))
+        self.names.append(name_prefix)
 
 
 def _assembly_config(**overrides):
@@ -568,6 +580,13 @@ class TestDsparkSharedKeyPromotion(unittest.TestCase):
     """
 
     def _keys(self, config, spec, tie_word_embeddings):
+        return [
+            key for key, _ in self._descs(config, spec, tie_word_embeddings)
+        ]
+
+    def _descs(self, config, spec, tie_word_embeddings):
+        """``(shared key, name prefix)`` of every desc, in order."""
+        recorder = _RecordingGPT(config)
         with (
             mock.patch.object(gm, "LayerDesc", lambda *a, **k: None),
             mock.patch.object(
@@ -576,9 +595,10 @@ class TestDsparkSharedKeyPromotion(unittest.TestCase):
                 lambda *a, **k: SimpleNamespace(layer_name=a[0] if a else None),
             ),
         ):
-            return gm.GPTModel.get_layer_desc_list(
-                _RecordingGPT(config), spec, tie_word_embeddings
+            keys = gm.GPTModel.get_layer_desc_list(
+                recorder, spec, tie_word_embeddings
             )
+        return list(zip(keys, recorder.names))
 
     def test_no_draft_keeps_embedding_and_head_unshared(self):
         keys = self._keys(
@@ -604,6 +624,28 @@ class TestDsparkSharedKeyPromotion(unittest.TestCase):
             True,
         )
         self.assertEqual(keys[-1], "dspark_lm_head")
+
+    def test_draft_keeps_lm_head_name(self):
+        # Sharing the head with the draft must not rename its parameters, or a
+        # checkpoint written without a draft has no head to load.
+        descs = self._descs(
+            _assembly_config(), _assembly_spec(has_draft=True), False
+        )
+        self.assertEqual(
+            [name for key, name in descs if key == "dspark_lm_head"],
+            ["model.lm_head", "model.lm_head"],
+        )
+
+    def test_no_draft_head_names_are_unchanged(self):
+        descs = self._descs(
+            _assembly_config(), _assembly_spec(has_draft=False), False
+        )
+        self.assertEqual(descs[-1], (None, "model.lm_head"))
+        # A head shared with the embedding still uses the shared_head name.
+        descs = self._descs(
+            _assembly_config(), _assembly_spec(has_draft=False), True
+        )
+        self.assertEqual(descs[-1], ("embed", "model.shared_head"))
 
     def test_tie_words_embeddings_with_draft_is_rejected(self):
         with self.assertRaisesRegex(NotImplementedError, "cannot share"):
