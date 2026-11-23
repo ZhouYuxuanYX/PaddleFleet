@@ -120,9 +120,10 @@ class TestReadOnlyProjection(unittest.TestCase):
             )
         self.assertIn("target SegLU requires both", str(caught.exception))
 
-    def test_target_transform_applies_seglu_but_draft_stays_raw(self):
-        # transform_target_logits adds bias then SegLU (teacher side); plain
-        # transform_logits / __call__ stay bias-only (draft side).
+    def test_target_transform_applies_bias_then_seglu(self):
+        # transform_target_logits adds bias then SegLU (the transform the DSpark
+        # loss applies to both draft and teacher); plain transform_logits only
+        # adds the bias.
         from paddlefleet.models.gpt.lm_head import SegLU
 
         weight = paddle.randn([_H, _V])
@@ -135,16 +136,34 @@ class TestReadOnlyProjection(unittest.TestCase):
             target_multimax_ts=ts,
         )
         logits = paddle.randn([_B, _V])
-        # Draft side: unchanged (no bias, no SegLU).
+        # transform_logits: unchanged (no bias here, and never SegLU).
         np.testing.assert_allclose(
             head.transform_logits(logits).numpy(), logits.numpy(), atol=1e-5
         )
-        # Teacher side: matches an explicit SegLU of the same logits.
+        # transform_target_logits: matches an explicit SegLU of the logits.
         np.testing.assert_allclose(
             head.transform_target_logits(logits).numpy(),
             SegLU(logits, ranges, ts).numpy(),
             atol=1e-5,
         )
+
+    def test_target_transform_does_not_train_the_seglu_params(self):
+        # The draft loss backpropagates through transform_target_logits, so
+        # live SegLU params must be detached and never receive gradient.
+        ranges = paddle.to_tensor([-1.0, 1.0, -2.0, 2.0], stop_gradient=False)
+        ts = paddle.to_tensor([0.1, 0.2, 0.3, 0.4], stop_gradient=False)
+        head = ReadOnlyProjection(
+            weight=paddle.randn([_H, _V]),
+            transpose_y=False,
+            target_multimax_ranges=ranges,
+            target_multimax_ts=ts,
+        )
+        logits = paddle.randn([_B, _V])
+        logits.stop_gradient = False
+        head.transform_target_logits(logits).sum().backward()
+        self.assertIsNotNone(logits.grad)
+        self.assertIsNone(ranges.grad)
+        self.assertIsNone(ts.grad)
 
 
 def _anchors(positions, keep_mask):

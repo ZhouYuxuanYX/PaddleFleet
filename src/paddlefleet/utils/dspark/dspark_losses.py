@@ -289,12 +289,14 @@ def _streamed_token_losses(
     )
     # Custom bound transforms can capture live target parameters. Only the
     # functional read-only protocol is accepted; never freeze a target module.
-    if transform_logits is not None and not getattr(
+    # transform_target_logits is the transform the loss actually applies (it
+    # falls back to transform_logits), and draft gradient flows through it.
+    if transform_target_logits is not None and not getattr(
         output.logits_projection, "dspark_readonly", False
     ):
         raise ValueError(
             "custom transforms require ReadOnlyProjection "
-            "(detached bias; SegLU on the teacher side only)"
+            "(detached bias and SegLU params)"
         )
     expected_hidden = int(projection_weight.shape[1 if transpose_y else 0])
     if (
@@ -376,13 +378,12 @@ def _streamed_token_losses(
         if markov_enabled:
             previous_embeddings = paddle.nn.functional.embedding(previous, w1)
             draft_logits = draft_logits + paddle.matmul(previous_embeddings, w2)
-        # Asymmetric head transform: the draft head adds only the bias at
-        # inference, while the teacher logits must match the main model's real
-        # output, which also applies SegLU. So draft gets bias-only and target
-        # gets bias+SegLU.
-        if transform_logits is not None:
-            draft_logits = transform_logits(draft_logits)
+        # Symmetric head transform: the draft head reuses the main model's
+        # multimax LM head at inference, so draft and teacher logits both get
+        # bias+SegLU. The SegLU params are detached, so only the draft logits
+        # (not ranges/ts) receive gradient through SegLU.
         if transform_target_logits is not None:
+            draft_logits = transform_target_logits(draft_logits)
             target_logits = transform_target_logits(target_logits)
         draft_logits = draft_logits.astype("float32")
         ce_per_token = paddle.nn.functional.cross_entropy(
@@ -401,16 +402,13 @@ def _streamed_token_losses(
         selector_covered = paddle.zeros_like(ce_per_token)
         selector_correct = paddle.zeros_like(ce_per_token)
         if selector_enabled:
-            # Candidate selector is mutually exclusive with the Markov head,
-            # so its unary scores are exactly the draft logits that already had
-            # the head bias added above. Reuse them instead of re-adding the
-            # bias a second time in every streamed chunk.
-            selector_unary = (
-                draft_logits if not markov_enabled else unary_logits
-            )
+            # Candidate selector is mutually exclusive with the Markov head
+            # (compute_dspark_loss rejects both), so its unary scores are
+            # exactly the draft logits that already went through the head
+            # bias+SegLU above. Reuse them instead of re-applying the head
+            # transform in every streamed chunk.
+            selector_unary = draft_logits
             selector_hidden = draft
-            if transform_logits is not None and markov_enabled:
-                selector_unary = transform_logits(selector_unary)
             if selector_stop_gradient:
                 selector_unary = selector_unary.detach()
                 selector_hidden = selector_hidden.detach()

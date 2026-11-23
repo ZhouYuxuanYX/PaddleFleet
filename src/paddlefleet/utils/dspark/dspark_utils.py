@@ -59,13 +59,13 @@ class ReadOnlyProjection:
     gradient or leaking gradient into the target; ``dspark_readonly`` marks that
     guarantee for the loss engine.
 
-    SegLU is asymmetric. The dspark draft head does NOT apply SegLU at inference,
-    so draft logits stay un-SegLU'd (``transform_logits`` = bias only). The
-    distillation teacher, however, is the MAIN model output, which DOES apply
-    SegLU; so ``target_multimax_ranges`` / ``target_multimax_ts`` carry the main
-    head's (detached) SegLU params and ``transform_target_logits`` re-applies
-    SegLU on the teacher side only. Mutating the underlying target weights before
-    backward is unsupported.
+    ``target_multimax_ranges`` / ``target_multimax_ts`` carry the main head's
+    (detached) SegLU params. ``transform_logits`` adds the bias only;
+    ``transform_target_logits`` adds the bias and then applies SegLU, matching
+    the main model's multimax LM head output. The DSpark loss applies
+    ``transform_target_logits`` to both draft and teacher logits, since the
+    draft reuses that head at inference. Mutating the underlying target weights
+    before backward is unsupported.
     """
 
     dspark_readonly = True
@@ -102,7 +102,7 @@ class ReadOnlyProjection:
                 object.__setattr__(self, name, value.detach())
 
     def transform_logits(self, logits):
-        """Draft-side transform: the detached head bias only (no SegLU)."""
+        """The detached head bias only (no SegLU)."""
         if self.bias is not None:
             # Match linear's autocast bias dtype, including streamed callers
             # that project first and call transform_logits directly.
@@ -110,10 +110,11 @@ class ReadOnlyProjection:
         return logits
 
     def transform_target_logits(self, logits):
-        """Teacher-side transform: head bias, then the main model's SegLU.
+        """Head bias, then the main model's SegLU.
 
-        Matches what the main model actually emits (``SegLU(x @ W + bias)``), so
-        the distill L1 target is the real teacher distribution.
+        Matches what the main model's multimax LM head actually emits
+        (``SegLU(x @ W + bias)``). The DSpark loss applies it to both the draft
+        and the teacher logits.
         """
         logits = self.transform_logits(logits)
         if self.target_multimax_ranges is None:

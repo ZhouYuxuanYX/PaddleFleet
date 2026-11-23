@@ -45,6 +45,7 @@ import paddle
 from paddlefleet.training.initialize import initialize_fleet
 from paddlefleet.transformer.parallel_multi_token_prediction import (
     CandidateSelector,
+    MarkovHead,
 )
 from paddlefleet.utils.dspark import dspark_losses as dl
 from paddlefleet.utils.dspark.dspark_losses import (
@@ -487,11 +488,11 @@ class TestMaterializedMatchesStreamed(unittest.TestCase):
                 msg=f"{name} ignores the projection bias in the streamed path",
             )
 
-    def test_streamed_target_gets_seglu_but_draft_stays_raw(self):
-        # Draft stays raw (the draft head skips SegLU at inference); the distill
-        # teacher is the main model output, which applies SegLU. Verify the
-        # forward AND the _ChunkedTokenLoss backward recompute, via loss values
-        # and hidden.grad, with a discriminating draft-also-SegLU reference.
+    def test_streamed_draft_and_target_both_get_seglu(self):
+        # The draft head reuses the main model's multimax LM head, so draft and
+        # teacher logits both go through SegLU. Verify the forward AND the
+        # _ChunkedTokenLoss backward recompute, via loss values and
+        # hidden.grad, with a discriminating draft-raw reference.
         from paddlefleet.models.gpt.lm_head import SegLU
 
         seed = 17
@@ -520,6 +521,10 @@ class TestMaterializedMatchesStreamed(unittest.TestCase):
                 ts,
             )
 
+        # Live (trainable) copies of the SegLU params: ReadOnlyProjection must
+        # detach them, so the draft loss never trains the main head's SegLU.
+        live_ranges = paddle.to_tensor(ranges.numpy(), stop_gradient=False)
+        live_ts = paddle.to_tensor(ts.numpy(), stop_gradient=False)
         hidden_s = _leaf()
         streamed = compute_dspark_loss(
             _streamed_output(
@@ -531,20 +536,26 @@ class TestMaterializedMatchesStreamed(unittest.TestCase):
                 projection=ReadOnlyProjection(
                     weight=weight,
                     transpose_y=True,
-                    target_multimax_ranges=ranges,
-                    target_multimax_ts=ts,
+                    target_multimax_ranges=live_ranges,
+                    target_multimax_ts=live_ts,
                 ),
             ),
             profile,
             return_terms=True,
         )
         streamed.loss.backward()
+        self.assertIsNone(live_ranges.grad, "SegLU ranges received gradient")
+        self.assertIsNone(live_ts.grad, "SegLU ts received gradient")
         hidden_m = _leaf()
         materialized = compute_dspark_loss(
             _materialized_output(
                 seed,
                 fields=fields,
-                draft_logits=paddle.matmul(hidden_m, weight, transpose_y=True),
+                draft_logits=SegLU(
+                    paddle.matmul(hidden_m, weight, transpose_y=True),
+                    ranges,
+                    ts,
+                ),
                 teacher_logits=_teacher_seglu(),
             ),
             profile,
@@ -557,9 +568,9 @@ class TestMaterializedMatchesStreamed(unittest.TestCase):
                 float(streamed.terms[name]),
                 float(materialized.terms[name]),
                 delta=_ATOL,
-                msg=f"{name}: target SegLU / draft-raw asymmetry not honored",
+                msg=f"{name}: draft/target SegLU not applied symmetrically",
             )
-        # Backward recompute must keep the draft raw too: hidden grads match.
+        # Backward recompute must apply SegLU to the draft too: grads match.
         self.assertIsNotNone(hidden_s.grad)
         self.assertIsNotNone(hidden_m.grad)
         self.assertGreater(float(paddle.abs(hidden_s.grad).max()), 0.0)
@@ -568,20 +579,18 @@ class TestMaterializedMatchesStreamed(unittest.TestCase):
             hidden_m.grad.numpy(),
             atol=_ATOL,
             rtol=_RTOL,
-            err_msg="draft-raw grad mismatch vs materialized reference",
+            err_msg="draft-SegLU grad mismatch vs materialized reference",
         )
-        # Discriminating check: a draft-also-SegLU reference must give a
-        # DIFFERENT hidden grad, otherwise the match above proves nothing about
-        # the draft skipping SegLU in the backward recompute.
+        # Discriminating check: a draft-raw reference must give a DIFFERENT
+        # hidden grad, otherwise the match above proves nothing about the
+        # draft applying SegLU in the backward recompute.
         hidden_wrong = _leaf()
         wrong = compute_dspark_loss(
             _materialized_output(
                 seed,
                 fields=fields,
-                draft_logits=SegLU(
-                    paddle.matmul(hidden_wrong, weight, transpose_y=True),
-                    ranges,
-                    ts,
+                draft_logits=paddle.matmul(
+                    hidden_wrong, weight, transpose_y=True
                 ),
                 teacher_logits=_teacher_seglu(),
             ),
@@ -596,7 +605,121 @@ class TestMaterializedMatchesStreamed(unittest.TestCase):
                 atol=_ATOL,
                 rtol=_RTOL,
             ),
-            "draft-raw and draft-SegLU grads coincide; test lacks power",
+            "draft-SegLU and draft-raw grads coincide; test lacks power",
+        )
+
+    def test_streamed_markov_term_is_added_before_seglu(self):
+        # With the Markov refiner the draft logits are
+        # SegLU(unary + markov + bias), the order the multimax head sees at
+        # inference. Pin it against a hand-written materialized reference, and
+        # check that SegLU(unary + bias) + markov is distinguishable.
+        from paddlefleet.models.gpt.lm_head import SegLU
+
+        seed = 19
+        paddle.seed(seed)
+        base_hidden = paddle.randn([_B, _A, _K, _H], dtype="float32")
+        teacher_hidden = paddle.randn([_B, _A, _K, _H], dtype="float32")
+        teacher_hidden.stop_gradient = True
+        weight = paddle.randn([_V, _H], dtype="float32")
+        bias = paddle.randn([_V], dtype="float32")
+        ranges = paddle.to_tensor([-1.0, 1.0, -2.0, 2.0], dtype="float32")
+        ts = paddle.to_tensor([0.1, 0.2, 0.3, 0.4], dtype="float32")
+        previous = paddle.randint(0, _V, [_B, _A, _K], dtype="int64")
+        fields = _fields(seed, drop_last=True)
+        profile = LossProfile(
+            probability_chunk_tokens=7, subbatch_sequence_length=3
+        )
+        markov = MarkovHead(vocab_size=_V, rank=_R)
+        # markov_w2 starts at zero; make the Markov term non-trivial.
+        markov.markov_w2.weight.set_value(
+            paddle.randn(markov.markov_w2.weight.shape, dtype="float32")
+        )
+
+        def _leaf():
+            h = base_hidden.detach()
+            h.stop_gradient = False
+            return h
+
+        def _markov_term():
+            with paddle.no_grad():
+                embeddings = paddle.nn.functional.embedding(
+                    previous, markov.markov_w1.weight
+                )
+                return paddle.matmul(embeddings, markov.markov_w2.weight)
+
+        def _materialized(draft_logits):
+            return compute_dspark_loss(
+                _materialized_output(
+                    seed,
+                    fields=fields,
+                    draft_logits=draft_logits,
+                    teacher_logits=SegLU(
+                        paddle.matmul(teacher_hidden, weight, transpose_y=True)
+                        + bias,
+                        ranges,
+                        ts,
+                    ),
+                ),
+                profile,
+                return_terms=True,
+            )
+
+        hidden_s = _leaf()
+        streamed = compute_dspark_loss(
+            _streamed_output(
+                seed,
+                fields=fields,
+                draft_hidden_states=hidden_s,
+                target_hidden_states=teacher_hidden,
+                previous_token_ids=previous,
+                projection=ReadOnlyProjection(
+                    weight=weight,
+                    transpose_y=True,
+                    bias=bias,
+                    target_multimax_ranges=ranges,
+                    target_multimax_ts=ts,
+                ),
+                markov_head=markov,
+            ),
+            profile,
+            return_terms=True,
+        )
+        streamed.loss.backward()
+        self.assertIsNotNone(markov.markov_w2.weight.grad)
+
+        hidden_m = _leaf()
+        unary_m = paddle.matmul(hidden_m, weight, transpose_y=True)
+        materialized = _materialized(
+            SegLU(unary_m + _markov_term() + bias, ranges, ts)
+        )
+        materialized.loss.backward()
+        for name in ("ce_loss", "l1_loss", "loss"):
+            self.assertAlmostEqual(
+                float(streamed.terms[name]),
+                float(materialized.terms[name]),
+                delta=_ATOL,
+                msg=f"{name}: Markov term not added before SegLU",
+            )
+        np.testing.assert_allclose(
+            hidden_s.grad.numpy(),
+            hidden_m.grad.numpy(),
+            atol=_ATOL,
+            rtol=_RTOL,
+            err_msg="Markov+SegLU grad mismatch vs materialized reference",
+        )
+
+        wrong = _materialized(
+            SegLU(
+                paddle.matmul(_leaf(), weight, transpose_y=True) + bias,
+                ranges,
+                ts,
+            )
+            + _markov_term()
+        )
+        self.assertGreater(
+            abs(float(streamed.terms["loss"]) - float(wrong.terms["loss"])),
+            1e-3,
+            "Markov-after-SegLU gives the same loss; test lacks power",
         )
 
 
@@ -760,6 +883,89 @@ class TestSelectorObjective(unittest.TestCase):
                 delta=_ATOL,
                 msg=f"{name} differs between the two selector paths",
             )
+
+    def test_streamed_selector_ranks_the_seglu_logits(self):
+        # With a multimax head the selector's unary top-k must come from the
+        # SegLU'd draft logits (SegLU is non-monotone and changes the set), so
+        # the streamed terms match a materialized SegLU reference and differ
+        # from a raw-logits one.
+        from paddlefleet.models.gpt.lm_head import SegLU
+
+        seed = 18
+        selector = _selector(seed=19)
+        fields = _fields(seed=seed, drop_last=True)
+        paddle.seed(seed)
+        hidden = paddle.randn([_B, _A, _K, _H])
+        teacher_hidden = paddle.randn([_B, _A, _K, _H])
+        weight = paddle.randn([_V, _H])
+        ranges = paddle.to_tensor([-1.0, 1.0, -2.0, 2.0], dtype="float32")
+        ts = paddle.to_tensor([0.1, 0.2, 0.3, 0.4], dtype="float32")
+        previous = self._previous()
+        profile = LossProfile(
+            selector_loss_alpha=0.5, subbatch_sequence_length=3
+        )
+
+        def _materialized(transform):
+            return compute_dspark_loss(
+                _materialized_output(
+                    seed,
+                    fields=fields,
+                    draft_logits=transform(
+                        paddle.matmul(hidden, weight, transpose_y=True)
+                    ),
+                    teacher_logits=SegLU(
+                        paddle.matmul(teacher_hidden, weight, transpose_y=True),
+                        ranges,
+                        ts,
+                    ),
+                    draft_hidden_states=hidden,
+                    previous_token_ids=previous,
+                    selector=selector,
+                ),
+                profile,
+                return_terms=True,
+            )
+
+        streamed = compute_dspark_loss(
+            _streamed_output(
+                seed,
+                fields=fields,
+                draft_hidden_states=hidden,
+                target_hidden_states=teacher_hidden,
+                previous_token_ids=previous,
+                projection=ReadOnlyProjection(
+                    weight=weight,
+                    transpose_y=True,
+                    target_multimax_ranges=ranges,
+                    target_multimax_ts=ts,
+                ),
+                selector=selector,
+            ),
+            profile,
+            return_terms=True,
+        )
+        reference = _materialized(lambda x: SegLU(x, ranges, ts))
+        names = (
+            "selector_loss",
+            "selector_accuracy_num",
+            "selector_coverage_num",
+            "selector_probability_num",
+        )
+        for name in names:
+            self.assertAlmostEqual(
+                float(streamed.terms[name]),
+                float(reference.terms[name]),
+                delta=_ATOL,
+                msg=f"{name}: selector does not rank the SegLU logits",
+            )
+        raw = _materialized(lambda x: x)
+        self.assertTrue(
+            any(
+                abs(float(streamed.terms[n]) - float(raw.terms[n])) > 1e-3
+                for n in names
+            ),
+            "SegLU and raw unary give the same selector terms; test lacks power",
+        )
 
     def test_streamed_selector_backward_reaches_the_codebooks(self):
         selector = _selector(seed=14)
@@ -932,6 +1138,19 @@ class TestStreamedGuards(unittest.TestCase):
         output = _streamed_output(seed=40, projection=projection)
         with self.assertRaises(ValueError):
             compute_dspark_loss(output)
+
+    def test_projection_must_be_readonly_for_a_target_only_transform(self):
+        # The loss applies transform_target_logits to the draft logits, so a
+        # projection exposing only that transform must also be read-only.
+        projection = types.SimpleNamespace(
+            weight=paddle.randn([_V, _H]),
+            transpose_y=True,
+            transform_target_logits=lambda logits: logits,
+        )
+        output = _streamed_output(seed=40, projection=projection)
+        with self.assertRaises(ValueError) as caught:
+            compute_dspark_loss(output)
+        self.assertIn("ReadOnlyProjection", str(caught.exception))
 
     def test_hidden_dimension_must_match_the_projection(self):
         output = _streamed_output(
