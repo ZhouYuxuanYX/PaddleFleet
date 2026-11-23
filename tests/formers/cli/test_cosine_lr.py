@@ -190,14 +190,11 @@ class CosineScheduleWithWarmupTest(unittest.TestCase):
         self.assertAlmostEqual(lr_full, 0.0, places=12)
         self.assertNotAlmostEqual(lr_half, lr_full, places=8)
 
-    @unittest.expectedFailure
     def test_post_schedule_stays_at_floor_CONTRACT(self):
         """Docstring says lr decreases 'to 0'; beyond T it must stay at floor.
 
-        Expected-failure: with num_cycles=0.5 and no clamp on ``progress``, at
-        step 1450 (p=1.5, cos(1.5*pi)=0) the actual lr rebounds to 1.0e-4 after
-        having reached 0 at step 1000. Asserting the intended monotone-to-floor
-        contract exposes this rebound. No production code is modified.
+        ``progress`` is clamped to 1, so at step 1450 the lr stays at the floor
+        instead of rebounding along the cosine (used to be an expected failure).
         """
         scheduler = get_cosine_schedule_with_warmup(
             learning_rate=2e-4,

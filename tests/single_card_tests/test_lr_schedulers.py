@@ -37,6 +37,7 @@ from paddlefleet.lr_schedulers import (
     register_lr_scheduler,
 )
 from paddlefleet.lr_schedulers.base import parse_finite_float
+from paddlefleet.lr_schedulers.cosine_lr import CosineLR
 
 LR = 1e-3
 WARMUP = 2
@@ -58,6 +59,14 @@ class TestParseSpec(unittest.TestCase):
 
     def test_accepted(self):
         self.assertEqual(parse_lr_scheduler_spec("cosine"), ("cosine", {}))
+        self.assertEqual(
+            parse_lr_scheduler_spec("cosine:8"),
+            ("cosine", {"num_decay_steps": 8}),
+        )
+        self.assertEqual(
+            parse_lr_scheduler_spec("cosine", num_decay_steps=8),
+            ("cosine", {"num_decay_steps": 8}),
+        )
         # Unset params are omitted: the ctor default applies.
         self.assertEqual(parse_lr_scheduler_spec("wsd"), ("wsd", {}))
         self.assertEqual(
@@ -87,7 +96,8 @@ class TestParseSpec(unittest.TestCase):
     def test_rejected(self):
         for spec in (
             "nope",  # unknown name
-            "cosine:1",  # takes no field
+            "cosine:1:2",  # one field only
+            "cosine:-1",  # negative decay steps
             "wsd:-1",  # negative steady steps
             "wsd:0.5",  # steady steps must be an int
             "wsd:1:2",  # one field only
@@ -153,6 +163,76 @@ class TestBuildGroupScheduler(unittest.TestCase):
                     max_steps=MAX_STEPS,
                     decay_function="1-sqrt",
                 )
+
+
+class TestCosineDecaySteps(unittest.TestCase):
+    """cosine:<num_decay_steps>: decay to min_lr at that step, then hold."""
+
+    def _lrs(self, sched, n):
+        out = []
+        for _ in range(n):
+            out.append(sched.get_lr())
+            sched.step()
+        return out
+
+    def test_matches_shorter_cosine_then_holds(self):
+        decay, total, min_lr = 6, 20, 1e-4
+        held = build_group_scheduler(
+            lr_scheduler=f"cosine:{decay}",
+            learning_rate=LR,
+            warmup_steps=WARMUP,
+            max_steps=total,
+            min_lr=min_lr,
+        )
+        ref = build_group_scheduler(
+            lr_scheduler="cosine",
+            learning_rate=LR,
+            warmup_steps=WARMUP,
+            max_steps=decay,
+            min_lr=min_lr,
+        )
+        a, b = self._lrs(held, total), self._lrs(ref, decay + 1)
+        for i in range(decay + 1):  # identical up to and including the end
+            self.assertAlmostEqual(a[i], b[i], places=12, msg=i)
+        for i in range(decay, total):  # then flat at min_lr
+            self.assertAlmostEqual(a[i], min_lr, places=12, msg=i)
+
+    def test_hand_computed_anchor(self):
+        # warmup 2, decay ends at step 6: step 4 is mid-decay (progress 0.5,
+        # ratio 0.5); from step 6 on the lr is exactly min_lr.
+        min_lr = 1e-4
+        sched = build_group_scheduler(
+            lr_scheduler="cosine:6",
+            learning_rate=LR,
+            warmup_steps=WARMUP,
+            max_steps=MAX_STEPS,
+            min_lr=min_lr,
+        )
+        lrs = self._lrs(sched, MAX_STEPS + 1)
+        self.assertAlmostEqual(lrs[4], min_lr + 0.5 * (LR - min_lr), places=12)
+        for i in range(6, MAX_STEPS + 1):
+            self.assertAlmostEqual(lrs[i], min_lr, places=12, msg=i)
+
+    def test_default_unchanged(self):
+        a = self._lrs(_build("cosine"), MAX_STEPS + 1)
+        b = self._lrs(_build(f"cosine:{MAX_STEPS}"), MAX_STEPS + 1)
+        self.assertEqual(a, b)
+
+    def test_does_not_rise_after_max_steps(self):
+        sched = _build("cosine")
+        lrs = self._lrs(sched, 3 * MAX_STEPS)
+        self.assertTrue(all(x == lrs[MAX_STEPS] for x in lrs[MAX_STEPS:]))
+
+    def test_decay_must_end_after_warmup(self):
+        with self.assertRaises(ValueError):
+            _build(f"cosine:{WARMUP}")
+
+    def test_decay_steps_requires_half_cycle(self):
+        with self.assertRaises(ValueError):
+            CosineLR(LR, WARMUP, MAX_STEPS, num_cycles=1.0, num_decay_steps=6)
+        CosineLR(
+            LR, WARMUP, MAX_STEPS, num_cycles=1.0
+        )  # no num_decay_steps: allowed
 
 
 class TestPowerSchedule(unittest.TestCase):
