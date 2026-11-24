@@ -295,6 +295,10 @@ def drafter_provider(target_config, target_layer_ids):
         "num_empty_layers_add_in_head": 0,
         "num_empty_layers_add_in_tail": 0,
         "cpu_offloading": False,
+        # The draft routes block tokens (anchor + noise), not the backbone
+        # sequence, and gets no input_ids, so the multimodal router bias of
+        # an omni target cannot apply to it.
+        "moe_multimodal_router_bias": False,
         # The draft module is not itself a dspark target: clear the trigger so
         # its (deepcopied) config does not recurse into dspark construction.
         "dspark_target_layer_ids": None,
@@ -364,6 +368,91 @@ def dspark_share_lm_head(shared_head, dict_args):
         if value is not None:
             dict_args[key] = value
     return dict_args
+
+
+def setup_dspark_capture(layers, target_ids, require_draft=False):
+    """Wire DSpark feature capture over the layers this rank holds.
+
+    Shared by ``GPTModel`` and ``HyperBodyUnifiedModel``; each model only
+    supplies ``layers``, its own iteration over the local layer container.
+
+    Target layers are marked unconditionally, independent of where the draft
+    lives: under PP / VPP the draft may sit in a different chunk or stage from
+    the layers it taps, and gating the marking on "the draft is local" would
+    only resurface much later as a missing ``dspark_target_hidden_<lid>`` key
+    inside the draft. Without a local draft the marking is all this rank owes,
+    unless ``require_draft`` (every layer is local, e.g. HyperBody at PP=1)
+    turns that into an error. With the draft, the stage's last norm is flagged
+    as the final norm and the embedding is hooked to hand the draft its host
+    metadata.
+    """
+    # Local imports: models.gpt imports this module.
+    from paddlefleet.models.gpt.gpt_embedding import GPTEmbedding
+    from paddlefleet.transformer.paddle_norm import WrappedPaddleNormPipe
+    from paddlefleet.transformer.transformer_layer import TransformerLayer
+
+    draft = embedding = final_norm = None
+    present_ids = set()
+    for layer in layers:
+        if isinstance(layer, DsparkPredictionLayer):
+            draft = layer
+        elif isinstance(layer, GPTEmbedding):
+            embedding = layer
+        elif isinstance(layer, WrappedPaddleNormPipe):
+            final_norm = layer
+        elif (
+            isinstance(layer, TransformerLayer)
+            and not getattr(layer, "is_mtp_layer", False)
+            and getattr(layer, "layer_number", None) in target_ids
+        ):
+            if type(layer).forward is not TransformerLayer.forward:
+                raise NotImplementedError(
+                    f"DSpark target layer {layer.layer_number} is a "
+                    f"{type(layer).__name__}, whose forward does not carry "
+                    f"the feature tap. Only TransformerLayer / "
+                    f"HyperConnectionTransformerLayer / Gemma4 are supported "
+                    f"this phase; extend the tap to that variant first."
+                )
+            layer._dspark_target_id = int(layer.layer_number)
+            present_ids.add(layer._dspark_target_id)
+
+    if draft is None and not require_draft:
+        return
+    missing = target_ids - present_ids
+    if draft is None or missing or final_norm is None or embedding is None:
+        # The embedding / LM head weights reach the draft through dict_args
+        # (SharedLayerDesc pass-throughs in the draft's own stage), but the
+        # embedding is still needed here for the host-metadata hook.
+        raise RuntimeError(
+            "DSpark requires its target layers / final norm / embedding to "
+            "be co-located with the draft in the same stage: "
+            f"draft={draft is not None}, "
+            f"missing_target_layers={sorted(missing)}, "
+            f"final_norm={final_norm is not None}, "
+            f"embedding={embedding is not None}."
+        )
+    final_norm._dspark_is_final_norm = True
+
+    def _host_meta_pre_hook(module, args, kwargs):
+        # Preserve host metadata for block construction. attn_mask_
+        # startend_row_indices rides the same side-channel: it is built
+        # upstream from the GLOBAL sequence and is the preferred
+        # document-boundary source in get_doc_start_per_pos, with the
+        # "startend_row_indices" fallback name mirroring GPTEmbedding's own
+        # lookup order.
+        dict_args = args[0] if args else kwargs.get("dict_args")
+        if dict_args is None:
+            return
+        startend = dict_args.get("attn_mask_startend_row_indices")
+        if startend is None:
+            startend = dict_args.get("startend_row_indices")
+        draft._host_meta = {
+            "input_ids": dict_args.get("input_ids"),
+            "labels": dict_args.get("labels"),
+            "attn_mask_startend_row_indices": startend,
+        }
+
+    embedding.register_forward_pre_hook(_host_meta_pre_hook, with_kwargs=True)
 
 
 class DsparkPredictionLayer(FleetLayer):

@@ -72,6 +72,7 @@ from paddlefleet.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_layers_spec,
     get_gpt_spec,
 )
+from paddlefleet.models.gpt.gpt_embedding import GPTEmbedding
 from paddlefleet.models.gpt.aoa_multi_tower import (
     AOATower,
     gen_multi_tower_aoa,
@@ -96,7 +97,17 @@ from paddlefleet.transformer.moe.moe_router import TopKRouter
 from paddlefleet.transformer.multi_token_prediction import (
     MultiTokenPredictionLayer,
 )
-from paddlefleet.transformer.transformer_config import split_cp_overlap_suffix
+from paddlefleet.transformer.parallel_multi_token_prediction import (
+    DsparkPredictionLayer,
+    dspark_share_embedding,
+    dspark_share_lm_head,
+    setup_dspark_capture,
+)
+from paddlefleet.transformer.transformer_config import (
+    dspark_layers_active,
+    split_cp_overlap_suffix,
+)
+from paddlefleet.transformer.transformer_layer import TransformerLayer
 
 from ...nn.pp_model import GeneralModelForCausalLMPipe
 from ..model_utils import PretrainedModel
@@ -1103,6 +1114,10 @@ class HyperBodySublayersSpec:
     mtp: list[LayerSpec] = None
     layer_norm: LayerSpec = None
     lm_head: LayerSpec = None
+    # DSpark draft + loss, filled by get_gpt_spec when dspark_target_layer_ids
+    # is set.
+    dspark: list[LayerSpec] | None = None
+    dspark_loss: LayerSpec | None = None
 
 
 class HyperBodyUnifiedModel(PretrainedModel, PipelineLayer):
@@ -1147,6 +1162,28 @@ class HyperBodyUnifiedModel(PretrainedModel, PipelineLayer):
             ),
             **kwargs,
         )
+        self._setup_dspark_capture()
+
+    def _setup_dspark_capture(self):
+        """DSpark capture for the decoder region.
+
+        Same wiring as ``GPTModel._setup_dspark_capture``, over the decoder
+        layers only. PP=1, so every layer is on this rank and a missing draft
+        is an error.
+        """
+        if not dspark_layers_active(self.config):
+            return
+        setup_dspark_capture(
+            self._iter_decoder_layers(),
+            set(self.config.dspark_target_layer_ids),
+            require_draft=True,
+        )
+
+    def _iter_decoder_layers(self):
+        # Encoder layers also number from 0, so only walk ``model.*`` slots.
+        for x, layer in zip(self._sequential_layers, self.run_function):
+            if x["name_prefix"].split(".")[0] == "model":
+                yield layer
 
     @staticmethod
     def add_sequential_layer(layers, layer_desc, name_prefix=""):
@@ -1177,6 +1214,9 @@ class HyperBodyUnifiedModel(PretrainedModel, PipelineLayer):
             elif isinstance(layer, MultiTokenPredictionLayer):
                 # Mirror GPTModel: MTP's fp8 state lives on its inner body.
                 yield layer.transformer_layer
+            elif isinstance(layer, DsparkPredictionLayer):
+                # Mirror GPTModel: the draft blocks live in ``layer.layers``.
+                yield from layer.layers
 
     def fp8_quant_weight(self, batch_mode=False, quant_transpose=True):
         for layer in self._iter_transformer_layers():
@@ -1208,9 +1248,7 @@ class HyperBodyUnifiedModel(PretrainedModel, PipelineLayer):
             layers, LayerDesc(spec.bridge), "encoder.bridge"
         )
         # --- decoder region (name_prefix="model") ---
-        self.add_sequential_layer(
-            layers, LayerDesc(spec.decoder_embedding), "model"
-        )
+        self._add_decoder_embedding(layers, spec)
         # hyper-connections expand (after embedding, before trunk); only when
         # the decoder was built with enable_hyper_connections=True.
         if spec.mhc_expand is not None:
@@ -1242,6 +1280,34 @@ class HyperBodyUnifiedModel(PretrainedModel, PipelineLayer):
                 layers, LayerDesc(spec.mhc_contract), "model.mhc_contract"
             )
         self.add_sequential_layer(layers, LayerDesc(spec.layer_norm), "model")
+        self._add_mtp_layers(layers, spec, n_dec)
+        self._add_dspark_layers(layers, spec, n_dec)
+        self._add_lm_head(layers, spec)
+        return layers
+
+    def _add_decoder_embedding(self, layers, spec):
+        if spec.dspark:
+            desc = SharedLayerDesc(
+                "embed",
+                spec.decoder_embedding,
+                shared_weight_attr="embedding_weight",
+            )
+        else:
+            desc = LayerDesc(spec.decoder_embedding)
+        self.add_sequential_layer(layers, desc, "model")
+
+    def _add_lm_head(self, layers, spec):
+        if spec.dspark:
+            desc = SharedLayerDesc(
+                "dspark_lm_head",
+                spec.lm_head,
+                shared_weight_attr="embedding_weight",
+            )
+        else:
+            desc = LayerDesc(spec.lm_head)
+        self.add_sequential_layer(layers, desc, "model.lm_head")
+
+    def _add_mtp_layers(self, layers, spec, n_dec):
         # MTP layers (structure wiring; MTP forward/loss still deferred). Mirror
         # the standard GPTModel: placed after the final norm, indexed continuing
         # the main decoder layers (first MTP layer is model.layers.{n_dec}, so it
@@ -1249,31 +1315,62 @@ class HyperBodyUnifiedModel(PretrainedModel, PipelineLayer):
         # honored here: mtp_shared_last_layer aliases each MTP body against the
         # backbone pivot ("mtp_reuse_transformer"); mtp_shared_weights aliases the
         # all-depths key ("mtp_shared_all"); otherwise each MTP layer owns weights.
-        if spec.mtp:
-            for j, mtp_layer in enumerate(spec.mtp):
-                if getattr(self.config, "mtp_shared_last_layer", False):
-                    desc = SharedLayerDesc(
-                        "mtp_reuse_transformer",
-                        mtp_layer,
-                        shared_submodule_weight_only=True,
-                        shared_weight_attr="transformer_layer_weights",
-                    )
-                elif getattr(self.config, "mtp_shared_weights", False):
-                    desc = SharedLayerDesc(
-                        "mtp_shared_all",
-                        mtp_layer,
-                        shared_submodule_weight_only=True,
-                        shared_weight_attr="all_weights",
-                    )
-                else:
-                    desc = LayerDesc(mtp_layer)
-                self.add_sequential_layer(
-                    layers, desc, f"model.layers.{n_dec + j}"
+        if not spec.mtp:
+            return
+        for j, mtp_layer in enumerate(spec.mtp):
+            if getattr(self.config, "mtp_shared_last_layer", False):
+                desc = SharedLayerDesc(
+                    "mtp_reuse_transformer",
+                    mtp_layer,
+                    shared_submodule_weight_only=True,
+                    shared_weight_attr="transformer_layer_weights",
                 )
+            elif getattr(self.config, "mtp_shared_weights", False):
+                desc = SharedLayerDesc(
+                    "mtp_shared_all",
+                    mtp_layer,
+                    shared_submodule_weight_only=True,
+                    shared_weight_attr="all_weights",
+                )
+            else:
+                desc = LayerDesc(mtp_layer)
+            self.add_sequential_layer(layers, desc, f"model.layers.{n_dec + j}")
+
+    def _add_dspark_layers(self, layers, spec, n_dec):
+        """Add the DSpark layers before the LM head: the embedding / LM head
+        pass-throughs that hand the shared weights to the draft, the draft
+        and the DSpark loss. As in GPTModel, the drafts are named
+        ``model.layers.{i}`` right after the MTP layers."""
+        if not spec.dspark:
+            return
         self.add_sequential_layer(
-            layers, LayerDesc(spec.lm_head), "model.lm_head"
+            layers,
+            SharedLayerDesc(
+                "embed",
+                spec.decoder_embedding,
+                forward_func=dspark_share_embedding,
+                shared_weight_attr="embedding_weight",
+            ),
+            "model",
         )
-        return layers
+        self.add_sequential_layer(
+            layers,
+            SharedLayerDesc(
+                "dspark_lm_head",
+                spec.lm_head,
+                forward_func=dspark_share_lm_head,
+                shared_weight_attr="embedding_weight",
+            ),
+            "model.lm_head",
+        )
+        first = n_dec + len(spec.mtp or [])
+        for k, dspark_spec in enumerate(spec.dspark):
+            self.add_sequential_layer(
+                layers, LayerDesc(dspark_spec), f"model.layers.{first + k}"
+            )
+        self.add_sequential_layer(
+            layers, LayerDesc(spec.dspark_loss), "model.dspark_loss"
+        )
 
     # ------------------------------------------------------------------ #
     # Logical <-> pipeline key mapping (for weight save / flex_ckpt load) #
@@ -2393,6 +2490,8 @@ def build_hyperbody_unified_model(
         mtp=dec_sub.mtp,
         layer_norm=dec_sub.layer_norm,
         lm_head=dec_sub.lm_head,
+        dspark=dec_sub.dspark,
+        dspark_loss=dec_sub.dspark_loss,
     )
 
     root = LayerSpec(

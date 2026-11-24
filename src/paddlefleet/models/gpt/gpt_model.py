@@ -45,15 +45,14 @@ from paddlefleet.models.gpt.lm_head import (
 from paddlefleet.transformer.multi_token_prediction import (
     MultiTokenPredictionLayer,
 )
-from paddlefleet.transformer.paddle_norm import WrappedPaddleNormPipe
 from paddlefleet.transformer.parallel_multi_token_prediction import (
     DsparkPredictionLayer,
     dspark_share_embedding,
     dspark_share_lm_head,
+    setup_dspark_capture,
 )
 from paddlefleet.transformer.transformer_config import dspark_layers_active
 from paddlefleet.transformer.transformer_layer import (
-    HyperConnectionTransformerLayer,
     TransformerLayer,
     TransformerLayerNode,
     TransformerLayerOverlappedScheduleNode,
@@ -506,35 +505,6 @@ class GPTModel(PipelineLayer):
         else:
             yield from self.run_function
 
-    def _mark_dspark_target_layers(self, target_ids):
-        """Stamp ``_dspark_target_id`` on every target layer this rank holds.
-
-        Deliberately independent of where the draft lives. The draft may sit in
-        a different VPP chunk, or on a downstream PP stage, from the layers it
-        taps; gating this loop on "the draft is local" would leave those layers
-        unmarked, and the omission would only resurface much later as a missing
-        ``dspark_target_hidden_<lid>`` key inside the draft.
-        """
-        for layer in self._iter_local_layers():
-            if (
-                isinstance(
-                    layer,
-                    (HyperConnectionTransformerLayer, TransformerLayer),
-                )
-                and not isinstance(layer, DsparkPredictionLayer)
-                and not getattr(layer, "is_mtp_layer", False)
-                and getattr(layer, "layer_number", None) in target_ids
-            ):
-                if type(layer).forward is not TransformerLayer.forward:
-                    raise NotImplementedError(
-                        f"DSpark target layer {layer.layer_number} is a "
-                        f"{type(layer).__name__}, whose forward does not carry "
-                        f"the feature tap. Only TransformerLayer / "
-                        f"HyperConnectionTransformerLayer / Gemma4 are supported "
-                        f"this phase; extend the tap to that variant first."
-                    )
-                layer._dspark_target_id = int(layer.layer_number)
-
     def _setup_dspark_capture(self):
         """Mark capture layers and validate DSpark inputs on this stage."""
         # Short-circuit on the canonical predicate before touching any layer
@@ -543,71 +513,8 @@ class GPTModel(PipelineLayer):
         # sequence, so a model that never asks for DSpark must not walk layers.
         if not dspark_layers_active(self.config):
             return
-
-        target_ids = set(self.config.dspark_target_layer_ids)
-        # Mark first, and unconditionally -- see _mark_dspark_target_layers.
-        self._mark_dspark_target_layers(target_ids)
-
-        dspark_layer = embedding = None
-        norm_layers = []
-        present_ids = set()
-        for layer in self._iter_local_layers():
-            if isinstance(layer, DsparkPredictionLayer):
-                dspark_layer = layer
-            elif isinstance(layer, GPTEmbedding):
-                embedding = layer
-            elif isinstance(layer, WrappedPaddleNormPipe):
-                norm_layers.append(layer)
-            lid = getattr(layer, "_dspark_target_id", None)
-            if lid is not None:
-                present_ids.add(lid)
-
-        if dspark_layer is None:
-            # No draft on this rank; the marking above is all this rank owes.
-            return
-
-        final_norm = norm_layers[-1] if norm_layers else None
-        if final_norm is not None:
-            # Capture only the final norm output.
-            final_norm._dspark_is_final_norm = True
-
-        # The embedding is still located here for the host-metadata hook below,
-        # but it is no longer handed to the draft: the shared embedding / LM
-        # head weights reach the draft through dict_args, published by the
-        # SharedLayerDesc pass-throughs declared next to it in
-        # get_layer_desc_list. Those descs live in the draft's own stage, so
-        # unlike the backbone layers they need no co-location check.
-        missing = target_ids - present_ids
-        if missing or final_norm is None or embedding is None:
-            raise RuntimeError(
-                "DSpark requires its target layers / final norm / embedding to "
-                "be co-located with the draft in the same stage: "
-                f"missing_target_layers={sorted(missing)}, "
-                f"final_norm={'present' if final_norm else 'MISSING'}, "
-                f"embedding={'present' if embedding else 'MISSING'}."
-            )
-
-        def _host_meta_pre_hook(module, args, kwargs):
-            # Preserve host metadata for block construction. attn_mask_
-            # startend_row_indices rides the same side-channel: it is built
-            # upstream from the GLOBAL sequence and is the preferred
-            # document-boundary source in get_doc_start_per_pos, with the
-            # "startend_row_indices" fallback name mirroring GPTEmbedding's own
-            # lookup order.
-            dict_args = args[0] if args else kwargs.get("dict_args")
-            if dict_args is None:
-                return
-            startend = dict_args.get("attn_mask_startend_row_indices")
-            if startend is None:
-                startend = dict_args.get("startend_row_indices")
-            dspark_layer._host_meta = {
-                "input_ids": dict_args.get("input_ids"),
-                "labels": dict_args.get("labels"),
-                "attn_mask_startend_row_indices": startend,
-            }
-
-        embedding.register_forward_pre_hook(
-            _host_meta_pre_hook, with_kwargs=True
+        setup_dspark_capture(
+            self._iter_local_layers(), set(self.config.dspark_target_layer_ids)
         )
 
     def _tie_mtp_lm_head_weight(self):

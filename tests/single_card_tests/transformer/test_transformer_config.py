@@ -382,6 +382,13 @@ class TestPerTokenLossValidation(unittest.TestCase):
         )
         self.assertTrue(cfg.calculate_per_token_loss)
 
+    def test_accepts_dspark_loss(self):
+        _make_config(
+            calculate_per_token_loss=True,
+            dspark_target_layer_ids=[0],
+            add_dspark_loss=True,
+        )
+
     def test_plain_layout_accepted(self):
         cfg = _make_config(calculate_per_token_loss=True)
         self.assertTrue(cfg.calculate_per_token_loss)

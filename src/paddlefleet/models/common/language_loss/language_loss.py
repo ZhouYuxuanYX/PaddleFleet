@@ -1660,7 +1660,11 @@ class DSparkLanguageLoss(LanguageLoss):
         # restores the CP=1 gradient. Skipped at cp_size==1 (no-op group) to
         # keep CP=1 numerics identical.
         normalization_group = None
-        if get_context_parallel_world_size() > 1:
+        if self.calculate_per_token_loss:
+            # Per-token: normalize over every sampled point in the sharding
+            # group, the pool the trainer counts T_global and sums grads over.
+            normalization_group = fleet.get_hybrid_communicate_group().get_sharding_parallel_group()
+        elif get_context_parallel_world_size() > 1:
             normalization_group = get_context_parallel_group()
         dspark_terms = compute_dspark_loss(
             output,
@@ -1679,23 +1683,63 @@ class DSparkLanguageLoss(LanguageLoss):
             normalization_group=normalization_group,
         )
         dspark_loss = dspark_terms.loss
-        scaled = (
-            float(getattr(self.config, "dspark_loss_scaling_factor", 1.0))
-            * dspark_loss
-        )
-        DSparkLossLoggingHelper.save_loss_to_tracker(scaled)
-        dict_args["dspark_loss"] = scaled
-        _publish_dspark_loss(scaled)
+        factor = float(getattr(self.config, "dspark_loss_scaling_factor", 1.0))
+        scaled = factor * dspark_loss
+        logged = scaled
+        if self.calculate_per_token_loss:
+            logged = factor * self._per_cp_group_dspark_loss(dspark_terms)
+        DSparkLossLoggingHelper.save_loss_to_tracker(logged)
+        dict_args["dspark_loss"] = logged
+        _publish_dspark_loss(logged)
         _publish_dspark_terms(dspark_terms)
         # Carry the draft gradient through the main loss path.
         if getattr(self.config, "add_dspark_loss", False) and (
             "hidden_states" in dict_args
         ):
+            inject = scaled
+            if self.calculate_per_token_loss:
+                # Per-token: the trainer divides grads by T_global, so scale
+                # the global draft mean by this micro-batch's global token count.
+                inject = scaled * self._global_main_token_count(dict_args)
             dict_args["hidden_states"] = DSparkLossAutoScaler.apply(
-                dict_args["hidden_states"], scaled
+                dict_args["hidden_states"], inject
             )
         dict_args.pop("dspark_out", None)
         return dict_args
+
+    def _global_main_token_count(self, dict_args):
+        """Main-head valid tokens of this micro-batch over the sharding group."""
+        labels = dict_args.get("labels")
+        if labels is None:
+            raise ValueError("per-token DSpark loss needs labels in dict_args")
+        if mtp_layers_active(self.config):
+            labels = self._global_labels_for_depth(labels, -1)
+        elif cp_shard_source(self.config) == "loader":
+            labels = to_cp_global(labels, self.config)
+        # Every CP rank holds the whole sequence here, hence the / cp_size.
+        count = (labels != self.ignored_index).sum().astype("float32").detach()
+        group = (
+            fleet.get_hybrid_communicate_group().get_sharding_parallel_group()
+        )
+        dist.all_reduce(count, group=group)
+        return count / max(get_context_parallel_world_size(), 1)
+
+    @staticmethod
+    def _per_cp_group_dspark_loss(dspark_terms):
+        """Rescale the sharding-normalized loss to the CP-normalized value the
+        logs used before, so ``dspark_loss`` stays comparable across modes."""
+        t = dspark_terms.terms
+        local = paddle.stack(
+            [t["weight_denominator"], t["selector_weight_denominator"]]
+        ).astype("float32")
+        if get_context_parallel_world_size() > 1:
+            dist.all_reduce(local, group=get_context_parallel_group())
+        sel = t["selector_loss_alpha"] * t["selector_loss"]
+        return (t["loss"] - sel) * t["normalized_weight_denominator"] / (
+            local[0] + 1e-6
+        ) + sel * t["normalized_selector_weight_denominator"] / (
+            local[1] + 1e-6
+        )
 
     def build_schedule_node(self):
         return ScheduleNode(self.forward, name="DSparkLanguageLoss")

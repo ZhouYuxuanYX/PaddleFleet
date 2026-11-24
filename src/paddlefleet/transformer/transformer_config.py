@@ -572,6 +572,13 @@ class TransformerConfig(ModelParallelConfig):
     (capture bridge, draft backbone, loss computation) still runs when False;
     only the gradient carrier is gated. DSpark itself is enabled by
     ``dspark_target_layer_ids``.
+
+    With ``calculate_per_token_loss`` the loss is normalized over the sharding
+    group and the carried gradient scale is also multiplied by the
+    micro-batch's global main-head token count, which the trainer's
+    ``1/T_global`` undoes. The logged ``dspark_loss`` is rescaled to the mean
+    mode's normalization so the two modes stay comparable; it is not the
+    optimized quantity.
     """
 
     num_empty_layers_add_in_head: int = 0
