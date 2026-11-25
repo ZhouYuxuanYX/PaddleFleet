@@ -726,6 +726,39 @@ class StandardMoERouter(nn.Layer):
         # set_layer_number(), after the hash-layer decision.
         self.multimodal_bias_enabled = False
 
+    # Looped decoder (transformer/loop_pass.py): number of passes that keep their own
+    # load-balancing state, set by TopKRouter.add_loop_pass_bias_states. Pass p > 1 keeps it
+    # under the pass-1 attribute names plus ``_pass{p}``.
+    loop_bias_passes = 1
+    has_loop_pass_state = False
+
+    def loop_pass_suffixes(self):
+        """Attribute-name suffix of every pass's state, pass 1 (``""``) first."""
+        return [""] + [f"_pass{p}" for p in range(2, self.loop_bias_passes + 1)]
+
+    def _pass_suffix(self, loop_pass=None):
+        if loop_pass is None or self.loop_bias_passes == 1:
+            return ""
+        from paddlefleet.transformer.loop_pass import check_loop_pass
+
+        loop_pass = check_loop_pass(
+            loop_pass, self.loop_bias_passes, type(self).__name__
+        )
+        return "" if loop_pass == 1 else f"_pass{loop_pass}"
+
+    def _pass_tensor(self, name, loop_pass=None):
+        """The tensor ``name`` of pass ``loop_pass`` (pass 1's without the copies)."""
+        return getattr(self, name + self._pass_suffix(loop_pass))
+
+    def _pass_add_(self, name, loop_pass, value):
+        """``self.<name> += value`` on the accumulator ``name`` (``expert_usage`` /
+        ``multimodal_expert_usage``) of pass ``loop_pass``: the same get / ``+=`` / set Python
+        does for an attribute, so pass 1 behaves exactly as before."""
+        name = name + self._pass_suffix(loop_pass)
+        accumulator = getattr(self, name)
+        accumulator += value
+        setattr(self, name, accumulator)
+
     def gate_score_func(
         self, logits: paddle.Tensor, logits_type_promotion: bool = True
     ) -> paddle.Tensor:
@@ -1313,6 +1346,7 @@ class StandardMoERouter(nn.Layer):
         n_group: int,
         topk_group: int,
         choice_bias: paddle.Tensor | None = None,
+        loop_pass: int | None = None,
     ) -> tuple[paddle.Tensor, paddle.Tensor]:
         """_summary_
 
@@ -1324,6 +1358,8 @@ class StandardMoERouter(nn.Layer):
             choice_bias (paddle.Tensor, optional): per-token selection bias
                 [bsz*seq_len, n_experts] replacing ``e_score_correction_bias``
                 (see ``_multimodal_choice_bias``).
+            loop_pass (int | None): looped-decoder pass whose correction bias is
+                used (transformer/loop_pass.py); None is pass 1.
 
         Returns:
             tuple[paddle.Tensor, paddle.Tensor]: topk_weight, topk_idx
@@ -1337,19 +1373,17 @@ class StandardMoERouter(nn.Layer):
             "n_experts must be divisible by n_groups"
         )
 
-        assert self.e_score_correction_bias is not None, (
-            "e_score_correction_bias is None"
-        )
+        bias = self._pass_tensor("e_score_correction_bias", loop_pass)
+        assert bias is not None, "e_score_correction_bias is None"
         if choice_bias is not None:
             scores_for_choice = scores.reshape([bsz_seq_len, -1]) + choice_bias
         elif not self.config.gpt_model_use_experimental_version:
             scores_for_choice = scores.reshape(
                 [bsz_seq_len, -1]
-            ) + self.e_score_correction_bias.detach().unsqueeze(0)
+            ) + bias.detach().unsqueeze(0)
         else:
             scores_for_choice = (
-                scores.reshape([bsz_seq_len, -1])
-                + self.e_score_correction_bias.detach()
+                scores.reshape([bsz_seq_len, -1]) + bias.detach()
             )
         if n_group == 1:
             topk_weight, topk_idx = paddle.topk(
@@ -1664,7 +1698,13 @@ class StandardMoERouter(nn.Layer):
         topk_group=None,
         valid_mask=None,
         choice_bias=None,
+        loop_pass=None,
     ):
+        if loop_pass is not None and topk_method != "noaux_tc":
+            raise ValueError(
+                "Per-pass router state is only wired for noaux_tc, got "
+                f"{topk_method!r}."
+            )
         if choice_bias is not None and topk_method != "noaux_tc":
             raise ValueError(
                 f"choice_bias is only supported by noaux_tc, got {topk_method!r}."
@@ -1685,6 +1725,7 @@ class StandardMoERouter(nn.Layer):
                 n_group,
                 topk_group,
                 choice_bias=choice_bias,
+                loop_pass=loop_pass,
             )
         elif topk_method == "quantile_balancing":
             top_gate, top_idx = self._topk_quantile_balancing(
@@ -1889,19 +1930,24 @@ class StandardMoERouter(nn.Layer):
             mask = mask.transpose([1, 0])
         return mask.reshape([-1, 1])
 
-    def _multimodal_bias_row(self):
-        return self.multimodal_e_score_correction_bias.detach().reshape(
-            [1, self.num_experts]
+    def _multimodal_bias_row(self, loop_pass=None):
+        return (
+            self._pass_tensor("multimodal_e_score_correction_bias", loop_pass)
+            .detach()
+            .reshape([1, self.num_experts])
         )
 
-    def _multimodal_choice_bias(self, multimodal_mask):
+    def _multimodal_choice_bias(self, multimodal_mask, loop_pass=None):
         """Per-token selection bias [num_tokens, num_experts]: the multimodal
-        bias on multimodal rows, ``e_score_correction_bias`` elsewhere."""
-        text_bias = self.e_score_correction_bias.detach().reshape(
-            [1, self.num_experts]
+        bias on multimodal rows, ``e_score_correction_bias`` elsewhere. Both are
+        the ones of pass ``loop_pass`` (transformer/loop_pass.py)."""
+        text_bias = (
+            self._pass_tensor("e_score_correction_bias", loop_pass)
+            .detach()
+            .reshape([1, self.num_experts])
         )
         return paddle.where(
-            multimodal_mask, self._multimodal_bias_row(), text_bias
+            multimodal_mask, self._multimodal_bias_row(loop_pass), text_bias
         )
 
     @paddle.no_grad()
@@ -1927,7 +1973,66 @@ class TopKRouter(StandardMoERouter):
         self._setup_hash_layer(layer_number, is_mtp_layer=is_mtp_layer)
         self._setup_multimodal_bias()
 
-    def forward(self, input, input_ids=None, origin_input_ids=None):
+    def add_loop_pass_bias_states(self, num_passes):
+        """Give passes 2..``num_passes`` of a looped decoder their own correction bias.
+
+        Pass ``p`` selects experts with ``e_score_correction_bias_pass{p}`` (and
+        ``multimodal_e_score_correction_bias_pass{p}`` where the multimodal bias is on) and
+        counts into ``expert_usage_pass{p}`` / ``multimodal_expert_usage_pass{p}``; the
+        aux-loss-free callback updates every pass from its own usage, so each pass balances on
+        its own instead of the passes together. The biases are persistable buffers initialized
+        to pass 1's, the usages plain attributes like pass 1's.
+        ``forward(..., loop_pass=p)`` picks pass ``p``. Returns ``[(copy, source), ...]`` of
+        the persistable buffers, for the caller to declare as warm-start sources.
+        """
+        from paddlefleet.transformer.loop_pass import check_num_passes
+
+        num_passes = check_num_passes(num_passes, type(self).__name__)
+        if type(self).forward is not TopKRouter.forward:
+            raise NotImplementedError(
+                f"{type(self).__name__} overrides TopKRouter.forward and does not "
+                "read per-pass state."
+            )
+        if self.topk_method != "noaux_tc":
+            raise ValueError(
+                "Per-pass router bias needs topk_method='noaux_tc', got "
+                f"{self.topk_method!r}."
+            )
+        if self.is_hash_layer:
+            raise ValueError(
+                f"Per-pass router bias: layer {self._layer_number} is a hash-routing "
+                "layer and has no correction bias."
+            )
+        if self.has_loop_pass_state:
+            raise RuntimeError("add_loop_pass_bias_states was already called.")
+        biases = ["e_score_correction_bias"]
+        usages = ["expert_usage"]
+        if getattr(self, "multimodal_bias_enabled", False):
+            # The multimodal rows balance against their own bias; leaving it shared would
+            # keep every <context> token on pass 1's routing.
+            biases.append("multimodal_e_score_correction_bias")
+            usages.append("multimodal_expert_usage")
+        pairs = []
+        for p in range(2, num_passes + 1):
+            for name in biases:
+                source = getattr(self, name)
+                self.register_buffer(f"{name}_pass{p}", source.detach().clone())
+                pairs.append((getattr(self, f"{name}_pass{p}"), source))
+            for name in usages:
+                state = paddle.zeros_like(getattr(self, name))
+                state.stop_gradient = True
+                setattr(self, f"{name}_pass{p}", state)
+        self.loop_bias_passes = num_passes
+        self.has_loop_pass_state = True
+        return pairs
+
+    def forward(
+        self, input, input_ids=None, origin_input_ids=None, loop_pass=None
+    ):
+        if self.has_loop_pass_state:
+            # Read back by the looped decoder: a pass number lost on the way here would
+            # silently route pass p with pass 1's bias.
+            self.last_loop_pass = 1 if loop_pass is None else int(loop_pass)
         # The gate matmul gets this tensor, not the flattened view made below:
         # FusedGateDetachMatmul keeps what it is given until backward, so a view
         # would pin the mHC layernorm output against the recompute's _clear_data().
@@ -2196,14 +2301,16 @@ class TopKRouter(StandardMoERouter):
             use_node_limit = self.n_group > 1
             if multimodal_mask is not None:
                 probs_for_choice = gates + self._multimodal_choice_bias(
-                    multimodal_mask
+                    multimodal_mask, loop_pass
                 )
             elif not self.config.gpt_model_use_experimental_version:
-                probs_for_choice = (
-                    gates + self.e_score_correction_bias.detach().unsqueeze(0)
-                )
+                probs_for_choice = gates + self._pass_tensor(
+                    "e_score_correction_bias", loop_pass
+                ).detach().unsqueeze(0)
             else:
-                probs_for_choice = gates + self.e_score_correction_bias.detach()
+                probs_for_choice = gates + self._pass_tensor(
+                    "e_score_correction_bias", loop_pass
+                ).detach()
             if _LOG_LAYER_MD5 and self._layer_number == 0:
                 _log_moe_md5(
                     self.e_score_correction_bias,
@@ -2278,8 +2385,9 @@ class TopKRouter(StandardMoERouter):
                 choice_bias=(
                     None
                     if multimodal_mask is None
-                    else self._multimodal_choice_bias(multimodal_mask)
+                    else self._multimodal_choice_bias(multimodal_mask, loop_pass)
                 ),
+                loop_pass=loop_pass if self.topk_method == "noaux_tc" else None,
             )
 
             _log_moe_md5(
@@ -2379,11 +2487,13 @@ class TopKRouter(StandardMoERouter):
                     multimodal_counts = self._multimodal_expert_counts(
                         mask, multimodal_mask
                     )
-                    self.multimodal_expert_usage += multimodal_counts
+                    self._pass_add_(
+                        "multimodal_expert_usage", loop_pass, multimodal_counts
+                    )
                     exp_counts = (
                         exp_counts.cast(paddle.int64) - multimodal_counts
                     )
-                self.expert_usage += exp_counts
+                self._pass_add_("expert_usage", loop_pass, exp_counts)
 
         # aux_loss
         if self.config.router_aux_loss_coef:

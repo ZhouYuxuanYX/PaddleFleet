@@ -65,6 +65,7 @@ from paddlefleet.transformer.dw_overlap import (
     deferrable_linear_bare,
     install_sonic_moe_dw_deferral,
 )
+from paddlefleet.transformer.loop_pass import loop_pass_kwargs
 from paddlefleet.transformer.paddle_norm import WrappedPaddleNorm
 from paddlefleet.transformer.transformer_config import (
     dw_overlap_enabled,
@@ -1565,6 +1566,12 @@ class MoELayer(nn.Layer):
             )
             self.moe_shared_expert_overlap = False
 
+    @property
+    def has_loop_pass_state(self):
+        """Whether the router keeps per-pass load-balancing state of a looped decoder
+        (transformer/loop_pass.py); ``forward`` then takes ``loop_pass``."""
+        return getattr(self.gate, "has_loop_pass_state", False)
+
     def _project_to_latent(self, hidden_states: paddle.Tensor) -> paddle.Tensor:
         """Project hidden_states to latent space, consuming any cached
         projection from the AllGather overlap path if available.
@@ -1824,7 +1831,7 @@ class MoELayer(nn.Layer):
         return hidden_states
 
     def compute_gate(
-        self, hidden_states, input_ids=None, origin_input_ids=None
+        self, hidden_states, input_ids=None, origin_input_ids=None, loop_pass=None
     ):
         if self.expert_model_parallel_size <= 1 and self.sequence_parallel:
             hidden_states = GatherOp.apply(hidden_states)
@@ -1832,6 +1839,7 @@ class MoELayer(nn.Layer):
             hidden_states,
             input_ids=input_ids,
             origin_input_ids=origin_input_ids,
+            **loop_pass_kwargs(self.gate, loop_pass),
         )
 
     def _use_hybrid_ep_fusion(self):
@@ -2126,6 +2134,7 @@ class MoELayer(nn.Layer):
         input_ids: paddle.Tensor | None = None,
         residual: paddle.Tensor | None = None,
         origin_input_ids: paddle.Tensor | None = None,
+        loop_pass: int | None = None,
     ) -> paddle.Tensor:
         """
         Args:
@@ -2221,6 +2230,7 @@ class MoELayer(nn.Layer):
             gate_input,
             input_ids=input_ids,
             origin_input_ids=origin_input_ids,
+            **loop_pass_kwargs(self.gate, loop_pass),
         )
         # topk_weights, topk_indices: Shape is [seq_len, moe_router_topk]
         # probs: combine weights in [S, E] sparse layout (non-selected positions are 0) [seq_len, num_experts]

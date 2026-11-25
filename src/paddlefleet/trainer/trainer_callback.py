@@ -1036,6 +1036,16 @@ class FP8QuantWeightCallback(TrainerCallback):
                     reload(optimizer._master_weights[name])
 
 
+def _loop_pass_suffixes(layer):
+    """Attribute-name suffixes of a layer's per-pass load-balancing state, pass 1 (``""``) first.
+
+    A router of a looped decoder keeps one copy per pass (transformer/loop_pass.py,
+    ``add_loop_pass_bias_states``); every other layer has the single pass-1 state.
+    """
+    suffixes = getattr(layer, "loop_pass_suffixes", None)
+    return suffixes() if callable(suffixes) else [""]
+
+
 class MoECorrectionBiasAdjustCallback(TrainerCallback):
     """
     used for moe aux loss free balance
@@ -1070,8 +1080,14 @@ class MoECorrectionBiasAdjustCallback(TrainerCallback):
                     hasattr(layer, "e_score_correction_bias")
                     and layer.e_score_correction_bias is not None
                 ):
-                    biases.append(layer.e_score_correction_bias)
-                    usages.append(layer.expert_usage)
+                    # A looped decoder's extra passes keep their own bias and usage
+                    # (transformer/loop_pass.py): every pass is updated from its own usage, so
+                    # each balances on its own. Without the copies this is one entry, as before.
+                    for suffix in _loop_pass_suffixes(layer):
+                        biases.append(
+                            getattr(layer, "e_score_correction_bias" + suffix)
+                        )
+                        usages.append(getattr(layer, "expert_usage" + suffix))
 
         model.apply(get_stat)
 
@@ -1139,15 +1155,17 @@ class MoECorrectionBiasAdjustCallback(TrainerCallback):
                 ):
                     return
                 with paddle.no_grad():
-                    bias = biases.pop(0)
-                    upd = update_list.pop(0)
                     frozen = layer.weight.stop_gradient or (
                         lr_ratio_fn is not None
                         and not float(lr_ratio_fn(layer.weight))
                     )
-                    if not frozen:
-                        bias.add_(upd)
-                    usages.pop(0).zero_()
+                    # Same traversal order as get_stat: one entry per pass.
+                    for _ in _loop_pass_suffixes(layer):
+                        bias = biases.pop(0)
+                        upd = update_list.pop(0)
+                        if not frozen:
+                            bias.add_(upd)
+                        usages.pop(0).zero_()
 
         model.apply(update_bias)
 
@@ -1189,20 +1207,31 @@ class MoEMultimodalBiasAdjustCallback(TrainerCallback):
                 and getattr(layer, "multimodal_e_score_correction_bias", None)
                 is not None
             ):
-                routers.append(layer)
+                # One entry per pass of a looped decoder (transformer/loop_pass.py): every pass
+                # balances its multimodal rows on its own. One entry without the copies.
+                for suffix in _loop_pass_suffixes(layer):
+                    routers.append((layer, suffix))
 
         kwargs["model"].apply(collect)
         if not routers:
             return
 
+        def state_of(entry, name):
+            router, suffix = entry
+            return getattr(router, name + suffix)
+
         groups = {}
-        for idx, router in enumerate(routers):
+        for idx, (router, _) in enumerate(routers):
             groups.setdefault(router.num_experts, []).append(idx)
         stacked = [
             (
                 indices,
                 paddle.stack(
-                    [routers[i].multimodal_expert_usage for i in indices], 0
+                    [
+                        state_of(routers[i], "multimodal_expert_usage")
+                        for i in indices
+                    ],
+                    0,
                 ),
             )
             for indices in groups.values()
@@ -1242,15 +1271,20 @@ class MoEMultimodalBiasAdjustCallback(TrainerCallback):
                 routed += int(usages.sum().item())
 
         with paddle.no_grad():
-            for router, update in zip(routers, updates):
-                bias = router.multimodal_e_score_correction_bias
+            for entry, update in zip(routers, updates):
+                bias = state_of(entry, "multimodal_e_score_correction_bias")
                 bias.add_(update.reshape(bias.shape))
-                router.multimodal_expert_usage.zero_()
+                state_of(entry, "multimodal_expert_usage").zero_()
 
         if log_step:
             bias_absmax = max(
-                float(r.multimodal_e_score_correction_bias.abs().max().item())
-                for r in routers
+                float(
+                    state_of(entry, "multimodal_e_score_correction_bias")
+                    .abs()
+                    .max()
+                    .item()
+                )
+                for entry in routers
             )
             logger.info(
                 f"[MoEMultimodalBias] step={state.global_step} routers={len(routers)} "

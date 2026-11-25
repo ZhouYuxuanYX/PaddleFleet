@@ -64,6 +64,7 @@ from paddlefleet.transformer.indexcache_state import (
     state_to_slots,
 )
 from paddlefleet.transformer.kimi_delta_attention import KimiDeltaAttention
+from paddlefleet.transformer.loop_pass import LOOP_PASS_KEY, loop_pass_kwargs
 from paddlefleet.transformer.mlp import MLP
 from paddlefleet.transformer.moe.moe_layer import MoELayer
 from paddlefleet.transformer.multi_latent_attention import MultiLatentAttention
@@ -243,6 +244,13 @@ def _unpack_flattened_indexcache_recompute_outputs(outputs):
         return outputs[0], outputs[1], indexcache_state
 
     return None
+
+
+def _loop_pass_arg(kwargs):
+    """``{"loop_pass": p}`` when ``kwargs`` carries a looped-decoder pass number
+    (transformer/loop_pass.py), else ``{}``: a layer outside a loop is called exactly as before."""
+    loop_pass = kwargs.get(LOOP_PASS_KEY)
+    return {} if loop_pass is None else {LOOP_PASS_KEY: loop_pass}
 
 
 @dataclass
@@ -1009,11 +1017,21 @@ class TransformerLayer(nn.Layer):
                 if "cu_seqlens" in dict_args
                 else {}
             )
+            # Looped decoder (transformer/loop_pass.py): a plain int captured by the closure
+            # below, so the replay reruns the pass the forward ran in. The recompute call
+            # itself only forwards a fixed set of keys.
+            loop_pass_arg = _loop_pass_arg(dict_args)
 
             if (
                 self.config.block_attention_residuals
                 and not skip_block_attn_res
             ):
+                if loop_pass_arg:
+                    raise NotImplementedError(
+                        "Per-pass loop state does not support block_attention_residuals with "
+                        "layer-level recompute (full recompute, or the RECOVER_STEP recovery "
+                        f"window); layer {self.layer_number}."
+                    )
                 # block_attention_residuals + full_recompute:
                 # attn_res runs outside recompute (PyLayer handles its own
                 # gradient checkpointing); attention and MLP each get their
@@ -1110,6 +1128,7 @@ class TransformerLayer(nn.Layer):
                         cu_seqlens=cu_seqlens,
                         indexcache_state=recompute_indexcache_state,
                         **docmask_meta_kwargs,
+                        **loop_pass_arg,
                     )
                     return _flatten_indexcache_recompute_outputs(body_outputs)
 
@@ -1442,6 +1461,7 @@ class TransformerLayer(nn.Layer):
                     hidden_states,
                     input_ids=input_ids,
                     origin_input_ids=origin_input_ids,
+                    **_loop_pass_arg(kwargs),
                 )
             self._log_md5(output, "layer_output", self.layer_number)
         if indexcache_state is not None:
@@ -1657,6 +1677,7 @@ class TransformerLayer(nn.Layer):
         block_attention_residuals=False,
         input_ids=None,
         origin_input_ids=None,
+        loop_pass=None,
         **kwargs,
     ):
         """
@@ -1664,6 +1685,8 @@ class TransformerLayer(nn.Layer):
 
         Args:
             hidden_states (Tensor): Transformed hidden states before the MLP layernorm.
+            loop_pass (int | None): looped-decoder pass number, for an MLP with per-pass
+                state (transformer/loop_pass.py).
 
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
@@ -1671,6 +1694,8 @@ class TransformerLayer(nn.Layer):
 
         # Residual connection.
         residual = hidden_states
+        # The MLP replay of recompute_handler captures this, so it reruns the pass it ran in.
+        mlp_pass = loop_pass_kwargs(self.mlp, loop_pass)
 
         # Optional Layer norm post the cross-attention.
         if self.recompute_post_attention_layernorm:
@@ -1706,9 +1731,12 @@ class TransformerLayer(nn.Layer):
                         post_attention_layernorm_output,
                         input_ids=_mlp_input_ids,
                         origin_input_ids=_mlp_origin_input_ids,
+                        **mlp_pass,
                     )
                 else:
-                    mlp_output, bias = self.mlp(post_attention_layernorm_output)
+                    mlp_output, bias = self.mlp(
+                        post_attention_layernorm_output, **mlp_pass
+                    )
                 if bias is None:
                     return mlp_output
                 return mlp_output, bias
@@ -1730,9 +1758,12 @@ class TransformerLayer(nn.Layer):
                     post_attention_layernorm_output,
                     input_ids=input_ids,
                     origin_input_ids=origin_input_ids,
+                    **mlp_pass,
                 )
             else:
-                mlp_output_with_bias = self.mlp(post_attention_layernorm_output)
+                mlp_output_with_bias = self.mlp(
+                    post_attention_layernorm_output, **mlp_pass
+                )
 
         # Log MLP raw output before BDA
         if (
@@ -2398,11 +2429,19 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         hidden_states,
         is_first_fwd=False,
         input_ids=None,
+        loop_pass=None,
         **kwargs,
     ):
-        """mHC MLP forward: aggregate → layernorm → MLP → fused_h_res_h_post_bda."""
+        """mHC MLP forward: aggregate → layernorm → MLP → fused_h_res_h_post_bda.
+
+        ``loop_pass`` is the looped-decoder pass number (transformer/loop_pass.py); mHC keeps the
+        base layer's contract of handing it to an MLP with per-pass state, so a looped mHC decoder
+        routes each pass with its own router state.
+        """
         # Save n-stream residual for H_res mixing
         original_residual = hidden_states
+        # The MLP replay of recompute_handler captures this, so it reruns the pass it ran in.
+        mlp_pass = loop_pass_kwargs(self.mlp, loop_pass)
         ori_dtype = hidden_states.dtype
 
         mhc_manager = self._mhc_block_manager(half_layer=1)
@@ -2452,9 +2491,12 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                     mlp_output, bias = self.mlp(
                         post_attention_layernorm_output,
                         input_ids=_mlp_input_ids,
+                        **mlp_pass,
                     )
                 else:
-                    mlp_output, bias = self.mlp(post_attention_layernorm_output)
+                    mlp_output, bias = self.mlp(
+                        post_attention_layernorm_output, **mlp_pass
+                    )
                 if bias is None:
                     return mlp_output
                 return mlp_output, bias
@@ -2469,10 +2511,14 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         else:
             if isinstance(self.mlp, MoELayer) and input_ids is not None:
                 mlp_output_with_bias = self.mlp(
-                    post_attention_layernorm_output, input_ids=input_ids
+                    post_attention_layernorm_output,
+                    input_ids=input_ids,
+                    **mlp_pass,
                 )
             else:
-                mlp_output_with_bias = self.mlp(post_attention_layernorm_output)
+                mlp_output_with_bias = self.mlp(
+                    post_attention_layernorm_output, **mlp_pass
+                )
 
         # mHC: fused H_res + H_post + bias-dropout-add
         # The block's final BDA output is the boundary tensor, so it stays live
